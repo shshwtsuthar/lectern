@@ -9,4 +9,10 @@ follow [Semantic Versioning](https://semver.org/) once releases begin.
 
 ### Added
 
+- Native desktop library browser with a virtualized cover grid and bounded texture cache.
+- Indexed SQLite storage with transactional migrations, WAL mode, and FTS5 search.
+- Parallel EPUB discovery and import with metadata and cover extraction.
+- Search, format filtering, title/author/recent sorting, and background query coalescing.
+- File, folder, and drag-and-drop import with progress and per-file failure reporting.
+- In-place metadata editing with asynchronous saves and immediate search-index refresh.
 - Initial Rust workspace, quality policy, CI, and project documentation.

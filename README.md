@@ -1,7 +1,21 @@
 # Lectern
 
-Lectern is intended to become a fast, native-feeling library manager for people who own ebooks.
-This repository currently contains the production-oriented Rust scaffold, not product features.
+Lectern is a fast, native-feeling library manager for people who own ebooks. The current thin
+application is deliberately focused: it imports EPUBs into a local library, makes them immediately
+searchable, renders a cover grid, and edits their metadata.
+
+## What works
+
+- Add individual EPUBs, recursively import a folder, or drop either onto the window.
+- Extract title, authors, series, publisher, language, description, and a bounded cover thumbnail.
+- Search title, author, series, and publisher with SQLite FTS5 prefix indexes.
+- Filter by format and sort by title, author, or recently added.
+- Browse a virtualized grid whose cover I/O, image decoding, and database queries stay off the UI
+  thread.
+- Edit metadata in place and refresh the search index as soon as it is saved.
+
+Bulk editing, device export, filesystem export, and Calibre-library import are not implemented yet.
+They remain product work rather than hidden placeholders in this release.
 
 ## Quick start
 
@@ -16,6 +30,17 @@ cargo clippy-all
 cargo fmt --all --check
 ```
 
+For a normal optimized build, run `cargo run --release`. Lectern stores its database in the
+platform application-data directory. Set `LECTERN_DATA_DIR` to use an explicit location during
+development or testing:
+
+```sh
+LECTERN_DATA_DIR=/path/to/lectern-data cargo run --release
+```
+
+The first import can be started with **Add books**, **Add folder**, or native drag-and-drop. Click a
+book card to open its metadata editor; `Ctrl-S` on Windows/Linux or `Cmd-S` on macOS saves changes.
+
 ## Workspace
 
 ```text
@@ -29,9 +54,13 @@ docs/
 └── adr/           # Architecture decision records
 ```
 
-The workspace starts with no third-party runtime dependencies. Add dependencies at the workspace
-root when multiple crates share them, and keep adapter-specific dependencies in their owning crate.
-The eventual desktop toolkit, persistence engine, and async runtime are deliberately undecided.
+Shared dependency versions live at the workspace root, while adapter-specific dependencies stay in
+their owning crates. The desktop uses egui/eframe, storage uses bundled SQLite through rusqlite, and
+EPUB ingestion uses bounded ZIP, XML, and image processing.
+
+The application has performance-conscious boundaries but makes no unmeasured performance claims.
+Once the thin workflow and representative libraries are stable, profiling and targeted benchmarks
+can guide optimization of cold launch, import throughput, query latency, scrolling, and memory.
 
 ## Quality gates
 
