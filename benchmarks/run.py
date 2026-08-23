@@ -19,6 +19,7 @@ from typing import Any, Iterable
 
 GIB = 1024**3
 DEFAULT_CORPUS = pathlib.Path("target/benchmarks/import-corpus-v1/corpus")
+DESKTOP_TIMEOUT_GRACE_SECONDS = 30.0
 
 
 class CommandRecorder:
@@ -34,21 +35,42 @@ class CommandRecorder:
         command: list[str],
         *,
         environment: dict[str, str] | None = None,
+        timeout_seconds: float | None = None,
     ) -> None:
         print(f"+ {shlex.join(command)}", flush=True)
         started_at = utc_now()
         started = time.monotonic_ns()
-        result = subprocess.run(
-            command,
-            cwd=self.repository,
-            env=environment,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                command,
+                cwd=self.repository,
+                env=environment,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as error:
+            self.commands.append(
+                {
+                    "command": command,
+                    "started_at_utc": started_at,
+                    "elapsed_ns": time.monotonic_ns() - started,
+                    "return_code": None,
+                    "timeout_seconds": timeout_seconds,
+                    "timed_out": True,
+                }
+            )
+            write_json(self.output, {"commands": self.commands})
+            raise RuntimeError(
+                f"command timed out after {timeout_seconds:.1f} seconds: "
+                f"{shlex.join(command)}"
+            ) from error
         record = {
             "command": command,
             "started_at_utc": started_at,
             "elapsed_ns": time.monotonic_ns() - started,
             "return_code": result.returncode,
+            "timeout_seconds": timeout_seconds,
+            "timed_out": False,
         }
         self.commands.append(record)
         write_json(self.output, {"commands": self.commands})
@@ -207,6 +229,8 @@ def main(arguments: list[str]) -> int:
             str(options.cover_every),
         ]
     )
+    seed_result = read_json(seed_output)
+    validate_seed_result(seed_result, options.books)
 
     startup_results: list[dict[str, Any]] = []
     scroll_result: dict[str, Any] | None = None
@@ -224,7 +248,9 @@ def main(arguments: list[str]) -> int:
                 scroll_pixels_per_second=options.scroll_pixels_per_second,
                 timeout_seconds=options.timeout_seconds,
             )
-            startup_results.append(read_completed_desktop_result(result_path))
+            startup_results.append(
+                read_completed_desktop_result(result_path, options.books)
+            )
 
         scroll_path = output / "scrolling.json"
         run_desktop(
@@ -238,7 +264,7 @@ def main(arguments: list[str]) -> int:
             scroll_pixels_per_second=options.scroll_pixels_per_second,
             timeout_seconds=options.timeout_seconds,
         )
-        scroll_result = read_completed_desktop_result(scroll_path)
+        scroll_result = read_completed_desktop_result(scroll_path, options.books)
 
     recorder.run(
         [
@@ -254,6 +280,8 @@ def main(arguments: list[str]) -> int:
             str(options.query_warmup),
         ]
     )
+    query_result = read_json(query_output)
+    validate_query_result(query_result, options.books, options.query_iterations)
 
     import_result: dict[str, Any] | None = None
     if not options.skip_import:
@@ -271,6 +299,7 @@ def main(arguments: list[str]) -> int:
             ]
         )
         import_result = read_json(import_output)
+        validate_import_result(import_result, int(corpus_inventory["files"]))
 
     run_bytes = directory_allocated_bytes(output)
     if run_bytes > options.maximum_run_gib * GIB:
@@ -285,13 +314,15 @@ def main(arguments: list[str]) -> int:
         "kind": "lectern-performance-results",
         "completed_at_utc": utc_now(),
         "run": run_metadata,
-        "seed": read_json(seed_output),
+        "seed": seed_result,
         "startup": {
             "runs": startup_results,
-            "all_process_cold_samples_ns": startup_samples(desktop_results),
+            "main_entry_to_populated_library_samples_ns": startup_samples(
+                desktop_results
+            ),
             "summary_ns": summarize(startup_samples(desktop_results)),
         },
-        "queries": read_json(query_output),
+        "queries": query_result,
         "scrolling": scroll_result,
         "import": import_result,
         "memory": combined_memory(desktop_results, scroll_result, import_result),
@@ -299,7 +330,7 @@ def main(arguments: list[str]) -> int:
         "run_allocated_bytes": run_bytes,
         "warnings": [
             "Measurements are exploratory and intentionally have no pass/fail thresholds.",
-            "Cold launch means a fresh process; operating-system page cache was not cleared.",
+            "Startup timing begins at Rust main entry; operating-system page cache was not cleared.",
             "Frame intervals describe delivered app cadence, not GPU presentation timestamps.",
             "RSS excludes dedicated GPU memory and does not estimate total system impact.",
             "The prepared corpus repeats a bounded set of valid source publications; interpret import throughput accordingly.",
@@ -335,22 +366,142 @@ def run_desktop(
             "WGPU_BACKEND": environment.get("WGPU_BACKEND", "vulkan"),
         }
     )
-    recorder.run([str(binary)], environment=environment)
+    recorder.run(
+        [str(binary)],
+        environment=environment,
+        timeout_seconds=timeout_seconds + DESKTOP_TIMEOUT_GRACE_SECONDS,
+    )
 
 
-def read_completed_desktop_result(path: pathlib.Path) -> dict[str, Any]:
+def read_completed_desktop_result(
+    path: pathlib.Path, expected_books: int
+) -> dict[str, Any]:
     result = read_json(path)
     if result.get("status") != "completed":
         raise RuntimeError(f"desktop benchmark did not complete: {result.get('error')}")
+    validate_desktop_result(result, expected_books)
     return result
 
 
 def startup_samples(results: Iterable[dict[str, Any]]) -> list[int]:
     return [
-        int(result["startup"]["populated_library_ns"])
+        int(result["startup"]["main_entry_to_populated_library_ns"])
         for result in results
         if result and result.get("startup")
     ]
+
+
+def validate_seed_result(result: dict[str, Any], expected_books: int) -> None:
+    requested = count_field(result, "requested_books", "seed result")
+    stored = count_field(result, "stored_books", "seed result")
+    if requested != expected_books or stored != expected_books:
+        raise RuntimeError(
+            "seed count mismatch: "
+            f"requested={requested}, stored={stored}, expected={expected_books}"
+        )
+
+
+def validate_desktop_result(result: dict[str, Any], expected_books: int) -> None:
+    library = object_field(result, "library", "desktop result")
+    books = count_field(library, "books", "desktop library")
+    if books != expected_books:
+        raise RuntimeError(
+            f"desktop library count mismatch: got {books}, expected {expected_books}"
+        )
+    startup = object_field(result, "startup", "desktop result")
+    startup_ns = count_field(
+        startup,
+        "main_entry_to_populated_library_ns",
+        "desktop startup",
+    )
+    if startup_ns == 0:
+        raise RuntimeError("desktop startup endpoint must be greater than zero")
+
+
+def validate_query_result(
+    result: dict[str, Any], expected_books: int, expected_iterations: int
+) -> None:
+    library_books = count_field(result, "library_books", "query result")
+    measured_iterations = count_field(
+        result, "measured_iterations", "query result"
+    )
+    if library_books != expected_books:
+        raise RuntimeError(
+            f"query library count mismatch: got {library_books}, expected {expected_books}"
+        )
+    if measured_iterations != expected_iterations:
+        raise RuntimeError(
+            "query iteration mismatch: "
+            f"got {measured_iterations}, expected {expected_iterations}"
+        )
+
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RuntimeError("query result must contain at least one scenario")
+    full_library_scenarios = {"sort_title", "sort_author", "sort_recently_added"}
+    for index, scenario in enumerate(scenarios):
+        context = f"query scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RuntimeError(f"{context} must be an object")
+        result_count = count_field(scenario, "result_count", context)
+        if result_count > expected_books:
+            raise RuntimeError(
+                f"{context} returned {result_count} rows from {expected_books} books"
+            )
+        samples = scenario.get("samples_ns")
+        if not isinstance(samples, list) or len(samples) != expected_iterations:
+            sample_count = len(samples) if isinstance(samples, list) else "invalid"
+            raise RuntimeError(
+                f"{context} sample count mismatch: "
+                f"got {sample_count}, expected {expected_iterations}"
+            )
+        if scenario.get("name") in full_library_scenarios and result_count != expected_books:
+            raise RuntimeError(
+                f"{context} full-library result count mismatch: "
+                f"got {result_count}, expected {expected_books}"
+            )
+
+
+def validate_import_result(result: dict[str, Any], expected_files: int) -> None:
+    corpus = object_field(result, "corpus", "import result")
+    summary = object_field(result, "summary", "import result")
+    corpus_files = count_field(corpus, "files", "import corpus")
+    discovered = count_field(summary, "discovered", "import summary")
+    imported = count_field(summary, "imported", "import summary")
+    failed = count_field(summary, "failed", "import summary")
+    database_books = count_field(result, "database_books", "import result")
+
+    if corpus_files != expected_files or discovered != expected_files:
+        raise RuntimeError(
+            "import discovery count mismatch: "
+            f"corpus={corpus_files}, discovered={discovered}, expected={expected_files}"
+        )
+    if imported + failed != discovered:
+        raise RuntimeError(
+            "import outcome does not reconcile: "
+            f"imported={imported}, failed={failed}, discovered={discovered}"
+        )
+    if imported == 0:
+        raise RuntimeError("import produced no books")
+    if database_books != imported:
+        raise RuntimeError(
+            "import database count mismatch: "
+            f"database={database_books}, imported={imported}"
+        )
+
+
+def object_field(value: dict[str, Any], key: str, context: str) -> dict[str, Any]:
+    field = value.get(key)
+    if not isinstance(field, dict):
+        raise RuntimeError(f"{context}.{key} must be an object")
+    return field
+
+
+def count_field(value: dict[str, Any], key: str, context: str) -> int:
+    field = value.get(key)
+    if isinstance(field, bool) or not isinstance(field, int) or field < 0:
+        raise RuntimeError(f"{context}.{key} must be a non-negative integer")
+    return field
 
 
 def combined_memory(
@@ -465,12 +616,13 @@ def environment_metadata() -> dict[str, Any]:
 
 def measurement_definitions() -> dict[str, str]:
     return {
-        "cold_launch": "fresh Lectern process start through the second populated-library render pass",
+        "main_entry_to_populated_library": "Rust main entry through the second populated-library UI pass, after one populated frame was presented",
         "query_latency": "SQLite query, row decoding, string allocation, and full matching-result materialization on one open connection",
         "frame_interval": "monotonic interval between app frame starts after scrolling warmup",
         "egui_unstable_dt": "egui-reported interval for the current frame",
         "cpu_frame_time": "eframe CPU time for the previous app/render frame, excluding vsync wait",
         "memory": "Linux process RSS sampled from /proc at 20 ms; dedicated GPU memory excluded",
+        "idle_memory_window": "populated-library endpoint through the configured idle window; pending cover work may complete",
         "import": "production discovery, parallel EPUB/PDF parsing and cover generation, plus transactional persistence",
         "page_cache_control": "uncontrolled",
         "percentiles": "nearest-rank over retained raw samples",

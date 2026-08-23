@@ -6,6 +6,7 @@ import importlib.util
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("run.py")
@@ -45,6 +46,126 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(options.books, 1000)
         self.assertEqual(options.query_iterations, 5)
         self.assertEqual(options.startup_runs, 1)
+
+    def test_command_timeout_is_recorded_before_failing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            recorder = RUN.CommandRecorder(root, root / "commands.json")
+            expired = RUN.subprocess.TimeoutExpired(["lectern"], 2.0)
+            with mock.patch.object(RUN.subprocess, "run", side_effect=expired):
+                with self.assertRaisesRegex(RuntimeError, "timed out after 2.0 seconds"):
+                    recorder.run(["lectern"], timeout_seconds=2.0)
+            command_log = RUN.read_json(root / "commands.json")
+
+        self.assertTrue(command_log["commands"][0]["timed_out"])
+        self.assertIsNone(command_log["commands"][0]["return_code"])
+
+    def test_desktop_timeout_includes_grace_period(self) -> None:
+        calls = []
+
+        class Recorder:
+            def run(self, command, **options):
+                calls.append((command, options))
+
+        RUN.run_desktop(
+            Recorder(),
+            pathlib.Path("lectern"),
+            pathlib.Path("library"),
+            pathlib.Path("result.json"),
+            idle_seconds=3.0,
+            scroll_seconds=15.0,
+            scroll_warmup_seconds=1.0,
+            scroll_pixels_per_second=1_500.0,
+            timeout_seconds=20.0,
+        )
+
+        self.assertEqual(
+            calls[0][1]["timeout_seconds"],
+            20.0 + RUN.DESKTOP_TIMEOUT_GRACE_SECONDS,
+        )
+
+    def test_integrity_validators_accept_reconciled_counts(self) -> None:
+        RUN.validate_seed_result(
+            {"requested_books": 50_000, "stored_books": 50_000}, 50_000
+        )
+        RUN.validate_desktop_result(
+            {
+                "library": {"books": 50_000},
+                "startup": {"main_entry_to_populated_library_ns": 42},
+            },
+            50_000,
+        )
+        RUN.validate_query_result(
+            {
+                "library_books": 50_000,
+                "measured_iterations": 2,
+                "scenarios": [
+                    {
+                        "name": "sort_title",
+                        "result_count": 50_000,
+                        "samples_ns": [10, 11],
+                    },
+                    {
+                        "name": "search_title_prefix",
+                        "result_count": 4_000,
+                        "samples_ns": [3, 4],
+                    },
+                ],
+            },
+            50_000,
+            2,
+        )
+        RUN.validate_import_result(
+            {
+                "corpus": {"files": 10_000},
+                "summary": {"discovered": 10_000, "imported": 9_999, "failed": 1},
+                "database_books": 9_999,
+            },
+            10_000,
+        )
+
+    def test_integrity_validators_reject_mismatched_counts(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "seed count mismatch"):
+            RUN.validate_seed_result(
+                {"requested_books": 50_000, "stored_books": 49_999}, 50_000
+            )
+        with self.assertRaisesRegex(RuntimeError, "desktop library count mismatch"):
+            RUN.validate_desktop_result(
+                {
+                    "library": {"books": 49_999},
+                    "startup": {"main_entry_to_populated_library_ns": 42},
+                },
+                50_000,
+            )
+        with self.assertRaisesRegex(RuntimeError, "sample count mismatch"):
+            RUN.validate_query_result(
+                {
+                    "library_books": 50_000,
+                    "measured_iterations": 2,
+                    "scenarios": [
+                        {
+                            "name": "sort_title",
+                            "result_count": 50_000,
+                            "samples_ns": [10],
+                        }
+                    ],
+                },
+                50_000,
+                2,
+            )
+        with self.assertRaisesRegex(RuntimeError, "does not reconcile"):
+            RUN.validate_import_result(
+                {
+                    "corpus": {"files": 10_000},
+                    "summary": {
+                        "discovered": 10_000,
+                        "imported": 9_998,
+                        "failed": 1,
+                    },
+                    "database_books": 9_998,
+                },
+                10_000,
+            )
 
 
 if __name__ == "__main__":
