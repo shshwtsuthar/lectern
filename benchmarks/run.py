@@ -580,8 +580,11 @@ def inventory_corpus(corpus: pathlib.Path) -> dict[str, int | str]:
 
 
 def adjacent_corpus_manifest(corpus: pathlib.Path) -> dict[str, Any] | None:
-    manifest = corpus.parent / "corpus_stats.json"
-    return read_json(manifest) if manifest.is_file() else None
+    for filename in ("corpus-manifest.json", "corpus_stats.json"):
+        manifest = corpus.parent / filename
+        if manifest.is_file():
+            return read_json(manifest)
+    return None
 
 
 def repository_metadata(repository: pathlib.Path) -> dict[str, Any]:

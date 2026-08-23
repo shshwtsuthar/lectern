@@ -40,6 +40,22 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(inventory["pdf_files"], 1)
         self.assertEqual(inventory["total_bytes"], 12)
 
+    def test_adjacent_corpus_manifest_prefers_reproducible_recipe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            corpus = root / "corpus"
+            corpus.mkdir()
+            (root / "corpus_stats.json").write_text(
+                '{"kind":"legacy"}', encoding="utf-8"
+            )
+            (root / "corpus-manifest.json").write_text(
+                '{"kind":"pinned"}', encoding="utf-8"
+            )
+
+            manifest = RUN.adjacent_corpus_manifest(corpus)
+
+        self.assertEqual(manifest, {"kind": "pinned"})
+
     def test_smoke_mode_bounds_expensive_settings(self) -> None:
         options = RUN.parse_arguments(["--smoke", "--books", "50000"])
 
