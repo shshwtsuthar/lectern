@@ -1,0 +1,16 @@
+# Rust build output
+/target/
+*.profraw
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
