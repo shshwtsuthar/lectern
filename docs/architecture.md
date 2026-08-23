@@ -22,7 +22,8 @@ CLI-first product.
 
 ## Implemented boundaries
 
-- `lectern-core` owns book, query, format, and sort types without infrastructure dependencies.
+- `lectern-core` owns logical-book, asset, query, format, and sort types without infrastructure
+  dependencies.
 - `lectern-storage` owns schema migration, transactional writes, FTS5 queries, and cover blobs.
 - `lectern-import` owns EPUB/PDF discovery, bounded parsing and cover rendering, and batched
   ingestion.
@@ -45,6 +46,17 @@ SQLite runs in WAL mode for the persistent library. FTS5 triggers keep search da
 imports and metadata edits. Imports never extract archive members to disk, reject unsafe archive
 paths, and cap XML, cover entry, decoded-image, PDF file, thumbnail, and batch sizes. PDF first pages
 are rendered on the CPU without a system PDF runtime.
+
+Books are metadata aggregates rather than files. A logical book owns one or more stable file assets;
+format, storage ownership, and reversible paths live on those assets, while the cover remains
+book-level. Library summaries deliberately omit asset payloads, and format filters use an indexed
+existence test so multi-format books still produce one grid row. Trusted import adapters may supply
+several assets in one atomic record; ordinary file discovery never guesses cross-format identity.
+
+Persistent connections request WAL and use full synchronization. If SQLite cannot activate WAL for
+a filesystem, full synchronization remains in effect for the returned rollback journal mode. Schema
+creation and upgrades acquire an immediate transaction, validate relational and FTS integrity, and
+advance the schema version only after validation succeeds.
 
 ## Operational principles
 

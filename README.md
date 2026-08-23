@@ -10,7 +10,8 @@ immediately searchable, renders a cover grid, and edits their metadata.
 - Extract EPUB metadata and embedded covers; extract standard PDF metadata and render the first page
   as a bounded cover thumbnail.
 - Search title, author, series, and publisher with SQLite FTS5 prefix indexes.
-- Filter by format and sort by title, author, or recently added.
+- Represent one logical book with one or more stable file assets and filter by any available format.
+- Sort by title, author, or recently added.
 - Browse a virtualized grid whose cover I/O, image decoding, and database queries stay off the UI
   thread.
 - Edit metadata in place and refresh the search index as soon as it is saved.
@@ -60,6 +61,11 @@ Shared dependency versions live at the workspace root, while adapter-specific de
 their owning crates. The desktop uses egui/eframe, storage uses bundled SQLite through rusqlite,
 EPUB ingestion uses bounded ZIP, XML, and image processing, and PDF ingestion uses bounded parsing
 with a native CPU renderer.
+
+The storage model keeps logical metadata and cover data separate from format-specific file assets.
+Current file and folder import remains conservative and does not guess that similarly named files
+are the same book; trusted aggregate importers such as the planned Calibre adapter can attach
+several formats atomically.
 
 The application has performance-conscious boundaries but makes no unmeasured performance claims.
 Once the thin workflow and representative libraries are stable, profiling and targeted benchmarks

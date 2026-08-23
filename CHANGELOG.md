@@ -9,6 +9,8 @@ follow [Semantic Versioning](https://semver.org/) once releases begin.
 
 ### Added
 
+- Logical books with stable EPUB/PDF assets, explicit managed/reference ownership, reversible paths,
+  atomic grouped imports, and direct migration from the earlier single-file schemas.
 - Native desktop library browser with a virtualized cover grid and bounded texture cache.
 - Indexed SQLite storage with transactional migrations, WAL mode, and FTS5 search.
 - Parallel EPUB and PDF discovery and import with metadata and cover extraction.
