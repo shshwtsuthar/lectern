@@ -7,11 +7,17 @@ use std::{
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use image::{Rgb, RgbImage, codecs::jpeg::JpegEncoder};
 use lectern_core::{BookDraft, BookFormat, LibraryQuery, SortOrder};
+use lectern_import::{ImportProgress, ImportSummary, discover_publications, import_paths};
 use lectern_storage::{ImportRecord, LibraryDatabase};
 use serde::Serialize;
 
@@ -20,12 +26,14 @@ const DEFAULT_ITERATIONS: usize = 100;
 const DEFAULT_WARMUP: usize = 10;
 const SEED_BATCH_SIZE: usize = 500;
 const DEFAULT_SEED: u64 = 20_260_824;
+const MAX_RECORDED_FAILURES: usize = 200;
 
 const USAGE: &str = "Lectern exploratory performance harness
 
 Usage:
   lectern-benchmark seed --database PATH --output PATH [OPTIONS]
   lectern-benchmark query --database PATH --output PATH [OPTIONS]
+  lectern-benchmark import --database PATH --corpus PATH --output PATH [OPTIONS]
 
 Seed options:
   --books N          Number of deterministic books (default: 50000)
@@ -36,6 +44,9 @@ Seed options:
 Query options:
   --iterations N     Measured iterations per scenario (default: 100)
   --warmup N         Warmup iterations per scenario (default: 10)
+
+Import options:
+  --replace          Replace an existing benchmark database
 
 Common options:
   -h, --help         Print help";
@@ -64,6 +75,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     match command.as_str() {
         "seed" => run_seed(&SeedOptions::parse(&mut args)?),
         "query" => run_query(&QueryOptions::parse(&mut args)?),
+        "import" => run_import(&ImportOptions::parse(&mut args)?),
         _ => Err(format!(
             "unknown command '{command}'. Run 'lectern-benchmark --help' for usage"
         )),
@@ -149,6 +161,38 @@ struct QueryOptions {
     output: PathBuf,
     iterations: usize,
     warmup: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ImportOptions {
+    database: PathBuf,
+    corpus: PathBuf,
+    output: PathBuf,
+    replace: bool,
+}
+
+impl ImportOptions {
+    fn parse(args: &mut Arguments) -> Result<Self, String> {
+        let mut database = None;
+        let mut corpus = None;
+        let mut output = None;
+        let mut replace = false;
+        while let Some(option) = args.next_string()? {
+            match option.as_str() {
+                "--database" => database = Some(PathBuf::from(args.require_value(&option)?)),
+                "--corpus" => corpus = Some(PathBuf::from(args.require_value(&option)?)),
+                "--output" => output = Some(PathBuf::from(args.require_value(&option)?)),
+                "--replace" => replace = true,
+                _ => return Err(format!("unknown import option '{option}'")),
+            }
+        }
+        Ok(Self {
+            database: required_path("--database", database)?,
+            corpus: required_path("--corpus", corpus)?,
+            output: required_path("--output", output)?,
+            replace,
+        })
+    }
 }
 
 impl QueryOptions {
@@ -481,6 +525,323 @@ fn run_query(options: &QueryOptions) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Serialize)]
+struct ImportResult {
+    schema_version: u32,
+    kind: &'static str,
+    measured_at_unix_ms: u128,
+    database_path: String,
+    corpus_path: String,
+    corpus: CorpusStats,
+    timing: ImportTiming,
+    memory: ImportMemory,
+    progress: Vec<ImportProgressSample>,
+    summary: ImportOutcome,
+    database_books: u64,
+    database_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct CorpusStats {
+    files: usize,
+    epub_files: usize,
+    pdf_files: usize,
+    total_bytes: u64,
+    file_size_bytes: SizeSummary,
+    inspection_ms: f64,
+}
+
+#[derive(Serialize)]
+struct SizeSummary {
+    min: u64,
+    p50: u64,
+    p95: u64,
+    max: u64,
+}
+
+#[derive(Serialize)]
+struct ImportTiming {
+    discovery_ms: Option<f64>,
+    total_ms: f64,
+    imported_files_per_second: f64,
+}
+
+#[derive(Serialize)]
+struct ImportMemory {
+    definition: &'static str,
+    baseline_rss_bytes: Option<u64>,
+    peak_rss_bytes: Option<u64>,
+    peak_delta_bytes: Option<u64>,
+    sample_interval_ms: u64,
+}
+
+#[derive(Serialize)]
+struct ImportProgressSample {
+    elapsed_ms: f64,
+    discovered: usize,
+    processed: usize,
+    imported: usize,
+    failed: usize,
+}
+
+#[derive(Serialize)]
+struct ImportOutcome {
+    discovered: usize,
+    imported: usize,
+    failed: usize,
+    failures: Vec<ImportFailureResult>,
+    failures_omitted: usize,
+}
+
+#[derive(Serialize)]
+struct ImportFailureResult {
+    path: String,
+    message: String,
+}
+
+struct ImportMeasurements {
+    elapsed: Duration,
+    baseline_rss_bytes: Option<u64>,
+    peak_rss_bytes: Option<u64>,
+    progress: Vec<ImportProgressSample>,
+    summary: ImportSummary,
+}
+
+fn run_import(options: &ImportOptions) -> Result<(), String> {
+    if !options.corpus.exists() {
+        return Err(format!(
+            "corpus does not exist: {}",
+            options.corpus.display()
+        ));
+    }
+    if options.database.exists() && !options.replace {
+        return Err(format!(
+            "{} already exists; choose a new benchmark path or pass --replace",
+            options.database.display()
+        ));
+    }
+    remove_database_files(&options.database)?;
+
+    let inspection_started = Instant::now();
+    let publications =
+        discover_publications(std::slice::from_ref(&options.corpus)).map_err(display_error)?;
+    if publications.is_empty() {
+        return Err(format!(
+            "no EPUB or PDF files found beneath {}",
+            options.corpus.display()
+        ));
+    }
+    let corpus = inspect_corpus(&publications, inspection_started.elapsed())?;
+    let baseline_rss_bytes = current_rss_bytes();
+    let sampler = MemorySampler::start(Duration::from_millis(20))?;
+    let started = Instant::now();
+    let mut progress = Vec::new();
+    let result = import_paths(
+        &options.database,
+        std::slice::from_ref(&options.corpus),
+        |sample| progress.push(progress_sample(started.elapsed(), sample)),
+    );
+    let elapsed = started.elapsed();
+    let peak_rss_bytes = sampler.finish()?;
+    let summary = result.map_err(display_error)?;
+    let measurements = ImportMeasurements {
+        elapsed,
+        baseline_rss_bytes,
+        peak_rss_bytes,
+        progress,
+        summary,
+    };
+    let output = assemble_import_result(options, corpus, measurements)?;
+    write_json(&options.output, &output)?;
+    println!(
+        "Imported {} of {} files in {:.1} ms ({:.1} files/s)",
+        output.summary.imported,
+        output.summary.discovered,
+        output.timing.total_ms,
+        output.timing.imported_files_per_second
+    );
+    Ok(())
+}
+
+fn assemble_import_result(
+    options: &ImportOptions,
+    corpus: CorpusStats,
+    measurements: ImportMeasurements,
+) -> Result<ImportResult, String> {
+    let database = LibraryDatabase::open(&options.database).map_err(display_error)?;
+    let database_books = database.count().map_err(display_error)?;
+    drop(database);
+
+    let failure_count = measurements.summary.failures.len();
+    let failures = measurements
+        .summary
+        .failures
+        .iter()
+        .take(MAX_RECORDED_FAILURES)
+        .map(|failure| ImportFailureResult {
+            path: failure.path.display().to_string(),
+            message: failure.message.clone(),
+        })
+        .collect::<Vec<_>>();
+    let discovery_ms = measurements
+        .progress
+        .first()
+        .map(|sample| sample.elapsed_ms);
+    let imported_files_per_second = if measurements.elapsed.is_zero() {
+        0.0
+    } else {
+        Duration::from_secs(
+            u64::try_from(measurements.summary.imported).expect("import count fits u64"),
+        )
+        .as_secs_f64()
+            / measurements.elapsed.as_secs_f64()
+    };
+    Ok(ImportResult {
+        schema_version: 1,
+        kind: "import",
+        measured_at_unix_ms: unix_time_ms()?,
+        database_path: options.database.display().to_string(),
+        corpus_path: options.corpus.display().to_string(),
+        corpus,
+        timing: ImportTiming {
+            discovery_ms,
+            total_ms: duration_ms(measurements.elapsed),
+            imported_files_per_second,
+        },
+        memory: ImportMemory {
+            definition: "Linux process resident set size sampled from /proc/self/status",
+            baseline_rss_bytes: measurements.baseline_rss_bytes,
+            peak_rss_bytes: measurements.peak_rss_bytes,
+            peak_delta_bytes: measurements
+                .peak_rss_bytes
+                .zip(measurements.baseline_rss_bytes)
+                .map(|(peak, baseline)| peak.saturating_sub(baseline)),
+            sample_interval_ms: 20,
+        },
+        progress: measurements.progress,
+        summary: ImportOutcome {
+            discovered: measurements.summary.discovered,
+            imported: measurements.summary.imported,
+            failed: measurements.summary.failed,
+            failures,
+            failures_omitted: failure_count.saturating_sub(MAX_RECORDED_FAILURES),
+        },
+        database_books,
+        database_bytes: fs::metadata(&options.database)
+            .map_err(display_error)?
+            .len(),
+    })
+}
+
+fn inspect_corpus(paths: &[PathBuf], elapsed: Duration) -> Result<CorpusStats, String> {
+    let mut epub_files = 0;
+    let mut pdf_files = 0;
+    let mut sizes = Vec::with_capacity(paths.len());
+    for path in paths {
+        match path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("epub") => epub_files += 1,
+            Some("pdf") => pdf_files += 1,
+            _ => {}
+        }
+        sizes.push(fs::metadata(path).map_err(display_error)?.len());
+    }
+    sizes.sort_unstable();
+    let total_bytes = sizes.iter().try_fold(0_u64, |total, size| {
+        total
+            .checked_add(*size)
+            .ok_or_else(|| "corpus size exceeds u64".to_owned())
+    })?;
+    Ok(CorpusStats {
+        files: paths.len(),
+        epub_files,
+        pdf_files,
+        total_bytes,
+        file_size_bytes: SizeSummary {
+            min: sizes[0],
+            p50: nearest_rank(&sizes, 50),
+            p95: nearest_rank(&sizes, 95),
+            max: *sizes.last().expect("non-empty corpus"),
+        },
+        inspection_ms: duration_ms(elapsed),
+    })
+}
+
+fn progress_sample(elapsed: Duration, progress: ImportProgress) -> ImportProgressSample {
+    ImportProgressSample {
+        elapsed_ms: duration_ms(elapsed),
+        discovered: progress.discovered,
+        processed: progress.processed,
+        imported: progress.imported,
+        failed: progress.failed,
+    }
+}
+
+struct MemorySampler {
+    peak_bytes: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl MemorySampler {
+    fn start(interval: Duration) -> Result<Self, String> {
+        let peak_bytes = Arc::new(AtomicU64::new(current_rss_bytes().unwrap_or(0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_peak = Arc::clone(&peak_bytes);
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::Builder::new()
+            .name("lectern-benchmark-memory".into())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    if let Some(rss) = current_rss_bytes() {
+                        thread_peak.fetch_max(rss, Ordering::Relaxed);
+                    }
+                    thread::sleep(interval);
+                }
+            })
+            .map_err(display_error)?;
+        Ok(Self {
+            peak_bytes,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    fn finish(mut self) -> Result<Option<u64>, String> {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| "memory sampler thread panicked".to_owned())?;
+        }
+        if let Some(rss) = current_rss_bytes() {
+            self.peak_bytes.fetch_max(rss, Ordering::Relaxed);
+        }
+        let peak = self.peak_bytes.load(Ordering::Relaxed);
+        Ok((peak > 0).then_some(peak))
+    }
+}
+
+fn current_rss_bytes() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    parse_linux_rss_bytes(&status)
+}
+
+fn parse_linux_rss_bytes(status: &str) -> Option<u64> {
+    let kilobytes = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    kilobytes.checked_mul(1_024)
+}
+
 fn query_scenarios() -> Vec<QueryScenario> {
     vec![
         QueryScenario {
@@ -596,7 +957,10 @@ fn display_error(error: impl std::fmt::Display) -> String {
 mod tests {
     use std::ffi::OsString;
 
-    use super::{Arguments, QueryOptions, SeedOptions, benchmark_record, nearest_rank, splitmix64};
+    use super::{
+        Arguments, ImportOptions, QueryOptions, SeedOptions, benchmark_record, nearest_rank,
+        parse_linux_rss_bytes, splitmix64,
+    };
 
     fn arguments(values: &[&str]) -> Arguments {
         Arguments::new(values.iter().map(OsString::from))
@@ -644,6 +1008,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_import_options() {
+        let options = ImportOptions::parse(&mut arguments(&[
+            "--database",
+            "import.sqlite3",
+            "--corpus",
+            "corpus",
+            "--output",
+            "import.json",
+            "--replace",
+        ]))
+        .expect("parse import options");
+
+        assert_eq!(options.corpus.to_string_lossy(), "corpus");
+        assert!(options.replace);
+    }
+
+    #[test]
     fn seeded_metadata_is_stable_and_varied() {
         let first = benchmark_record(42, 7, None);
         let repeated = benchmark_record(42, 7, None);
@@ -661,5 +1042,13 @@ mod tests {
         assert_eq!(nearest_rank(&samples, 50), 50);
         assert_eq!(nearest_rank(&samples, 95), 95);
         assert_eq!(nearest_rank(&samples, 99), 99);
+    }
+
+    #[test]
+    fn parses_linux_resident_memory() {
+        let status = "Name:\tlectern\nVmSize:\t  9000 kB\nVmRSS:\t  1234 kB\nThreads:\t4\n";
+
+        assert_eq!(parse_linux_rss_bytes(status), Some(1_263_616));
+        assert_eq!(parse_linux_rss_bytes("Name:\tlectern\n"), None);
     }
 }
