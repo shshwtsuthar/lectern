@@ -53,10 +53,13 @@ impl BenchmarkConfig {
                 1_500.0,
             )?,
         };
-        if config.scroll.is_zero() {
-            return Err("LECTERN_BENCHMARK_SCROLL_SECONDS must be greater than zero".into());
+        if config.scroll.is_zero() && !config.scroll_warmup.is_zero() {
+            return Err(
+                "LECTERN_BENCHMARK_SCROLL_WARMUP_SECONDS must be zero when scrolling is disabled"
+                    .into(),
+            );
         }
-        if config.scroll_warmup >= config.scroll {
+        if !config.scroll.is_zero() && config.scroll_warmup >= config.scroll {
             return Err(
                 "LECTERN_BENCHMARK_SCROLL_WARMUP_SECONDS must be less than scroll duration".into(),
             );
@@ -202,7 +205,12 @@ impl DesktopBenchmark {
                 failure = Some("populated library was not rendered before timeout".to_owned());
             }
             Phase::Idle { started } if now.duration_since(*started) >= self.config.idle => {
-                begin_scroll = true;
+                if self.config.scroll.is_zero() {
+                    self.idle_end_rss_bytes = current_rss_bytes();
+                    finish = true;
+                } else {
+                    begin_scroll = true;
+                }
             }
             Phase::Startup { .. } | Phase::Idle { .. } => {
                 context.request_repaint_after(MEMORY_SAMPLE_INTERVAL);
