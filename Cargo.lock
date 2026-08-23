@@ -2071,6 +2071,8 @@ dependencies = [
  "lectern-import",
  "lectern-storage",
  "rfd",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

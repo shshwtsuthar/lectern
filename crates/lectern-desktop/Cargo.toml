@@ -19,6 +19,8 @@ lectern-core.workspace = true
 lectern-import.workspace = true
 lectern-storage.workspace = true
 rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

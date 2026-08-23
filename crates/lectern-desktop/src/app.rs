@@ -9,7 +9,10 @@ use lectern_core::{Book, BookFormat, BookId, BookSummary, LibraryQuery, SortOrde
 use lectern_import::{ImportProgress, ImportSummary};
 use lectern_storage::LibraryDatabase;
 
-use crate::workers::{DecodedCover, ImportRequest, QueryRequest, WorkerEvent, WorkerSet};
+use crate::{
+    benchmark::{BenchmarkFrame, DesktopBenchmark},
+    workers::{DecodedCover, ImportRequest, QueryRequest, WorkerEvent, WorkerSet},
+};
 
 const BACKGROUND: Color32 = Color32::from_rgb(18, 20, 24);
 const PANEL: Color32 = Color32::from_rgb(24, 27, 32);
@@ -98,10 +101,14 @@ pub(crate) struct LecternApp {
     show_import_summary: bool,
     editor_loading: Option<BookId>,
     editor: Option<BookEditor>,
+    benchmark: Option<DesktopBenchmark>,
 }
 
 impl LecternApp {
-    pub(crate) fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
+    pub(crate) fn new(
+        creation_context: &eframe::CreationContext<'_>,
+        benchmark: Option<DesktopBenchmark>,
+    ) -> Self {
         configure_style(&creation_context.egui_ctx);
         let database_path = default_database_path();
         let status = match LibraryDatabase::open(&database_path) {
@@ -128,6 +135,7 @@ impl LecternApp {
             show_import_summary: false,
             editor_loading: None,
             editor: None,
+            benchmark,
         };
         app.refresh_library();
         app
@@ -155,6 +163,9 @@ impl LecternApp {
                         Ok(books) => {
                             let recovered = self.status.starts_with("Library query failed:");
                             self.books = books;
+                            if let Some(benchmark) = &mut self.benchmark {
+                                benchmark.library_installed(&self.books);
+                            }
                             if self.selected.is_some_and(|selected| {
                                 !self.books.iter().any(|book| book.id == selected)
                             }) {
@@ -561,27 +572,34 @@ impl LecternApp {
 
         let columns = column_count(ui.available_width());
         let row_count = self.books.len().div_ceil(columns);
-        egui::ScrollArea::vertical()
+        let mut scroll_area = egui::ScrollArea::vertical()
             .id_salt("library-grid")
-            .auto_shrink([false, false])
-            .show_rows(ui, CARD_HEIGHT, row_count, |ui, visible_rows| {
-                for row in visible_rows {
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = CARD_GAP;
-                        for column in 0..columns {
-                            let index = row * columns + column;
-                            let Some(book) = self.books.get(index).cloned() else {
-                                break;
-                            };
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(CARD_WIDTH, CARD_HEIGHT),
-                                egui::Layout::top_down(Align::Center),
-                                |ui| self.book_card(ui, &book),
-                            );
-                        }
-                    });
-                }
-            });
+            .auto_shrink([false, false]);
+        if let Some(offset) = self
+            .benchmark
+            .as_ref()
+            .and_then(DesktopBenchmark::scroll_offset)
+        {
+            scroll_area = scroll_area.vertical_scroll_offset(offset);
+        }
+        scroll_area.show_rows(ui, CARD_HEIGHT, row_count, |ui, visible_rows| {
+            for row in visible_rows {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = CARD_GAP;
+                    for column in 0..columns {
+                        let index = row * columns + column;
+                        let Some(book) = self.books.get(index).cloned() else {
+                            break;
+                        };
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(CARD_WIDTH, CARD_HEIGHT),
+                            egui::Layout::top_down(Align::Center),
+                            |ui| self.book_card(ui, &book),
+                        );
+                    }
+                });
+            }
+        });
     }
 
     fn book_card(&mut self, ui: &mut egui::Ui, book: &BookSummary) {
@@ -684,8 +702,12 @@ impl LecternApp {
 }
 
 impl eframe::App for LecternApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.frame_number = self.frame_number.wrapping_add(1);
+        if let Some(benchmark) = &mut self.benchmark {
+            let unstable_dt = ui.input(|input| input.unstable_dt);
+            benchmark.frame_started(frame.info().cpu_usage, unstable_dt);
+        }
         self.poll_workers(ui.ctx());
         self.accept_dropped_files(ui);
         let files_hovering = ui.input(|input| !input.raw.hovered_files.is_empty());
@@ -728,6 +750,19 @@ impl eframe::App for LecternApp {
                 "Drop EPUBs, PDFs, or folders to import",
                 FontId::proportional(24.0),
                 Color32::WHITE,
+            );
+        }
+
+        if let Some(benchmark) = &mut self.benchmark {
+            benchmark.frame_finished(
+                ui.ctx(),
+                &BenchmarkFrame {
+                    viewport_width: ui.max_rect().width(),
+                    viewport_height: ui.max_rect().height(),
+                    cached_covers: self.covers.len(),
+                    pending_covers: self.pending_covers.len(),
+                    missing_covers: self.missing_covers.len(),
+                },
             );
         }
     }
