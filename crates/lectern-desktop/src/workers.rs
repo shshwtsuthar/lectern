@@ -7,7 +7,7 @@ use std::{
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use eframe::egui;
 use image::{ImageReader, Limits};
-use lectern_core::{BookId, BookSummary, LibraryQuery};
+use lectern_core::{Book, BookId, BookSummary, LibraryQuery};
 use lectern_import::{ImportProgress, ImportSummary, import_paths};
 use lectern_storage::LibraryDatabase;
 
@@ -26,6 +26,11 @@ pub(crate) struct ImportRequest {
     pub(crate) roots: Vec<PathBuf>,
 }
 
+enum MetadataRequest {
+    Load(BookId),
+    Save(Book),
+}
+
 pub(crate) struct DecodedCover {
     pub(crate) size: [usize; 2],
     pub(crate) rgba: Vec<u8>,
@@ -42,6 +47,14 @@ pub(crate) enum WorkerEvent {
     },
     ImportProgress(ImportProgress),
     ImportFinished(Result<ImportSummary, String>),
+    BookLoaded {
+        id: BookId,
+        result: Result<Option<Book>, String>,
+    },
+    BookSaved {
+        book: Book,
+        result: Result<(), String>,
+    },
     Error(String),
 }
 
@@ -49,6 +62,7 @@ pub(crate) struct WorkerSet {
     query_sender: Sender<QueryRequest>,
     cover_sender: Sender<BookId>,
     import_sender: Sender<ImportRequest>,
+    metadata_sender: Sender<MetadataRequest>,
     event_receiver: Receiver<WorkerEvent>,
 }
 
@@ -57,6 +71,7 @@ impl WorkerSet {
         let (query_sender, query_receiver) = unbounded();
         let (cover_sender, cover_receiver) = bounded(COVER_QUEUE_CAPACITY);
         let (import_sender, import_receiver) = bounded(1);
+        let (metadata_sender, metadata_receiver) = unbounded();
         let (event_sender, event_receiver) = unbounded();
 
         spawn_query_worker(
@@ -81,6 +96,12 @@ impl WorkerSet {
         spawn_import_worker(
             database_path.to_path_buf(),
             import_receiver,
+            event_sender.clone(),
+            context.clone(),
+        );
+        spawn_metadata_worker(
+            database_path.to_path_buf(),
+            metadata_receiver,
             event_sender,
             context.clone(),
         );
@@ -89,6 +110,7 @@ impl WorkerSet {
             query_sender,
             cover_sender,
             import_sender,
+            metadata_sender,
             event_receiver,
         }
     }
@@ -108,8 +130,69 @@ impl WorkerSet {
         self.import_sender.try_send(request).is_ok()
     }
 
+    pub(crate) fn load_book(&self, id: BookId) -> bool {
+        self.metadata_sender.send(MetadataRequest::Load(id)).is_ok()
+    }
+
+    pub(crate) fn save_book(&self, book: Book) -> bool {
+        self.metadata_sender
+            .send(MetadataRequest::Save(book))
+            .is_ok()
+    }
+
     pub(crate) fn next_event(&self) -> Option<WorkerEvent> {
         self.event_receiver.try_recv().ok()
+    }
+}
+
+fn spawn_metadata_worker(
+    database_path: PathBuf,
+    receiver: Receiver<MetadataRequest>,
+    events: Sender<WorkerEvent>,
+    context: egui::Context,
+) {
+    let failure_events = events.clone();
+    let failure_context = context.clone();
+    let result = thread::Builder::new()
+        .name("lectern-metadata".into())
+        .spawn(move || metadata_worker(&database_path, &receiver, &events, &context));
+    if let Err(error) = result {
+        publish(
+            &failure_events,
+            &failure_context,
+            WorkerEvent::Error(format!("Could not start metadata worker: {error}")),
+        );
+    }
+}
+
+fn metadata_worker(
+    database_path: &PathBuf,
+    receiver: &Receiver<MetadataRequest>,
+    events: &Sender<WorkerEvent>,
+    context: &egui::Context,
+) {
+    let database = match LibraryDatabase::open(database_path) {
+        Ok(database) => database,
+        Err(error) => {
+            publish(events, context, WorkerEvent::Error(error.to_string()));
+            return;
+        }
+    };
+
+    while let Ok(request) = receiver.recv() {
+        let published = match request {
+            MetadataRequest::Load(id) => {
+                let result = database.get_book(id).map_err(|error| error.to_string());
+                publish(events, context, WorkerEvent::BookLoaded { id, result })
+            }
+            MetadataRequest::Save(book) => {
+                let result = database.save_book(&book).map_err(|error| error.to_string());
+                publish(events, context, WorkerEvent::BookSaved { book, result })
+            }
+        };
+        if !published {
+            break;
+        }
     }
 }
 

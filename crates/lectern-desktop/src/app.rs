@@ -5,7 +5,7 @@ use std::{
 
 use directories::ProjectDirs;
 use eframe::egui::{self, Align, Color32, FontId, RichText, Sense, Stroke, StrokeKind, Vec2};
-use lectern_core::{BookFormat, BookId, BookSummary, LibraryQuery, SortOrder};
+use lectern_core::{Book, BookFormat, BookId, BookSummary, LibraryQuery, SortOrder};
 use lectern_import::{ImportProgress, ImportSummary};
 use lectern_storage::LibraryDatabase;
 
@@ -29,6 +29,56 @@ struct CachedCover {
     last_used: u64,
 }
 
+struct BookEditor {
+    original: Book,
+    title: String,
+    authors: String,
+    series: String,
+    publisher: String,
+    language: String,
+    description: String,
+    saving: bool,
+    error: Option<String>,
+}
+
+impl BookEditor {
+    fn new(book: Book) -> Self {
+        Self {
+            title: book.title.clone(),
+            authors: book.authors.clone(),
+            series: book.series.clone().unwrap_or_default(),
+            publisher: book.publisher.clone().unwrap_or_default(),
+            language: book.language.clone().unwrap_or_default(),
+            description: book.description.clone().unwrap_or_default(),
+            original: book,
+            saving: false,
+            error: None,
+        }
+    }
+
+    fn book(&self) -> Book {
+        Book {
+            id: self.original.id,
+            title: self.title.trim().to_owned(),
+            authors: self.authors.trim().to_owned(),
+            series: optional_metadata(&self.series),
+            publisher: optional_metadata(&self.publisher),
+            language: optional_metadata(&self.language),
+            description: optional_metadata(&self.description),
+            format: self.original.format,
+            source_path: self.original.source_path.clone(),
+        }
+    }
+
+    fn changed(&self) -> bool {
+        self.book() != self.original
+    }
+
+    fn can_save(&self) -> bool {
+        !self.saving && !self.title.trim().is_empty() && self.changed()
+    }
+}
+
 pub(crate) struct LecternApp {
     database_path: PathBuf,
     workers: WorkerSet,
@@ -46,6 +96,8 @@ pub(crate) struct LecternApp {
     import_progress: Option<ImportProgress>,
     import_summary: Option<ImportSummary>,
     show_import_summary: bool,
+    editor_loading: Option<BookId>,
+    editor: Option<BookEditor>,
 }
 
 impl LecternApp {
@@ -74,6 +126,8 @@ impl LecternApp {
             import_progress: None,
             import_summary: None,
             show_import_summary: false,
+            editor_loading: None,
+            editor: None,
         };
         app.refresh_library();
         app
@@ -103,14 +157,13 @@ impl LecternApp {
                             if self.selected.is_some_and(|selected| {
                                 !self.books.iter().any(|book| book.id == selected)
                             }) {
-                                self.selected = None;
+                                self.clear_selection();
                             }
                             "Library ready".clone_into(&mut self.status);
                         }
                         Err(error) => self.status = format!("Library query failed: {error}"),
                     }
                 }
-                WorkerEvent::QueryFinished { .. } => {}
                 WorkerEvent::CoverFinished { id, result } => {
                     self.pending_covers.remove(&id);
                     match result {
@@ -146,6 +199,39 @@ impl LecternApp {
                         Err(error) => self.status = format!("Import failed: {error}"),
                     }
                 }
+                WorkerEvent::BookLoaded { id, result } if self.selected == Some(id) => {
+                    self.editor_loading = None;
+                    match result {
+                        Ok(Some(book)) => self.editor = Some(BookEditor::new(book)),
+                        Ok(None) => {
+                            "This book is no longer in the library".clone_into(&mut self.status);
+                            self.clear_selection();
+                        }
+                        Err(error) => {
+                            self.status = format!("Could not load metadata: {error}");
+                            self.clear_selection();
+                        }
+                    }
+                }
+                WorkerEvent::BookSaved { book, result } => match result {
+                    Ok(()) => {
+                        self.status = format!("Saved metadata for {}", book.title);
+                        if self.editor.as_ref().map(|editor| editor.original.id) == Some(book.id) {
+                            self.editor = Some(BookEditor::new(book));
+                        }
+                        self.refresh_library();
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not save metadata: {error}");
+                        if let Some(editor) = &mut self.editor
+                            && editor.original.id == book.id
+                        {
+                            editor.saving = false;
+                            editor.error = Some(error);
+                        }
+                    }
+                },
+                WorkerEvent::QueryFinished { .. } | WorkerEvent::BookLoaded { .. } => {}
                 WorkerEvent::Error(error) => self.status = format!("Background worker: {error}"),
             }
         }
@@ -351,6 +437,96 @@ impl LecternApp {
         self.show_import_summary = open;
     }
 
+    fn select_book(&mut self, id: BookId) {
+        self.selected = Some(id);
+        self.editor = None;
+        if self.workers.load_book(id) {
+            self.editor_loading = Some(id);
+        } else {
+            self.editor_loading = None;
+            "Metadata worker is unavailable".clone_into(&mut self.status);
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.editor_loading = None;
+        self.editor = None;
+    }
+
+    fn metadata_panel(&mut self, ui: &mut egui::Ui) {
+        let mut close = false;
+        let mut reset = false;
+        let mut save = false;
+        egui::Panel::right("metadata-editor")
+            .default_size(370.0)
+            .size_range(310.0..=520.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .inner_margin(egui::Margin::symmetric(18, 16)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Book details");
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        close = ui.button("×").on_hover_text("Close editor").clicked();
+                    });
+                });
+                ui.separator();
+
+                if self.editor_loading.is_some() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(30.0);
+                        ui.spinner();
+                        ui.label(RichText::new("Loading metadata…").color(MUTED));
+                    });
+                    return;
+                }
+
+                let Some(editor) = &mut self.editor else {
+                    ui.label(RichText::new("Metadata is unavailable.").color(MUTED));
+                    return;
+                };
+                let actions = metadata_form(ui, editor);
+                save = actions.0;
+                reset = actions.1;
+            });
+
+        save |= ui.input_mut(|input| {
+            input.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::S,
+            ))
+        });
+        if close {
+            self.clear_selection();
+        } else if reset {
+            if let Some(editor) = &mut self.editor {
+                *editor = BookEditor::new(editor.original.clone());
+            }
+        } else if save {
+            self.save_editor();
+        }
+    }
+
+    fn save_editor(&mut self) {
+        let Some(editor) = &mut self.editor else {
+            return;
+        };
+        if !editor.can_save() {
+            return;
+        }
+        let book = editor.book();
+        if self.workers.save_book(book) {
+            editor.saving = true;
+            editor.error = None;
+            "Saving metadata…".clone_into(&mut self.status);
+        } else {
+            "Metadata worker is unavailable".clone_into(&mut self.status);
+        }
+    }
+
     fn library(&mut self, ui: &mut egui::Ui) {
         if self.query_pending && self.books.is_empty() {
             centered_message(
@@ -440,7 +616,7 @@ impl LecternApp {
             .interact(Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         if response.clicked() {
-            self.selected = Some(book.id);
+            self.select_book(book.id);
         }
         if response.hovered() && !selected {
             ui.painter().rect_stroke(
@@ -525,6 +701,9 @@ impl eframe::App for LecternApp {
                     .inner_margin(egui::Margin::symmetric(18, 7)),
             )
             .show(ui, |ui| self.status_bar(ui));
+        if self.selected.is_some() {
+            self.metadata_panel(ui);
+        }
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -609,11 +788,90 @@ fn import_status(progress: ImportProgress) -> String {
     )
 }
 
+fn metadata_text_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    ui.add_space(4.0);
+    ui.label(RichText::new(label).strong());
+    ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
+}
+
+fn metadata_form(ui: &mut egui::Ui, editor: &mut BookEditor) -> (bool, bool) {
+    let mut save = false;
+    let mut reset = false;
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            metadata_text_field(ui, "Title", &mut editor.title);
+            if editor.title.trim().is_empty() {
+                ui.label(RichText::new("A title is required.").color(Color32::LIGHT_RED));
+            }
+            metadata_text_field(ui, "Authors", &mut editor.authors);
+            metadata_text_field(ui, "Series", &mut editor.series);
+            metadata_text_field(ui, "Publisher", &mut editor.publisher);
+            metadata_text_field(ui, "Language", &mut editor.language);
+
+            ui.add_space(4.0);
+            ui.label(RichText::new("Description").strong());
+            ui.add(
+                egui::TextEdit::multiline(&mut editor.description)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(8),
+            );
+
+            ui.add_space(8.0);
+            ui.label(RichText::new("File").strong());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(editor.original.source_path.display().to_string())
+                        .monospace()
+                        .color(MUTED)
+                        .size(11.0),
+                )
+                .wrap()
+                .selectable(true),
+            );
+            ui.label(
+                RichText::new(format!("Format: {}", editor.original.format))
+                    .color(MUTED)
+                    .size(12.0),
+            );
+
+            if let Some(error) = &editor.error {
+                ui.add_space(8.0);
+                ui.label(RichText::new(error).color(Color32::LIGHT_RED));
+            }
+
+            ui.add_space(12.0);
+            let changed = editor.changed();
+            ui.horizontal(|ui| {
+                let button_text = if editor.saving { "Saving…" } else { "Save" };
+                save = ui
+                    .add_enabled(editor.can_save(), egui::Button::new(button_text))
+                    .on_hover_text("Save metadata (Ctrl/Cmd-S)")
+                    .clicked();
+                reset = ui
+                    .add_enabled(changed && !editor.saving, egui::Button::new("Reset"))
+                    .clicked();
+                if editor.saving {
+                    ui.spinner();
+                }
+            });
+        });
+    (save, reset)
+}
+
+fn optional_metadata(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use lectern_core::{Book, BookFormat, BookId};
     use lectern_import::ImportProgress;
 
-    use super::{CARD_GAP, CARD_WIDTH, column_count, import_status};
+    use super::{BookEditor, CARD_GAP, CARD_WIDTH, column_count, import_status};
 
     #[test]
     fn grid_always_has_a_column() {
@@ -642,5 +900,29 @@ mod tests {
             }),
             "Importing 4/10 · 3 imported · 1 failed"
         );
+    }
+
+    #[test]
+    fn metadata_editor_normalizes_saved_values() {
+        let book = Book {
+            id: BookId::new(7),
+            title: "Dune".into(),
+            authors: "Frank Herbert".into(),
+            series: Some("Dune".into()),
+            publisher: None,
+            language: Some("en".into()),
+            description: None,
+            format: BookFormat::Epub,
+            source_path: PathBuf::from("/books/dune.epub"),
+        };
+        let mut editor = BookEditor::new(book);
+        editor.title = "  Dune Messiah  ".into();
+        editor.series = "   ".into();
+
+        let saved = editor.book();
+
+        assert_eq!(saved.title, "Dune Messiah");
+        assert_eq!(saved.series, None);
+        assert!(editor.changed());
     }
 }
