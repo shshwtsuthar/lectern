@@ -50,7 +50,31 @@ impl fmt::Display for BookId {
     }
 }
 
-/// File format owned by a library entry.
+/// Stable identifier for one file asset owned by a logical book.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AssetId(i64);
+
+impl AssetId {
+    /// Creates an identifier from its database representation.
+    #[must_use]
+    pub const fn new(value: i64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the database representation of this identifier.
+    #[must_use]
+    pub const fn value(self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for AssetId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// File format of a book asset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BookFormat {
     /// EPUB publication.
@@ -90,6 +114,70 @@ impl fmt::Display for BookFormat {
             Self::Pdf => formatter.write_str("PDF"),
         }
     }
+}
+
+/// Ownership and path semantics for a book asset.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AssetStorage {
+    /// The file remains user-owned at an external path.
+    #[default]
+    Reference,
+    /// The file is owned by Lectern below its managed library root.
+    Managed,
+}
+
+impl AssetStorage {
+    /// Returns the stable lowercase storage value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Managed => "managed",
+        }
+    }
+
+    /// Parses a stable storage value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "reference" => Some(Self::Reference),
+            "managed" => Some(Self::Managed),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for AssetStorage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reference => formatter.write_str("Referenced"),
+            Self::Managed => formatter.write_str("Managed"),
+        }
+    }
+}
+
+/// File asset ready to be attached to a logical book.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BookAssetDraft {
+    /// Publication format.
+    pub format: BookFormat,
+    /// Whether Lectern or the user owns the file.
+    pub storage: AssetStorage,
+    /// External path for a reference asset or library-relative path for a managed asset.
+    pub path: PathBuf,
+}
+
+/// One stored file representation of a logical book.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BookAsset {
+    /// Stable asset identifier.
+    pub id: AssetId,
+    /// Publication format.
+    pub format: BookFormat,
+    /// Whether Lectern or the user owns the file.
+    pub storage: AssetStorage,
+    /// External path for a reference asset or library-relative path for a managed asset.
+    pub path: PathBuf,
 }
 
 /// Sort order applied to the library projection.
@@ -141,8 +229,6 @@ pub struct BookSummary {
     pub authors: String,
     /// Optional series name.
     pub series: Option<String>,
-    /// Stored ebook format.
-    pub format: BookFormat,
     /// Whether a cached cover thumbnail is available.
     pub has_cover: bool,
 }
@@ -164,13 +250,32 @@ pub struct Book {
     pub language: Option<String>,
     /// Optional description or synopsis.
     pub description: Option<String>,
-    /// Stored ebook format.
-    pub format: BookFormat,
-    /// Original ebook path.
-    pub source_path: PathBuf,
+    /// File representations attached to this logical book.
+    pub assets: Vec<BookAsset>,
 }
 
-/// Metadata discovered before a book is inserted into the library.
+/// Logical-book metadata ready to be inserted into the library.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BookMetadataDraft {
+    /// Display title.
+    pub title: String,
+    /// Display-ready author names.
+    pub authors: String,
+    /// Optional series name.
+    pub series: Option<String>,
+    /// Optional publisher.
+    pub publisher: Option<String>,
+    /// Optional publication language.
+    pub language: Option<String>,
+    /// Optional description or synopsis.
+    pub description: Option<String>,
+}
+
+/// Metadata and location discovered from one publication file.
+///
+/// New aggregate importers should pair [`BookMetadataDraft`] with one or more
+/// [`BookAssetDraft`] values. This single-file shape remains useful for format parsers and
+/// compatibility with callers that import independent files.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BookDraft {
     /// Display title.
@@ -193,7 +298,7 @@ pub struct BookDraft {
 
 #[cfg(test)]
 mod tests {
-    use super::{BookFormat, BookId, BuildInfo};
+    use super::{AssetId, AssetStorage, BookFormat, BookId, BuildInfo};
 
     #[test]
     fn current_build_info_is_populated() {
@@ -205,10 +310,13 @@ mod tests {
 
     #[test]
     fn identifiers_round_trip_their_storage_value() {
-        let id = BookId::new(42);
+        let book_id = BookId::new(42);
+        let asset_id = AssetId::new(84);
 
-        assert_eq!(id.value(), 42);
-        assert_eq!(id.to_string(), "42");
+        assert_eq!(book_id.value(), 42);
+        assert_eq!(book_id.to_string(), "42");
+        assert_eq!(asset_id.value(), 84);
+        assert_eq!(asset_id.to_string(), "84");
     }
 
     #[test]
@@ -218,5 +326,17 @@ mod tests {
         assert_eq!(BookFormat::parse("epub"), Some(BookFormat::Epub));
         assert_eq!(BookFormat::parse("pdf"), Some(BookFormat::Pdf));
         assert_eq!(BookFormat::parse("mobi"), None);
+    }
+
+    #[test]
+    fn storage_modes_have_stable_values() {
+        assert_eq!(AssetStorage::Reference.as_str(), "reference");
+        assert_eq!(AssetStorage::Managed.as_str(), "managed");
+        assert_eq!(
+            AssetStorage::parse("reference"),
+            Some(AssetStorage::Reference)
+        );
+        assert_eq!(AssetStorage::parse("managed"), Some(AssetStorage::Managed));
+        assert_eq!(AssetStorage::parse("copied"), None);
     }
 }

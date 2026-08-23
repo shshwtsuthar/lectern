@@ -68,8 +68,7 @@ impl BookEditor {
             publisher: optional_metadata(&self.publisher),
             language: optional_metadata(&self.language),
             description: optional_metadata(&self.description),
-            format: self.original.format,
-            source_path: self.original.source_path.clone(),
+            assets: self.original.assets.clone(),
         }
     }
 
@@ -856,22 +855,25 @@ fn metadata_form(ui: &mut egui::Ui, editor: &mut BookEditor) -> (bool, bool) {
             );
 
             ui.add_space(8.0);
-            ui.label(RichText::new("File").strong());
-            ui.add(
-                egui::Label::new(
-                    RichText::new(editor.original.source_path.display().to_string())
-                        .monospace()
+            ui.label(RichText::new("Files").strong());
+            for asset in &editor.original.assets {
+                ui.label(
+                    RichText::new(format!("{} · {}", asset.format, asset.storage))
                         .color(MUTED)
-                        .size(11.0),
-                )
-                .wrap()
-                .selectable(true),
-            );
-            ui.label(
-                RichText::new(format!("Format: {}", editor.original.format))
-                    .color(MUTED)
-                    .size(12.0),
-            );
+                        .size(12.0),
+                );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(asset.path.display().to_string())
+                            .monospace()
+                            .color(MUTED)
+                            .size(11.0),
+                    )
+                    .wrap()
+                    .selectable(true),
+                );
+                ui.add_space(4.0);
+            }
 
             if let Some(error) = &editor.error {
                 ui.add_space(8.0);
@@ -906,7 +908,7 @@ fn optional_metadata(value: &str) -> Option<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use lectern_core::{Book, BookFormat, BookId};
+    use lectern_core::{AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId};
     use lectern_import::ImportProgress;
 
     use super::{BookEditor, CARD_GAP, CARD_WIDTH, column_count, import_status};
@@ -950,8 +952,12 @@ mod tests {
             publisher: None,
             language: Some("en".into()),
             description: None,
-            format: BookFormat::Epub,
-            source_path: PathBuf::from("/books/dune.epub"),
+            assets: vec![BookAsset {
+                id: AssetId::new(11),
+                format: BookFormat::Epub,
+                storage: AssetStorage::Reference,
+                path: PathBuf::from("/books/dune.epub"),
+            }],
         };
         let mut editor = BookEditor::new(book);
         editor.title = "  Dune Messiah  ".into();

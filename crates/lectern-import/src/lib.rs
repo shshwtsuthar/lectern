@@ -11,8 +11,8 @@ use hayro::{
     vello_cpu::color::palette::css::WHITE,
 };
 use image::{ImageReader, Limits, codecs::jpeg::JpegEncoder};
-use lectern_core::{BookDraft, BookFormat};
-use lectern_storage::{ImportRecord, LibraryDatabase};
+use lectern_core::{AssetStorage, BookAssetDraft, BookFormat, BookMetadataDraft};
+use lectern_storage::{BookImport, LibraryDatabase};
 use lopdf::Document;
 use percent_encoding::percent_decode_str;
 use quick_xml::{Reader, XmlVersion, events::BytesStart, events::Event};
@@ -199,7 +199,7 @@ pub fn import_paths(
         }
 
         if !records.is_empty() {
-            database.import_batch(&records)?;
+            database.import_books(&records)?;
         }
 
         progress.processed += batch.len();
@@ -222,7 +222,7 @@ pub fn import_paths(
 ///
 /// Returns an error when the path has an unsupported extension or the selected parser cannot
 /// read the publication.
-pub fn parse_publication(path: impl AsRef<Path>) -> Result<ImportRecord> {
+pub fn parse_publication(path: impl AsRef<Path>) -> Result<BookImport> {
     let path = path.as_ref();
     match format_for_path(path) {
         Some(BookFormat::Epub) => parse_epub(path),
@@ -239,7 +239,7 @@ pub fn parse_publication(path: impl AsRef<Path>) -> Result<ImportRecord> {
 ///
 /// Returns an error when the file is not a readable EPUB, its container/package metadata is
 /// malformed, or a required archive path is unsafe.
-pub fn parse_epub(path: impl AsRef<Path>) -> Result<ImportRecord> {
+pub fn parse_epub(path: impl AsRef<Path>) -> Result<BookImport> {
     let path = path.as_ref();
     let mut archive = ZipArchive::new(File::open(path)?)?;
     let container = read_entry(&mut archive, CONTAINER_PATH, MAX_CONTAINER_BYTES)?;
@@ -256,17 +256,20 @@ pub fn parse_epub(path: impl AsRef<Path>) -> Result<ImportRecord> {
         .and_then(|name| name.to_str())
         .map_or_else(|| "Untitled".to_owned(), clean_text);
 
-    Ok(ImportRecord {
-        book: BookDraft {
+    Ok(BookImport {
+        book: BookMetadataDraft {
             title: metadata.title.unwrap_or(fallback_title),
             authors: metadata.creators.join(", "),
             series: metadata.series,
             publisher: metadata.publisher,
             language: metadata.language,
             description: metadata.description,
-            format: BookFormat::Epub,
-            source_path: path.to_path_buf(),
         },
+        assets: vec![BookAssetDraft {
+            format: BookFormat::Epub,
+            storage: AssetStorage::Reference,
+            path: path.to_path_buf(),
+        }],
         cover_thumbnail,
     })
 }
@@ -281,7 +284,7 @@ pub fn parse_epub(path: impl AsRef<Path>) -> Result<ImportRecord> {
 ///
 /// Returns an error when the file is too large for bounded in-memory parsing, is not a readable
 /// PDF, contains no pages, or is password protected.
-pub fn parse_pdf(path: impl AsRef<Path>) -> Result<ImportRecord> {
+pub fn parse_pdf(path: impl AsRef<Path>) -> Result<BookImport> {
     let path = path.as_ref();
     let bytes = read_bounded_file(path, MAX_PDF_BYTES)?;
     let metadata = Document::load_metadata_mem(&bytes)?;
@@ -303,17 +306,20 @@ pub fn parse_pdf(path: impl AsRef<Path>) -> Result<ImportRecord> {
     let description = clean_optional(metadata.subject);
     let cover_thumbnail = render_pdf_cover(bytes);
 
-    Ok(ImportRecord {
-        book: BookDraft {
+    Ok(BookImport {
+        book: BookMetadataDraft {
             title,
             authors,
             series: None,
             publisher: None,
             language: None,
             description,
-            format: BookFormat::Pdf,
-            source_path: path.to_path_buf(),
         },
+        assets: vec![BookAssetDraft {
+            format: BookFormat::Pdf,
+            storage: AssetStorage::Reference,
+            path: path.to_path_buf(),
+        }],
         cover_thumbnail,
     })
 }
@@ -944,7 +950,8 @@ mod tests {
             record.book.description.as_deref(),
             Some("A field guide to many worlds.")
         );
-        assert_eq!(record.book.format, BookFormat::Pdf);
+        assert_eq!(record.assets.len(), 1);
+        assert_eq!(record.assets[0].format, BookFormat::Pdf);
         let cover = record.cover_thumbnail.expect("render first page");
         let image = image::load_from_memory(&cover).expect("decode rendered cover");
         assert!(image.width() <= super::THUMBNAIL_WIDTH);
@@ -959,7 +966,8 @@ mod tests {
 
         let record = parse_publication(&path).expect("parse publication");
 
-        assert_eq!(record.book.format, BookFormat::Pdf);
+        assert_eq!(record.assets.len(), 1);
+        assert_eq!(record.assets[0].format, BookFormat::Pdf);
     }
 
     #[test]
