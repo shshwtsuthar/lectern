@@ -1,6 +1,15 @@
 # Agent Instructions
 
-## Rule #1: Commit often and frequently
+## Rule #1: Make performance a core design priority
+
+Lectern's primary goal is to be an exceptionally fast, highly performant Rust application. Treat
+performance as a first-class requirement when designing or changing core functionality: choose
+efficient algorithms and data structures, avoid unnecessary allocations and copying, and consider
+memory, concurrency, and cache behavior where they matter. Keep the resulting code correct,
+idiomatic, and maintainable, and validate performance-sensitive decisions with profiling or
+benchmarks rather than assumptions.
+
+## Rule #2: Commit often and frequently
 
 Make small, cohesive Git commits throughout every task. Commit after each independently useful,
 working change and before moving to a different concern. Do not wait until the end of a large task
