@@ -48,8 +48,8 @@ does not merge by title, author, filename, or hash. A future Calibre adapter wil
 stable book identity to create the aggregate.
 
 The library summary projection does not load or aggregate asset details. Format filtering means
-"has an asset in this format" and uses an indexed `EXISTS` predicate, preserving exactly one result
-row per logical book. Complete assets are loaded only with the book detail record.
+"has an asset in this format" and drives an indexed join from `(format, book_id)`, preserving exactly
+one result row per logical book. Complete assets are loaded only with the book detail record.
 
 Schema versions 1 and 2 migrate directly to version 3 in one immediate transaction. Book IDs,
 timestamps, covers, and full-text row IDs are preserved, and every legacy book receives one

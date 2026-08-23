@@ -422,20 +422,19 @@ impl LibraryDatabase {
         let search = build_fts_query(&query.search);
         let mut bindings = Vec::<rusqlite::types::Value>::new();
         let mut predicates = Vec::new();
+        let mut joins = Vec::new();
 
-        let join = if let Some(search) = search {
+        if let Some(search) = search {
             bindings.push(search.into());
             predicates.push(format!("books_fts MATCH ?{}", bindings.len()));
-            "JOIN books_fts ON books_fts.rowid = b.id"
-        } else {
-            ""
-        };
+            joins.push("JOIN books_fts ON books_fts.rowid = b.id".to_owned());
+        }
 
         if let Some(format) = query.format {
             bindings.push(format.as_str().to_owned().into());
-            predicates.push(format!(
-                "EXISTS (SELECT 1 FROM book_assets a \
-                 WHERE a.book_id = b.id AND a.format = ?{})",
+            joins.push(format!(
+                "JOIN book_assets filtered_assets \
+                 ON filtered_assets.book_id = b.id AND filtered_assets.format = ?{}",
                 bindings.len()
             ));
         }
@@ -453,7 +452,8 @@ impl LibraryDatabase {
         let sql = format!(
             "SELECT b.id, b.title, b.authors, b.series, \
              EXISTS(SELECT 1 FROM book_covers c WHERE c.book_id = b.id) \
-             FROM books b {join} {where_clause} ORDER BY {order}"
+             FROM books b {} {where_clause} ORDER BY {order}",
+            joins.join(" ")
         );
 
         let mut statement = self.connection.prepare_cached(&sql)?;
@@ -1487,17 +1487,16 @@ mod tests {
     }
 
     #[test]
-    fn format_filter_uses_an_asset_index_without_multiplying_books() {
+    fn format_filter_drives_from_the_covering_asset_index() {
         let database = LibraryDatabase::open_in_memory().expect("open library");
         let mut statement = database
             .connection
             .prepare(
                 "EXPLAIN QUERY PLAN \
                  SELECT b.id FROM books b \
-                 WHERE EXISTS ( \
-                     SELECT 1 FROM book_assets a \
-                     WHERE a.book_id = b.id AND a.format = 'epub' \
-                 ) \
+                 JOIN book_assets filtered_assets \
+                   ON filtered_assets.book_id = b.id \
+                  AND filtered_assets.format = 'epub' \
                  ORDER BY b.sort_title, b.id",
             )
             .expect("prepare query plan");
@@ -1509,9 +1508,9 @@ mod tests {
 
         assert!(
             details.iter().any(|detail| {
-                detail.contains("SEARCH a")
-                    && detail.contains("USING COVERING INDEX")
-                    && detail.contains("book_id=? AND format=?")
+                detail.contains("SEARCH filtered_assets USING COVERING INDEX")
+                    && detail.contains("book_assets_format_book_idx")
+                    && detail.contains("format=?)")
             }),
             "unexpected query plan: {details:?}"
         );
