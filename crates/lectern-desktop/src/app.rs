@@ -153,13 +153,16 @@ impl LecternApp {
                     self.query_pending = false;
                     match result {
                         Ok(books) => {
+                            let recovered = self.status.starts_with("Library query failed:");
                             self.books = books;
                             if self.selected.is_some_and(|selected| {
                                 !self.books.iter().any(|book| book.id == selected)
                             }) {
                                 self.clear_selection();
                             }
-                            "Library ready".clone_into(&mut self.status);
+                            if recovered {
+                                "Library ready".clone_into(&mut self.status);
+                            }
                         }
                         Err(error) => self.status = format!("Library query failed: {error}"),
                     }
