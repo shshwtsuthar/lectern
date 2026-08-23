@@ -27,6 +27,7 @@ const PHASE_COUNT: usize = 3;
 pub(crate) struct BenchmarkFrame {
     pub(crate) viewport_width: f32,
     pub(crate) viewport_height: f32,
+    pub(crate) pixels_per_point: f32,
     pub(crate) cached_covers: usize,
     pub(crate) pending_covers: usize,
     pub(crate) missing_covers: usize,
@@ -86,11 +87,12 @@ enum Phase {
 pub(crate) struct DesktopBenchmark {
     output_path: PathBuf,
     config: BenchmarkConfig,
-    process_started: Instant,
+    main_entry: Instant,
     phase: Phase,
     last_frame_started: Option<Instant>,
-    query_installed_ns: Option<u64>,
-    populated_ns: Option<u64>,
+    main_entry_to_query_installed_ns: Option<u64>,
+    main_entry_to_populated_library_ns: Option<u64>,
+    observed_scroll_duration_ns: Option<u64>,
     ready_rss_bytes: Option<u64>,
     idle_end_rss_bytes: Option<u64>,
     library_books: usize,
@@ -102,7 +104,7 @@ pub(crate) struct DesktopBenchmark {
 }
 
 impl DesktopBenchmark {
-    pub(crate) fn from_environment(process_started: Instant) -> Result<Option<Self>, String> {
+    pub(crate) fn from_environment(main_entry: Instant) -> Result<Option<Self>, String> {
         let Some(output_path) = env::var_os(OUTPUT_ENV).map(PathBuf::from) else {
             return Ok(None);
         };
@@ -111,13 +113,14 @@ impl DesktopBenchmark {
         Ok(Some(Self {
             output_path,
             config,
-            process_started,
+            main_entry,
             phase: Phase::Startup {
                 paint_frames_remaining: None,
             },
             last_frame_started: None,
-            query_installed_ns: None,
-            populated_ns: None,
+            main_entry_to_query_installed_ns: None,
+            main_entry_to_populated_library_ns: None,
+            observed_scroll_duration_ns: None,
             ready_rss_bytes: None,
             idle_end_rss_bytes: None,
             library_books: 0,
@@ -141,7 +144,7 @@ impl DesktopBenchmark {
         }
         self.library_books = books.len();
         self.books_with_covers = books.iter().filter(|book| book.has_cover).count();
-        self.query_installed_ns = elapsed_ns(self.process_started.elapsed());
+        self.main_entry_to_query_installed_ns = elapsed_ns(self.main_entry.elapsed());
         *paint_frames_remaining = Some(1);
     }
 
@@ -188,8 +191,13 @@ impl DesktopBenchmark {
         let mut begin_scroll = false;
         let mut finish = false;
         let mut failure = None;
+        let mut observed_scroll_duration = None;
+        let timed_out = now.duration_since(self.main_entry) >= self.config.timeout;
 
         match &mut self.phase {
+            Phase::Startup { .. } if timed_out => {
+                failure = Some("populated library was not rendered before timeout".to_owned());
+            }
             Phase::Startup {
                 paint_frames_remaining: Some(remaining),
             } if *remaining > 0 => {
@@ -199,14 +207,17 @@ impl DesktopBenchmark {
             Phase::Startup {
                 paint_frames_remaining: Some(_),
             } => begin_idle = true,
-            Phase::Startup { .. }
-                if now.duration_since(self.process_started) >= self.config.timeout =>
-            {
-                failure = Some("populated library was not rendered before timeout".to_owned());
+            Phase::Idle { .. } if timed_out => {
+                failure = Some("desktop benchmark timed out during the idle window".to_owned());
+            }
+            Phase::Scroll { started } if timed_out => {
+                observed_scroll_duration = Some(now.duration_since(*started));
+                failure = Some("desktop benchmark timed out during scrolling".to_owned());
             }
             Phase::Idle { started } if now.duration_since(*started) >= self.config.idle => {
                 if self.config.scroll.is_zero() {
                     self.idle_end_rss_bytes = current_rss_bytes();
+                    observed_scroll_duration = Some(Duration::ZERO);
                     finish = true;
                 } else {
                     begin_scroll = true;
@@ -216,6 +227,7 @@ impl DesktopBenchmark {
                 context.request_repaint_after(MEMORY_SAMPLE_INTERVAL);
             }
             Phase::Scroll { started } if now.duration_since(*started) >= self.config.scroll => {
+                observed_scroll_duration = Some(now.duration_since(*started));
                 finish = true;
             }
             Phase::Scroll { .. } => context.request_repaint(),
@@ -223,7 +235,8 @@ impl DesktopBenchmark {
         }
 
         if begin_idle {
-            self.populated_ns = elapsed_ns(now.duration_since(self.process_started));
+            self.main_entry_to_populated_library_ns =
+                elapsed_ns(now.duration_since(self.main_entry));
             self.ready_rss_bytes = current_rss_bytes();
             if let Some(memory) = &self.memory {
                 memory.record_sample(STARTUP_PHASE, self.ready_rss_bytes);
@@ -240,6 +253,7 @@ impl DesktopBenchmark {
             self.phase = Phase::Scroll { started: now };
             context.request_repaint();
         } else if finish || failure.is_some() {
+            self.observed_scroll_duration_ns = observed_scroll_duration.and_then(elapsed_ns);
             self.phase = Phase::Finished;
             if let Err(error) = self.write_result(failure.as_deref(), frame) {
                 eprintln!("Could not write desktop benchmark result: {error}");
@@ -283,31 +297,29 @@ impl DesktopBenchmark {
                 books: self.library_books,
                 books_with_covers: self.books_with_covers,
             },
-            startup: self.populated_ns.map(|populated_ns| StartupResult {
-                query_installed_ns: self.query_installed_ns,
-                populated_library_ns: populated_ns,
-                ready_rss_bytes: self.ready_rss_bytes,
-            }),
+            startup: self
+                .main_entry_to_populated_library_ns
+                .map(|populated_library_ns| StartupResult {
+                    main_entry_to_query_installed_ns: self.main_entry_to_query_installed_ns,
+                    main_entry_to_populated_library_ns: populated_library_ns,
+                    ready_rss_bytes: self.ready_rss_bytes,
+                }),
             idle: IdleResult {
                 duration_ns: elapsed_ns(self.config.idle),
                 end_rss_bytes: self.idle_end_rss_bytes,
             },
-            scrolling: ScrollingResult {
-                measured_duration_ns: elapsed_ns(
-                    self.config.scroll.saturating_sub(self.config.scroll_warmup),
-                ),
-                configured_speed_pixels_per_second: self.config.scroll_pixels_per_second,
-                configured_distance_pixels: self.config.scroll.as_secs_f32()
-                    * self.config.scroll_pixels_per_second,
-                frame_interval: summarize_samples(&self.frame_intervals_ns),
-                egui_unstable_dt: summarize_samples(&self.egui_frame_intervals_ns),
-                cpu_frame_time: summarize_samples(&self.cpu_frame_times_ns),
-                frame_intervals_ns: &self.frame_intervals_ns,
-                egui_unstable_dt_ns: &self.egui_frame_intervals_ns,
-                cpu_frame_times_ns: &self.cpu_frame_times_ns,
-            },
+            scrolling: ScrollingResult::new(
+                self.config,
+                self.observed_scroll_duration_ns,
+                &ScrollingSamples {
+                    frame_intervals: &self.frame_intervals_ns,
+                    egui_unstable_dt: &self.egui_frame_intervals_ns,
+                    cpu_frame_times: &self.cpu_frame_times_ns,
+                },
+            ),
             memory: MemoryResult {
                 definition: "Linux process resident set size sampled from /proc/self/status; excludes dedicated GPU memory",
+                idle_peak_window: "from the populated-library endpoint through the configured idle window; pending cover work may complete",
                 sample_interval_ms: u64::try_from(MEMORY_SAMPLE_INTERVAL.as_millis())
                     .expect("memory interval fits u64"),
                 process_baseline_rss_bytes: memory.baseline_bytes,
@@ -318,6 +330,7 @@ impl DesktopBenchmark {
             final_frame: FinalFrameResult {
                 viewport_width: frame.viewport_width,
                 viewport_height: frame.viewport_height,
+                pixels_per_point: frame.pixels_per_point,
                 cached_covers: frame.cached_covers,
                 pending_covers: frame.pending_covers,
                 missing_covers: frame.missing_covers,
@@ -325,6 +338,51 @@ impl DesktopBenchmark {
         };
         write_json(&self.output_path, &result)
     }
+}
+
+struct ScrollingSamples<'a> {
+    frame_intervals: &'a [u64],
+    egui_unstable_dt: &'a [u64],
+    cpu_frame_times: &'a [u64],
+}
+
+impl<'a> ScrollingResult<'a> {
+    fn new(
+        config: BenchmarkConfig,
+        observed_duration_ns: Option<u64>,
+        samples: &ScrollingSamples<'a>,
+    ) -> Self {
+        let configured_measured_duration = config.scroll.saturating_sub(config.scroll_warmup);
+        let observed_duration = observed_duration_ns.map(Duration::from_nanos);
+        let observed_measured_duration =
+            observed_duration.map(|duration| duration.saturating_sub(config.scroll_warmup));
+        Self {
+            configured_duration_ns: elapsed_ns(config.scroll),
+            observed_duration_ns,
+            configured_measured_duration_ns: elapsed_ns(configured_measured_duration),
+            observed_measured_duration_ns: observed_measured_duration.and_then(elapsed_ns),
+            configured_speed_pixels_per_second: config.scroll_pixels_per_second,
+            configured_distance_pixels: scroll_distance(config.scroll, config),
+            observed_distance_pixels: observed_duration
+                .map(|duration| scroll_distance(duration, config)),
+            configured_measured_distance_pixels: scroll_distance(
+                configured_measured_duration,
+                config,
+            ),
+            observed_measured_distance_pixels: observed_measured_duration
+                .map(|duration| scroll_distance(duration, config)),
+            frame_interval: summarize_samples(samples.frame_intervals),
+            egui_unstable_dt: summarize_samples(samples.egui_unstable_dt),
+            cpu_frame_time: summarize_samples(samples.cpu_frame_times),
+            frame_intervals_ns: samples.frame_intervals,
+            egui_unstable_dt_ns: samples.egui_unstable_dt,
+            cpu_frame_times_ns: samples.cpu_frame_times,
+        }
+    }
+}
+
+fn scroll_distance(duration: Duration, config: BenchmarkConfig) -> f64 {
+    duration.as_secs_f64() * f64::from(config.scroll_pixels_per_second)
 }
 
 #[derive(Serialize)]
@@ -381,8 +439,8 @@ struct LibraryResult {
 
 #[derive(Serialize)]
 struct StartupResult {
-    query_installed_ns: Option<u64>,
-    populated_library_ns: u64,
+    main_entry_to_query_installed_ns: Option<u64>,
+    main_entry_to_populated_library_ns: u64,
     ready_rss_bytes: Option<u64>,
 }
 
@@ -394,9 +452,15 @@ struct IdleResult {
 
 #[derive(Serialize)]
 struct ScrollingResult<'a> {
-    measured_duration_ns: Option<u64>,
+    configured_duration_ns: Option<u64>,
+    observed_duration_ns: Option<u64>,
+    configured_measured_duration_ns: Option<u64>,
+    observed_measured_duration_ns: Option<u64>,
     configured_speed_pixels_per_second: f32,
-    configured_distance_pixels: f32,
+    configured_distance_pixels: f64,
+    observed_distance_pixels: Option<f64>,
+    configured_measured_distance_pixels: f64,
+    observed_measured_distance_pixels: Option<f64>,
     frame_interval: Option<SampleSummary>,
     egui_unstable_dt: Option<SampleSummary>,
     cpu_frame_time: Option<SampleSummary>,
@@ -419,6 +483,7 @@ struct SampleSummary {
 #[derive(Serialize)]
 struct MemoryResult {
     definition: &'static str,
+    idle_peak_window: &'static str,
     sample_interval_ms: u64,
     process_baseline_rss_bytes: Option<u64>,
     startup_peak_rss_bytes: Option<u64>,
@@ -430,6 +495,7 @@ struct MemoryResult {
 struct FinalFrameResult {
     viewport_width: f32,
     viewport_height: f32,
+    pixels_per_point: f32,
     cached_covers: usize,
     pending_covers: usize,
     missing_covers: usize,
@@ -608,10 +674,16 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     {
         fs::create_dir_all(parent).map_err(display_error)?;
     }
-    let file = File::create(path).map_err(display_error)?;
+    let mut temporary_name = path.as_os_str().to_os_string();
+    temporary_name.push(".tmp");
+    let temporary_path = PathBuf::from(temporary_name);
+    let file = File::create(&temporary_path).map_err(display_error)?;
     let mut writer = BufWriter::new(file);
     serde_json::to_writer_pretty(&mut writer, value).map_err(display_error)?;
-    writer.write_all(b"\n").map_err(display_error)
+    writer.write_all(b"\n").map_err(display_error)?;
+    writer.flush().map_err(display_error)?;
+    drop(writer);
+    fs::rename(&temporary_path, path).map_err(display_error)
 }
 
 fn display_error(error: impl std::fmt::Display) -> String {
@@ -620,7 +692,11 @@ fn display_error(error: impl std::fmt::Display) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{nearest_rank, summarize_samples};
+    use std::time::Duration;
+
+    use super::{
+        BenchmarkConfig, ScrollingResult, ScrollingSamples, nearest_rank, summarize_samples,
+    };
 
     #[test]
     fn summarizes_frame_samples_with_nearest_rank_percentiles() {
@@ -639,5 +715,44 @@ mod tests {
         assert_eq!(nearest_rank(&[7], 99), 7);
         assert_eq!(nearest_rank(&[4, 9], 50), 4);
         assert_eq!(nearest_rank(&[4, 9], 99), 9);
+    }
+
+    #[test]
+    fn scrolling_reports_configured_and_observed_windows() {
+        let config = BenchmarkConfig {
+            idle: Duration::from_secs(3),
+            scroll: Duration::from_secs(10),
+            scroll_warmup: Duration::from_secs(2),
+            timeout: Duration::from_secs(30),
+            scroll_pixels_per_second: 1_500.0,
+        };
+        let result = ScrollingResult::new(
+            config,
+            Some(10_100_000_000),
+            &ScrollingSamples {
+                frame_intervals: &[],
+                egui_unstable_dt: &[],
+                cpu_frame_times: &[],
+            },
+        );
+
+        assert_eq!(result.configured_duration_ns, Some(10_000_000_000));
+        assert_eq!(result.observed_duration_ns, Some(10_100_000_000));
+        assert_eq!(result.configured_measured_duration_ns, Some(8_000_000_000));
+        assert_eq!(result.observed_measured_duration_ns, Some(8_100_000_000));
+        assert!((result.configured_distance_pixels - 15_000.0).abs() < f64::EPSILON);
+        assert!(
+            (result.observed_distance_pixels.expect("observed distance") - 15_150.0).abs()
+                < f64::EPSILON
+        );
+        assert!((result.configured_measured_distance_pixels - 12_000.0).abs() < f64::EPSILON);
+        assert!(
+            (result
+                .observed_measured_distance_pixels
+                .expect("observed measured distance")
+                - 12_150.0)
+                .abs()
+                < f64::EPSILON
+        );
     }
 }

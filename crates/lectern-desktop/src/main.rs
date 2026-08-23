@@ -4,21 +4,17 @@ mod app;
 mod benchmark;
 mod workers;
 
-use std::time::Instant;
+use std::{io, time::Instant};
 
 use eframe::egui;
 
 use crate::app::LecternApp;
 
 fn main() -> eframe::Result {
-    let process_started = Instant::now();
-    let benchmark = match benchmark::DesktopBenchmark::from_environment(process_started) {
-        Ok(benchmark) => benchmark,
-        Err(error) => {
-            eprintln!("Could not configure desktop benchmark: {error}");
-            None
-        }
-    };
+    let main_entry = Instant::now();
+    let benchmark = benchmark::DesktopBenchmark::from_environment(main_entry).map_err(|error| {
+        eframe::Error::AppCreation(Box::new(io::Error::new(io::ErrorKind::InvalidInput, error)))
+    })?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1_280.0, 820.0])

@@ -758,6 +758,7 @@ impl eframe::App for LecternApp {
                 &BenchmarkFrame {
                     viewport_width: ui.max_rect().width(),
                     viewport_height: ui.max_rect().height(),
+                    pixels_per_point: ui.ctx().pixels_per_point(),
                     cached_covers: self.covers.len(),
                     pending_covers: self.pending_covers.len(),
                     missing_covers: self.missing_covers.len(),
