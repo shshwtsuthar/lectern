@@ -1335,6 +1335,48 @@ mod tests {
     }
 
     #[test]
+    fn managed_assets_require_safe_portable_relative_paths() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        for path in ["/absolute/book.epub", "../outside.epub"] {
+            let imported = BookImport {
+                book: metadata("Unsafe", "Author"),
+                assets: vec![BookAssetDraft {
+                    format: BookFormat::Epub,
+                    storage: AssetStorage::Managed,
+                    path: path.into(),
+                }],
+                cover_thumbnail: None,
+            };
+
+            assert!(matches!(
+                database.import_books(&[imported]),
+                Err(StorageError::InvalidAssetPath(_))
+            ));
+        }
+        assert_eq!(database.count().expect("count books"), 0);
+    }
+
+    #[test]
+    fn shared_managed_location_can_back_distinct_books() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let managed = |title: &str| BookImport {
+            book: metadata(title, "Author"),
+            assets: vec![BookAssetDraft {
+                format: BookFormat::Epub,
+                storage: AssetStorage::Managed,
+                path: "objects/ab/content.epub".into(),
+            }],
+            cover_thumbnail: None,
+        };
+
+        database
+            .import_books(&[managed("One"), managed("Two")])
+            .expect("import shared managed content");
+
+        assert_eq!(database.count().expect("count books"), 2);
+    }
+
+    #[test]
     fn single_publication_compatibility_import_still_works() {
         let mut database = LibraryDatabase::open_in_memory().expect("open library");
         let legacy = ImportRecord {
@@ -1404,6 +1446,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn deleting_a_book_cascades_to_assets_and_cover() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let mut imported = record("/books/dune.epub", "Dune", "Frank Herbert");
+        imported.cover_thumbnail = Some(vec![1, 2, 3]);
+        let id = database.import_books(&[imported]).expect("import book")[0];
+
+        database
+            .connection
+            .execute("DELETE FROM books WHERE id = ?1", [id.value()])
+            .expect("delete book");
+
+        let assets: i64 = database
+            .connection
+            .query_row("SELECT count(*) FROM book_assets", [], |row| row.get(0))
+            .expect("count assets");
+        assert_eq!(assets, 0);
+        assert_eq!(database.load_cover(id).expect("load cover"), None);
+    }
+
+    #[test]
+    fn unknown_stored_formats_are_not_silently_mislabeled() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let id = database
+            .import_books(&[record("/books/dune.epub", "Dune", "Frank Herbert")])
+            .expect("import book")[0];
+        database
+            .connection
+            .execute(
+                "UPDATE book_assets SET format = 'azw3' WHERE book_id = ?1",
+                [id.value()],
+            )
+            .expect("store future format");
+
+        assert!(matches!(
+            database.get_book(id),
+            Err(StorageError::InvalidAssetFormat(format)) if format == "azw3"
+        ));
+    }
+
+    #[test]
+    fn format_filter_uses_an_asset_index_without_multiplying_books() {
+        let database = LibraryDatabase::open_in_memory().expect("open library");
+        let mut statement = database
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN \
+                 SELECT b.id FROM books b \
+                 WHERE EXISTS ( \
+                     SELECT 1 FROM book_assets a \
+                     WHERE a.book_id = b.id AND a.format = 'epub' \
+                 ) \
+                 ORDER BY b.sort_title, b.id",
+            )
+            .expect("prepare query plan");
+        let details = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("explain query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect query plan");
+
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("SEARCH a")
+                    && detail.contains("USING COVERING INDEX")
+                    && detail.contains("book_id=? AND format=?")
+            }),
+            "unexpected query plan: {details:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn non_utf8_reference_paths_round_trip_without_loss() {
@@ -1432,6 +1545,60 @@ mod tests {
             decode_path("windows", vec![0]),
             Err(StorageError::InvalidPathData(encoding)) if encoding == "windows"
         ));
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_schema_data_and_search_index() {
+        let database_file = TestDatabase::new("migration-rollback");
+        create_legacy_library(database_file.path(), 2, BookFormat::Epub);
+        let connection = Connection::open(database_file.path()).expect("open legacy database");
+        connection
+            .pragma_update(None, "ignore_check_constraints", "ON")
+            .expect("disable checks for corrupt fixture");
+        connection
+            .execute("UPDATE books SET format = 'INVALID!' WHERE id = 7", [])
+            .expect("corrupt legacy format");
+        drop(connection);
+
+        assert!(LibraryDatabase::open(database_file.path()).is_err());
+
+        let connection = Connection::open(database_file.path()).expect("reopen rolled-back file");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read rolled-back version");
+        assert_eq!(version, 2);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('books') \
+                     WHERE name = 'source_path'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("check legacy column"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema \
+                     WHERE type = 'table' AND name = 'book_assets'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("check asset table absence"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM books_fts WHERE books_fts MATCH 'Dune'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("search rolled-back FTS index"),
+            1
+        );
     }
 
     #[test]
