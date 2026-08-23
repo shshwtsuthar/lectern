@@ -56,7 +56,7 @@ CREATE TABLE book_assets (
                   CHECK (storage_mode IN ('reference', 'managed')),
     path_encoding TEXT NOT NULL DEFAULT 'utf8'
                   CHECK (path_encoding IN ('utf8', 'unix', 'windows')),
-    path          BLOB NOT NULL,
+    path          BLOB NOT NULL CHECK (length(path) > 0),
     added_at      INTEGER NOT NULL DEFAULT (unixepoch()),
     modified_at   INTEGER NOT NULL DEFAULT (unixepoch()),
     UNIQUE(book_id, format),
@@ -150,7 +150,7 @@ CREATE TABLE book_assets (
                   CHECK (storage_mode IN ('reference', 'managed')),
     path_encoding TEXT NOT NULL DEFAULT 'utf8'
                   CHECK (path_encoding IN ('utf8', 'unix', 'windows')),
-    path          BLOB NOT NULL,
+    path          BLOB NOT NULL CHECK (length(path) > 0),
     added_at      INTEGER NOT NULL DEFAULT (unixepoch()),
     modified_at   INTEGER NOT NULL DEFAULT (unixepoch()),
     UNIQUE(book_id, format),
@@ -1552,11 +1552,8 @@ mod tests {
         create_legacy_library(database_file.path(), 2, BookFormat::Epub);
         let connection = Connection::open(database_file.path()).expect("open legacy database");
         connection
-            .pragma_update(None, "ignore_check_constraints", "ON")
-            .expect("disable checks for corrupt fixture");
-        connection
-            .execute("UPDATE books SET format = 'INVALID!' WHERE id = 7", [])
-            .expect("corrupt legacy format");
+            .execute("UPDATE books SET source_path = '' WHERE id = 7", [])
+            .expect("corrupt legacy path");
         drop(connection);
 
         assert!(LibraryDatabase::open(database_file.path()).is_err());
