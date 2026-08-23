@@ -2,6 +2,7 @@
 
 use std::{
     ffi::OsString,
+    fs::File,
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -12,8 +13,8 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 use lectern_core::{
-    AssetId, AssetStorage, Book, BookAsset, BookAssetDraft, BookDraft, BookFormat, BookId,
-    BookMetadataDraft, BookSummary, LibraryQuery, SortOrder,
+    AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookAssetDraft,
+    BookDraft, BookFormat, BookId, BookMetadataDraft, BookSummary, LibraryQuery, SortOrder,
 };
 use rusqlite::{
     Connection, OptionalExtension, Statement, Transaction, TransactionBehavior, params,
@@ -23,7 +24,7 @@ use thiserror::Error;
 #[cfg(not(any(unix, windows)))]
 compile_error!("Lectern's lossless path codec currently supports Unix and Windows targets");
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = r"
 CREATE TABLE books (
@@ -54,6 +55,8 @@ CREATE TABLE book_assets (
     ),
     storage_mode  TEXT NOT NULL DEFAULT 'reference'
                   CHECK (storage_mode IN ('reference', 'managed')),
+    health        TEXT NOT NULL DEFAULT 'unknown'
+                  CHECK (health IN ('unknown', 'available', 'missing', 'unreadable')),
     path_encoding TEXT NOT NULL DEFAULT 'utf8'
                   CHECK (path_encoding IN ('utf8', 'unix', 'windows')),
     path          BLOB NOT NULL CHECK (length(path) > 0),
@@ -68,6 +71,7 @@ CREATE UNIQUE INDEX book_assets_reference_path_uidx
     ON book_assets(path_encoding, path)
     WHERE storage_mode = 'reference';
 CREATE INDEX book_assets_format_book_idx ON book_assets(format, book_id);
+CREATE INDEX book_assets_health_book_idx ON book_assets(health, book_id);
 
 CREATE TABLE book_covers (
     book_id INTEGER PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
@@ -215,6 +219,12 @@ END;
 INSERT INTO books_fts(books_fts) VALUES ('rebuild');
 ";
 
+const MIGRATE_3_TO_4: &str = r"
+ALTER TABLE book_assets ADD COLUMN health TEXT NOT NULL DEFAULT 'unknown'
+    CHECK (health IN ('unknown', 'available', 'missing', 'unreadable'));
+CREATE INDEX book_assets_health_book_idx ON book_assets(health, book_id);
+";
+
 /// Failure returned by the persistence adapter.
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -254,6 +264,9 @@ pub enum StorageError {
     /// A stored asset ownership mode is not supported by this build.
     #[error("unsupported stored asset storage mode '{0}'")]
     InvalidAssetStorage(String),
+    /// A stored asset health value is not supported by this build.
+    #[error("unsupported stored asset health '{0}'")]
+    InvalidAssetHealth(String),
     /// A stored path uses an unknown platform encoding.
     #[error("unsupported stored path encoding '{0}'")]
     InvalidPathEncoding(String),
@@ -439,6 +452,15 @@ impl LibraryDatabase {
             ));
         }
 
+        if let Some(health) = query.asset_health {
+            bindings.push(health.as_str().to_owned().into());
+            joins.push(format!(
+                "JOIN (SELECT book_id FROM book_assets WHERE health = ?{} GROUP BY book_id) \
+                 health_assets ON health_assets.book_id = b.id",
+                bindings.len()
+            ));
+        }
+
         let where_clause = if predicates.is_empty() {
             String::new()
         } else {
@@ -451,7 +473,9 @@ impl LibraryDatabase {
         };
         let sql = format!(
             "SELECT b.id, b.title, b.authors, b.series, \
-             EXISTS(SELECT 1 FROM book_covers c WHERE c.book_id = b.id) \
+             EXISTS(SELECT 1 FROM book_covers c WHERE c.book_id = b.id), \
+             EXISTS(SELECT 1 FROM book_assets a \
+                    WHERE a.book_id = b.id AND a.health IN ('missing', 'unreadable')) \
              FROM books b {} {where_clause} ORDER BY {order}",
             joins.join(" ")
         );
@@ -464,6 +488,7 @@ impl LibraryDatabase {
                 authors: row.get(2)?,
                 series: row.get(3)?,
                 has_cover: row.get(4)?,
+                has_file_issue: row.get(5)?,
             })
         })?;
 
@@ -479,7 +504,7 @@ impl LibraryDatabase {
     pub fn get_book(&self, id: BookId) -> Result<Option<Book>> {
         let mut statement = self.connection.prepare_cached(
             "SELECT b.id, b.title, b.authors, b.series, b.publisher, b.language, b.description, \
-                    a.id, a.format, a.storage_mode, a.path_encoding, a.path \
+                    a.id, a.format, a.storage_mode, a.health, a.path_encoding, a.path \
              FROM books b LEFT JOIN book_assets a ON a.book_id = b.id \
              WHERE b.id = ?1 ORDER BY a.format, a.id",
         )?;
@@ -505,12 +530,14 @@ impl LibraryDatabase {
             })?;
             let format_value = row.get::<_, String>(8)?;
             let storage_value = row.get::<_, String>(9)?;
-            let path_encoding = row.get::<_, String>(10)?;
-            let path_bytes = row.get::<_, Vec<u8>>(11)?;
+            let health_value = row.get::<_, String>(10)?;
+            let path_encoding = row.get::<_, String>(11)?;
+            let path_bytes = row.get::<_, Vec<u8>>(12)?;
             let asset = BookAsset {
                 id: AssetId::new(asset_id),
                 format: decode_format(&format_value)?,
                 storage: decode_storage(&storage_value)?,
+                health: decode_health(&health_value)?,
                 path: decode_path(&path_encoding, path_bytes)?,
             };
             if let Some(book) = &mut book {
@@ -552,6 +579,70 @@ impl LibraryDatabase {
             return Err(StorageError::BookNotFound(book.id));
         }
         Ok(())
+    }
+
+    /// Checks every externally referenced asset and records only changed health states.
+    ///
+    /// The scan uses filesystem metadata plus a file-open check. It intentionally does not parse
+    /// publication contents, compute hashes, or rewrite rows whose health state is unchanged.
+    /// Managed assets are omitted because their library-root resolution is owned by future managed
+    /// storage support.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when asset paths cannot be decoded or changed health states cannot be
+    /// persisted.
+    pub fn rescan_reference_assets(&mut self) -> Result<AssetHealthReport> {
+        let mut statement = self.connection.prepare_cached(
+            "SELECT id, health, path_encoding, path FROM book_assets \
+             WHERE storage_mode = 'reference' ORDER BY id",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut assets = Vec::new();
+        while let Some(row) = rows.next()? {
+            let health = decode_health(&row.get::<_, String>(1)?)?;
+            let path = decode_path(&row.get::<_, String>(2)?, row.get(3)?)?;
+            assets.push(ReferenceAsset {
+                id: AssetId::new(row.get(0)?),
+                health,
+                path,
+            });
+        }
+        drop(rows);
+        drop(statement);
+
+        let mut report = AssetHealthReport::default();
+        let mut changed = Vec::new();
+        for asset in assets {
+            let health = inspect_reference_asset(&asset.path);
+            report.checked += 1;
+            match health {
+                AssetHealth::Available => report.available += 1,
+                AssetHealth::Missing => report.missing += 1,
+                AssetHealth::Unreadable => report.unreadable += 1,
+                AssetHealth::Unknown => unreachable!("a scan must produce a concrete health"),
+            }
+            if health != asset.health {
+                changed.push((asset.id, health));
+            }
+        }
+        report.changed = changed.len();
+        if changed.is_empty() {
+            return Ok(report);
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut update = transaction.prepare(
+            "UPDATE book_assets SET health = ?1, modified_at = unixepoch() WHERE id = ?2",
+        )?;
+        for (id, health) in changed {
+            update.execute(params![health.as_str(), id.value()])?;
+        }
+        drop(update);
+        transaction.commit()?;
+        Ok(report)
     }
 
     /// Loads a cached JPEG cover thumbnail.
@@ -603,7 +694,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
     let observed = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match observed {
         SCHEMA_VERSION => return Ok(()),
-        0..=2 => {}
+        0..=3 => {}
         unsupported => return Err(StorageError::UnsupportedSchema(unsupported)),
     }
 
@@ -632,6 +723,11 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
         }
         1 | 2 => {
             transaction.execute_batch(MIGRATE_1_OR_2_TO_3)?;
+            transaction.execute_batch(MIGRATE_3_TO_4)?;
+            true
+        }
+        3 => {
+            transaction.execute_batch(MIGRATE_3_TO_4)?;
             true
         }
         SCHEMA_VERSION => false,
@@ -734,6 +830,12 @@ struct EncodedAsset {
     storage: AssetStorage,
     path_encoding: &'static str,
     path: Vec<u8>,
+}
+
+struct ReferenceAsset {
+    id: AssetId,
+    health: AssetHealth,
+    path: PathBuf,
 }
 
 struct ImportStatements<'connection> {
@@ -989,6 +1091,21 @@ fn decode_storage(value: &str) -> Result<AssetStorage> {
     AssetStorage::parse(value).ok_or_else(|| StorageError::InvalidAssetStorage(value.into()))
 }
 
+fn decode_health(value: &str) -> Result<AssetHealth> {
+    AssetHealth::parse(value).ok_or_else(|| StorageError::InvalidAssetHealth(value.into()))
+}
+
+fn inspect_reference_asset(path: &Path) -> AssetHealth {
+    match std::fs::metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => AssetHealth::Missing,
+        Ok(metadata) if metadata.is_file() => match File::open(path) {
+            Ok(_) => AssetHealth::Available,
+            Err(_) => AssetHealth::Unreadable,
+        },
+        Ok(_) | Err(_) => AssetHealth::Unreadable,
+    }
+}
+
 fn build_fts_query(input: &str) -> Option<String> {
     let terms = input
         .split_whitespace()
@@ -1011,12 +1128,13 @@ mod tests {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
     use lectern_core::{
-        AssetStorage, Book, BookAssetDraft, BookFormat, BookId, BookMetadataDraft, LibraryQuery,
+        AssetHealth, AssetHealthReport, AssetStorage, Book, BookAssetDraft, BookFormat, BookId,
+        BookMetadataDraft, LibraryQuery,
     };
     use rusqlite::Connection;
 
     use super::{
-        BookImport, ImportRecord, LibraryDatabase, SCHEMA_VERSION, StorageError,
+        BookImport, ImportRecord, LibraryDatabase, SCHEMA, SCHEMA_VERSION, StorageError,
         configure_persistent_database, decode_path,
     };
 
@@ -1047,6 +1165,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    struct TestAsset(PathBuf);
+
+    impl TestAsset {
+        fn file(label: &str) -> Self {
+            let path = temporary_asset_path(label);
+            fs::write(&path, b"publication").expect("write test asset");
+            Self(path)
+        }
+
+        fn directory(label: &str) -> Self {
+            let path = temporary_asset_path(label);
+            fs::create_dir(&path).expect("create test asset directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestAsset {
+        fn drop(&mut self) {
+            if self.0.is_dir() {
+                fs::remove_dir(&self.0).expect("remove test asset directory");
+            } else if self.0.exists() {
+                fs::remove_file(&self.0).expect("remove test asset file");
+            }
+        }
+    }
+
+    fn temporary_asset_path(label: &str) -> PathBuf {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "lectern-storage-{label}-{}-{id}.epub",
+            std::process::id()
+        ))
     }
 
     fn metadata(title: &str, authors: &str) -> BookMetadataDraft {
@@ -1194,6 +1350,80 @@ mod tests {
     }
 
     #[test]
+    fn rescans_references_without_rewriting_unchanged_asset_states() {
+        let present = TestAsset::file("present");
+        let unreadable = TestAsset::directory("directory");
+        let missing = temporary_asset_path("missing");
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        database
+            .import_books(&[
+                record(
+                    present.path().to_string_lossy().as_ref(),
+                    "Present",
+                    "Author",
+                ),
+                record(missing.to_string_lossy().as_ref(), "Missing", "Author"),
+                record(
+                    unreadable.path().to_string_lossy().as_ref(),
+                    "Unreadable",
+                    "Author",
+                ),
+            ])
+            .expect("import records");
+
+        let report = database.rescan_reference_assets().expect("scan references");
+        assert_eq!(
+            report,
+            AssetHealthReport {
+                checked: 3,
+                available: 1,
+                missing: 1,
+                unreadable: 1,
+                changed: 3,
+            }
+        );
+        assert_eq!(
+            database
+                .query(&LibraryQuery {
+                    asset_health: Some(AssetHealth::Missing),
+                    ..LibraryQuery::default()
+                })
+                .expect("query missing books")
+                .len(),
+            1
+        );
+        assert_eq!(
+            database
+                .query(&LibraryQuery {
+                    asset_health: Some(AssetHealth::Unreadable),
+                    ..LibraryQuery::default()
+                })
+                .expect("query unreadable books")
+                .len(),
+            1
+        );
+        assert!(
+            database
+                .query(&LibraryQuery::default())
+                .expect("query books")
+                .iter()
+                .any(|book| book.has_file_issue)
+        );
+
+        let repeat = database
+            .rescan_reference_assets()
+            .expect("repeat scan references");
+        assert_eq!(repeat.changed, 0);
+
+        fs::remove_file(present.path()).expect("remove present asset");
+        let changed = database
+            .rescan_reference_assets()
+            .expect("scan changed references");
+        assert_eq!(changed.missing, 2);
+        assert_eq!(changed.changed, 1);
+    }
+
+    #[test]
     fn persistent_libraries_require_durable_journaling_and_full_sync() {
         let database_file = TestDatabase::new("durability");
         let database = LibraryDatabase::open(database_file.path()).expect("open library");
@@ -1265,6 +1495,52 @@ mod tests {
                     .expect("run foreign-key check")
             );
         }
+    }
+
+    #[test]
+    fn migrates_version_three_libraries_with_unknown_asset_health() {
+        let database_file = TestDatabase::new("migration-v3");
+        let version_three_schema = SCHEMA
+            .replace(
+                "    health        TEXT NOT NULL DEFAULT 'unknown'\n                  CHECK (health IN ('unknown', 'available', 'missing', 'unreadable')),\n",
+                "",
+            )
+            .replace("CREATE INDEX book_assets_health_book_idx ON book_assets(health, book_id);\n", "");
+        let connection = Connection::open(database_file.path()).expect("open v3 database");
+        connection
+            .execute_batch(&version_three_schema)
+            .expect("create v3 schema");
+        connection
+            .execute(
+                "INSERT INTO books (id, title, sort_title, authors, sort_authors) \
+                 VALUES (7, 'Dune', 'dune', 'Frank Herbert', 'frank herbert')",
+                [],
+            )
+            .expect("insert v3 book");
+        connection
+            .execute(
+                "INSERT INTO book_assets (id, book_id, format, storage_mode, path_encoding, path) \
+                 VALUES (9, 7, 'epub', 'reference', 'utf8', x'2F626F6F6B732F64756E652E65707562')",
+                [],
+            )
+            .expect("insert v3 asset");
+        connection
+            .pragma_update(None, "user_version", 3)
+            .expect("mark v3 schema");
+        drop(connection);
+
+        let database = LibraryDatabase::open(database_file.path()).expect("migrate database");
+        let book = database
+            .get_book(BookId::new(7))
+            .expect("load migrated book")
+            .expect("migrated book exists");
+
+        assert_eq!(book.assets[0].health, AssetHealth::Unknown);
+        let version: i64 = database
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated version");
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
@@ -1551,6 +1827,32 @@ mod tests {
                 detail.contains("SEARCH filtered_assets USING COVERING INDEX")
                     && detail.contains("book_assets_format_book_idx")
                     && detail.contains("format=?)")
+            }),
+            "unexpected query plan: {details:?}"
+        );
+    }
+
+    #[test]
+    fn asset_health_filter_drives_from_the_covering_asset_index() {
+        let database = LibraryDatabase::open_in_memory().expect("open library");
+        let mut statement = database
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN \
+                 SELECT book_id FROM book_assets WHERE health = 'missing' GROUP BY book_id",
+            )
+            .expect("prepare query plan");
+        let details = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("explain query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect query plan");
+
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("SEARCH book_assets USING COVERING INDEX")
+                    && detail.contains("book_assets_health_book_idx")
+                    && detail.contains("health=?)")
             }),
             "unexpected query plan: {details:?}"
         );

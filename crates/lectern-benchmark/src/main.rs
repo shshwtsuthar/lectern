@@ -571,6 +571,7 @@ impl QueryScenario {
         LibraryQuery {
             search: self.search.into(),
             format: self.format,
+            asset_health: None,
             sort: self.sort,
         }
     }

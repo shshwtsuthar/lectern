@@ -156,6 +156,62 @@ impl fmt::Display for AssetStorage {
     }
 }
 
+/// Most recently observed availability of a book asset.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AssetHealth {
+    /// Lectern has not checked this asset since it was added or upgraded.
+    #[default]
+    Unknown,
+    /// The asset was a readable regular file during the last scan.
+    Available,
+    /// The asset path did not exist during the last scan.
+    Missing,
+    /// The asset existed but could not be used as a readable regular file.
+    Unreadable,
+}
+
+impl AssetHealth {
+    /// Returns the stable lowercase storage value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Available => "available",
+            Self::Missing => "missing",
+            Self::Unreadable => "unreadable",
+        }
+    }
+
+    /// Parses a stable storage value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "unknown" => Some(Self::Unknown),
+            "available" => Some(Self::Available),
+            "missing" => Some(Self::Missing),
+            "unreadable" => Some(Self::Unreadable),
+            _ => None,
+        }
+    }
+
+    /// Returns whether the most recent check found a file problem.
+    #[must_use]
+    pub const fn has_issue(self) -> bool {
+        matches!(self, Self::Missing | Self::Unreadable)
+    }
+}
+
+impl fmt::Display for AssetHealth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown => formatter.write_str("Not checked"),
+            Self::Available => formatter.write_str("Available"),
+            Self::Missing => formatter.write_str("Missing"),
+            Self::Unreadable => formatter.write_str("Unreadable"),
+        }
+    }
+}
+
 /// File asset ready to be attached to a logical book.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BookAssetDraft {
@@ -176,6 +232,8 @@ pub struct BookAsset {
     pub format: BookFormat,
     /// Whether Lectern or the user owns the file.
     pub storage: AssetStorage,
+    /// Most recently observed availability of the file.
+    pub health: AssetHealth,
     /// External path for a reference asset or library-relative path for a managed asset.
     pub path: PathBuf,
 }
@@ -214,6 +272,8 @@ pub struct LibraryQuery {
     pub search: String,
     /// Optional file-format filter.
     pub format: Option<BookFormat>,
+    /// Optional last-observed asset-health filter.
+    pub asset_health: Option<AssetHealth>,
     /// Requested result order.
     pub sort: SortOrder,
 }
@@ -231,6 +291,23 @@ pub struct BookSummary {
     pub series: Option<String>,
     /// Whether a cached cover thumbnail is available.
     pub has_cover: bool,
+    /// Whether any attached asset was last found missing or unreadable.
+    pub has_file_issue: bool,
+}
+
+/// Summary returned after checking the externally referenced assets in a library.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AssetHealthReport {
+    /// Number of reference assets checked.
+    pub checked: usize,
+    /// Number of reference assets found as readable files.
+    pub available: usize,
+    /// Number of reference assets that no longer existed.
+    pub missing: usize,
+    /// Number of reference assets that existed but could not be read as files.
+    pub unreadable: usize,
+    /// Number of stored health states changed by the scan.
+    pub changed: usize,
 }
 
 /// Complete editable metadata for a library entry.
@@ -298,7 +375,7 @@ pub struct BookDraft {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssetId, AssetStorage, BookFormat, BookId, BuildInfo};
+    use super::{AssetHealth, AssetId, AssetStorage, BookFormat, BookId, BuildInfo};
 
     #[test]
     fn current_build_info_is_populated() {
@@ -338,5 +415,19 @@ mod tests {
         );
         assert_eq!(AssetStorage::parse("managed"), Some(AssetStorage::Managed));
         assert_eq!(AssetStorage::parse("copied"), None);
+    }
+
+    #[test]
+    fn asset_health_has_stable_values_and_issue_states() {
+        assert_eq!(AssetHealth::Unknown.as_str(), "unknown");
+        assert_eq!(AssetHealth::Available.as_str(), "available");
+        assert_eq!(AssetHealth::Missing.as_str(), "missing");
+        assert_eq!(AssetHealth::Unreadable.as_str(), "unreadable");
+        assert_eq!(AssetHealth::parse("missing"), Some(AssetHealth::Missing));
+        assert_eq!(AssetHealth::parse("offline"), None);
+        assert!(!AssetHealth::Unknown.has_issue());
+        assert!(!AssetHealth::Available.has_issue());
+        assert!(AssetHealth::Missing.has_issue());
+        assert!(AssetHealth::Unreadable.has_issue());
     }
 }

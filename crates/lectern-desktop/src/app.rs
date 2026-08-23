@@ -909,7 +909,7 @@ fn optional_metadata(value: &str) -> Option<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use lectern_core::{AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId};
+    use lectern_core::{AssetHealth, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId};
     use lectern_import::ImportProgress;
 
     use super::{BookEditor, CARD_GAP, CARD_WIDTH, column_count, import_status};
@@ -957,6 +957,7 @@ mod tests {
                 id: AssetId::new(11),
                 format: BookFormat::Epub,
                 storage: AssetStorage::Reference,
+                health: AssetHealth::Unknown,
                 path: PathBuf::from("/books/dune.epub"),
             }],
         };
