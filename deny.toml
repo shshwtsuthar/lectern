@@ -17,7 +17,10 @@ allow = [
   "CC0-1.0",
   "ISC",
   "MIT",
+  "MPL-2.0",
+  "OFL-1.1",
   "Unicode-3.0",
+  "Ubuntu-font-1.0",
   "Zlib",
 ]
 confidence-threshold = 0.8
