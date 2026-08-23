@@ -1,15 +1,29 @@
 [workspace]
 members = ["crates/*"]
+default-members = ["crates/lectern-desktop"]
 resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.97"
 publish = false
 
 [workspace.dependencies]
+crossbeam-channel = "0.5.16"
+directories = "6.0.0"
+eframe = "0.36.1"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+lectern-import = { path = "crates/lectern-import", version = "0.1.0" }
 lectern-core = { path = "crates/lectern-core", version = "0.1.0" }
+lectern-storage = { path = "crates/lectern-storage", version = "0.1.0" }
+quick-xml = "0.41.0"
+rayon = "1.12.0"
+rfd = "0.17.2"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+thiserror = "2.0"
+walkdir = "2.5.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"

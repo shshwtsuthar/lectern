@@ -1,17 +1,15 @@
 [package]
-name = "lectern-cli"
-description = "Command-line entry point for Lectern"
+name = "lectern-storage"
+description = "SQLite persistence adapter for Lectern"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-[[bin]]
-name = "lectern-cli"
-path = "src/main.rs"
-
 [dependencies]
 lectern-core.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

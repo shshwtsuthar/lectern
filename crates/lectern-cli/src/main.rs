@@ -4,9 +4,9 @@ use std::{env, ffi::OsString, process::ExitCode};
 
 use lectern_core::BuildInfo;
 
-const USAGE: &str = "Lectern library manager
+const USAGE: &str = "Lectern command-line tools
 
-Usage: lectern [OPTIONS]
+Usage: lectern-cli [OPTIONS]
 
 Options:
   -h, --help       Print help
@@ -34,7 +34,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
         }
         _ => {
             eprintln!(
-                "error: unrecognized argument '{}'. Run 'lectern --help' for usage.",
+                "error: unrecognized argument '{}'. Run 'lectern-cli --help' for usage.",
                 argument.to_string_lossy()
             );
             ExitCode::from(2)

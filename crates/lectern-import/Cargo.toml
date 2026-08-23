@@ -1,0 +1,20 @@
+[package]
+name = "lectern-import"
+description = "EPUB discovery and import pipeline for Lectern"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+image.workspace = true
+lectern-core.workspace = true
+lectern-storage.workspace = true
+quick-xml.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+walkdir.workspace = true
+zip.workspace = true
+
+[lints]
+workspace = true

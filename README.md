@@ -5,11 +5,12 @@ This repository currently contains the production-oriented Rust scaffold, not pr
 
 ## Quick start
 
-Install Rust with [rustup](https://rustup.rs/). The workspace supports Rust 1.85 or newer and uses
+Install Rust with [rustup](https://rustup.rs/). The workspace supports Rust 1.97 or newer and uses
 the latest stable toolchain for day-to-day development.
 
 ```sh
-cargo run -- --help
+cargo run
+cargo run -p lectern-cli -- --help
 cargo test-all
 cargo clippy-all
 cargo fmt --all --check
@@ -19,8 +20,11 @@ cargo fmt --all --check
 
 ```text
 crates/
-├── lectern-core/  # UI- and infrastructure-independent application boundary
-└── lectern-cli/   # Thin executable adapter and initial smoke-test surface
+├── lectern-core/     # UI- and infrastructure-independent application boundary
+├── lectern-desktop/  # Native application
+├── lectern-import/   # EPUB discovery and ingestion
+├── lectern-storage/  # SQLite persistence
+└── lectern-cli/      # Command-line diagnostics and automation
 docs/
 └── adr/           # Architecture decision records
 ```
