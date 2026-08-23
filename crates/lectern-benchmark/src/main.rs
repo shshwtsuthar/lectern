@@ -27,6 +27,8 @@ const DEFAULT_WARMUP: usize = 10;
 const SEED_BATCH_SIZE: usize = 500;
 const DEFAULT_SEED: u64 = 20_260_824;
 const MAX_RECORDED_FAILURES: usize = 200;
+const BENCHMARK_COVER_WIDTH: u32 = 320;
+const BENCHMARK_COVER_HEIGHT: u32 = 480;
 
 const USAGE: &str = "Lectern exploratory performance harness
 
@@ -248,6 +250,9 @@ struct SeedResult {
     metadata_seed: u64,
     cover_every: usize,
     covered_books: usize,
+    cover_width_pixels: u32,
+    cover_height_pixels: u32,
+    cover_encoded_bytes: usize,
     batch_size: usize,
     elapsed_ms: f64,
     database_bytes: u64,
@@ -297,6 +302,9 @@ fn run_seed(options: &SeedOptions) -> Result<(), String> {
         metadata_seed: options.seed,
         cover_every: options.cover_every,
         covered_books,
+        cover_width_pixels: BENCHMARK_COVER_WIDTH,
+        cover_height_pixels: BENCHMARK_COVER_HEIGHT,
+        cover_encoded_bytes: cover.as_ref().map_or(0, Vec::len),
         batch_size: SEED_BATCH_SIZE,
         elapsed_ms: duration_ms(elapsed),
         database_bytes: fs::metadata(&options.database)
@@ -402,8 +410,8 @@ fn splitmix64(mut value: u64) -> u64 {
 }
 
 fn make_benchmark_cover() -> Result<Vec<u8>, String> {
-    let image = RgbImage::from_fn(48, 72, |x, y| {
-        let stripe = ((x / 8) + (y / 12)) % 3;
+    let image = RgbImage::from_fn(BENCHMARK_COVER_WIDTH, BENCHMARK_COVER_HEIGHT, |x, y| {
+        let stripe = ((x / 40) + (y / 60)) % 3;
         match stripe {
             0 => Rgb([28, 80, 112]),
             1 => Rgb([214, 153, 76]),
@@ -548,7 +556,7 @@ struct CorpusStats {
     pdf_files: usize,
     total_bytes: u64,
     file_size_bytes: SizeSummary,
-    inspection_ms: f64,
+    post_import_inspection_ms: f64,
 }
 
 #[derive(Serialize)]
@@ -622,16 +630,6 @@ fn run_import(options: &ImportOptions) -> Result<(), String> {
     }
     remove_database_files(&options.database)?;
 
-    let inspection_started = Instant::now();
-    let publications =
-        discover_publications(std::slice::from_ref(&options.corpus)).map_err(display_error)?;
-    if publications.is_empty() {
-        return Err(format!(
-            "no EPUB or PDF files found beneath {}",
-            options.corpus.display()
-        ));
-    }
-    let corpus = inspect_corpus(&publications, inspection_started.elapsed())?;
     let baseline_rss_bytes = current_rss_bytes();
     let sampler = MemorySampler::start(Duration::from_millis(20))?;
     let started = Instant::now();
@@ -644,6 +642,15 @@ fn run_import(options: &ImportOptions) -> Result<(), String> {
     let elapsed = started.elapsed();
     let peak_rss_bytes = sampler.finish()?;
     let summary = result.map_err(display_error)?;
+    let publications =
+        discover_publications(std::slice::from_ref(&options.corpus)).map_err(display_error)?;
+    if publications.is_empty() {
+        return Err(format!(
+            "no EPUB or PDF files found beneath {}",
+            options.corpus.display()
+        ));
+    }
+    let corpus = inspect_corpus(&publications)?;
     let measurements = ImportMeasurements {
         elapsed,
         baseline_rss_bytes,
@@ -733,7 +740,8 @@ fn assemble_import_result(
     })
 }
 
-fn inspect_corpus(paths: &[PathBuf], elapsed: Duration) -> Result<CorpusStats, String> {
+fn inspect_corpus(paths: &[PathBuf]) -> Result<CorpusStats, String> {
+    let started = Instant::now();
     let mut epub_files = 0;
     let mut pdf_files = 0;
     let mut sizes = Vec::with_capacity(paths.len());
@@ -767,7 +775,7 @@ fn inspect_corpus(paths: &[PathBuf], elapsed: Duration) -> Result<CorpusStats, S
             p95: nearest_rank(&sizes, 95),
             max: *sizes.last().expect("non-empty corpus"),
         },
-        inspection_ms: duration_ms(elapsed),
+        post_import_inspection_ms: duration_ms(started.elapsed()),
     })
 }
 
