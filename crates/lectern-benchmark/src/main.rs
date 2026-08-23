@@ -3,10 +3,10 @@
 use std::{
     env,
     ffi::OsString,
-    fs::{self, File},
+    fs::{self, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{self, ExitCode},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -29,6 +29,7 @@ const DEFAULT_SEED: u64 = 20_260_824;
 const MAX_RECORDED_FAILURES: usize = 200;
 const BENCHMARK_COVER_WIDTH: u32 = 320;
 const BENCHMARK_COVER_HEIGHT: u32 = 480;
+const BENCHMARK_ADDED_AT_UNIX_SECONDS: i64 = 1_700_000_000;
 
 const USAGE: &str = "Lectern exploratory performance harness
 
@@ -230,6 +231,65 @@ fn required_path(option: &str, value: Option<PathBuf>) -> Result<PathBuf, String
     value.ok_or_else(|| format!("missing required {option}"))
 }
 
+fn ensure_distinct_paths(
+    first_label: &str,
+    first: &Path,
+    second_label: &str,
+    second: &Path,
+) -> Result<(), String> {
+    if comparison_path(first)? == comparison_path(second)? {
+        return Err(format!(
+            "{first_label} and {second_label} must use different paths: {}",
+            first.display()
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_outside_directory(
+    path_label: &str,
+    path: &Path,
+    directory_label: &str,
+    directory: &Path,
+) -> Result<(), String> {
+    if directory.is_dir() && comparison_path(path)?.starts_with(comparison_path(directory)?) {
+        return Err(format!(
+            "{path_label} must not be inside the {directory_label} directory: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn comparison_path(path: &Path) -> Result<PathBuf, String> {
+    if path.exists() {
+        return fs::canonicalize(path).map_err(display_error);
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+        && parent.is_dir()
+    {
+        return fs::canonicalize(parent)
+            .map(|parent| parent.join(name))
+            .map_err(display_error);
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir().map_err(display_error)?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
 fn parse_number<T>(option: &str, value: &str) -> Result<T, String>
 where
     T: std::str::FromStr,
@@ -248,6 +308,7 @@ struct SeedResult {
     requested_books: usize,
     stored_books: u64,
     metadata_seed: u64,
+    fixed_timestamp_unix_seconds: i64,
     cover_every: usize,
     covered_books: usize,
     cover_width_pixels: u32,
@@ -259,6 +320,7 @@ struct SeedResult {
 }
 
 fn run_seed(options: &SeedOptions) -> Result<(), String> {
+    ensure_distinct_paths("database", &options.database, "output", &options.output)?;
     if options.database.exists() && !options.replace {
         return Err(format!(
             "{} already exists; choose a new benchmark path or pass --replace",
@@ -289,9 +351,16 @@ fn run_seed(options: &SeedOptions) -> Result<(), String> {
         database.import_batch(&records).map_err(display_error)?;
     }
 
-    let elapsed = started.elapsed();
     let stored_books = database.count().map_err(display_error)?;
+    if stored_books != u64::try_from(options.books).expect("book count fits u64") {
+        return Err(format!(
+            "seed integrity check failed: requested {} books but stored {stored_books}",
+            options.books
+        ));
+    }
     drop(database);
+    normalize_seed_timestamps(&options.database, options.books)?;
+    let elapsed = started.elapsed();
     let result = SeedResult {
         schema_version: 1,
         kind: "seed",
@@ -300,6 +369,7 @@ fn run_seed(options: &SeedOptions) -> Result<(), String> {
         requested_books: options.books,
         stored_books,
         metadata_seed: options.seed,
+        fixed_timestamp_unix_seconds: BENCHMARK_ADDED_AT_UNIX_SECONDS,
         cover_every: options.cover_every,
         covered_books,
         cover_width_pixels: BENCHMARK_COVER_WIDTH,
@@ -323,8 +393,8 @@ fn run_seed(options: &SeedOptions) -> Result<(), String> {
 fn remove_database_files(database: &Path) -> Result<(), String> {
     for path in [
         database.to_path_buf(),
-        PathBuf::from(format!("{}-shm", database.display())),
-        PathBuf::from(format!("{}-wal", database.display())),
+        sqlite_sidecar(database, "-shm"),
+        sqlite_sidecar(database, "-wal"),
     ] {
         match fs::remove_file(&path) {
             Ok(()) => {}
@@ -333,6 +403,29 @@ fn remove_database_files(database: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn normalize_seed_timestamps(database: &Path, expected_books: usize) -> Result<(), String> {
+    let mut connection = rusqlite::Connection::open(database).map_err(display_error)?;
+    let transaction = connection.transaction().map_err(display_error)?;
+    let updated = transaction
+        .execute(
+            "UPDATE books SET added_at = ?1, modified_at = ?1",
+            [BENCHMARK_ADDED_AT_UNIX_SECONDS],
+        )
+        .map_err(display_error)?;
+    if updated != expected_books {
+        return Err(format!(
+            "timestamp normalization updated {updated} books; expected {expected_books}"
+        ));
+    }
+    transaction.commit().map_err(display_error)
+}
+
+fn sqlite_sidecar(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    path.into()
 }
 
 fn benchmark_record(index: usize, seed: u64, cover_thumbnail: Option<Vec<u8>>) -> ImportRecord {
@@ -412,11 +505,19 @@ fn splitmix64(mut value: u64) -> u64 {
 fn make_benchmark_cover() -> Result<Vec<u8>, String> {
     let image = RgbImage::from_fn(BENCHMARK_COVER_WIDTH, BENCHMARK_COVER_HEIGHT, |x, y| {
         let stripe = ((x / 40) + (y / 60)) % 3;
-        match stripe {
-            0 => Rgb([28, 80, 112]),
-            1 => Rgb([214, 153, 76]),
-            _ => Rgb([235, 228, 209]),
-        }
+        let base: [u8; 3] = match stripe {
+            0 => [28, 80, 112],
+            1 => [214, 153, 76],
+            _ => [235, 228, 209],
+        };
+        let coarse_x = u64::from(x / 3);
+        let coarse_y = u64::from(y / 3);
+        let grain = splitmix64((coarse_x << 32) ^ coarse_y ^ DEFAULT_SEED);
+        let adjustment = i16::from(u8::try_from(grain & 31).expect("grain is bounded")) - 15;
+        Rgb(base.map(|channel| {
+            u8::try_from((i16::from(channel) + adjustment).clamp(0, 255))
+                .expect("adjusted channel is clamped")
+        }))
     });
     let mut encoded = Vec::new();
     JpegEncoder::new_with_quality(&mut encoded, 82)
@@ -476,8 +577,21 @@ impl QueryScenario {
 }
 
 fn run_query(options: &QueryOptions) -> Result<(), String> {
+    ensure_distinct_paths("database", &options.database, "output", &options.output)?;
+    if !options.database.is_file() {
+        return Err(format!(
+            "benchmark database is not a file: {}",
+            options.database.display()
+        ));
+    }
     let database = LibraryDatabase::open(&options.database).map_err(display_error)?;
     let library_books = database.count().map_err(display_error)?;
+    if library_books == 0 {
+        return Err(format!(
+            "benchmark database contains no books: {}",
+            options.database.display()
+        ));
+    }
     let scenarios = query_scenarios();
     let mut samples = vec![Vec::with_capacity(options.iterations); scenarios.len()];
     let mut result_counts = vec![0; scenarios.len()];
@@ -616,6 +730,11 @@ struct ImportMeasurements {
 }
 
 fn run_import(options: &ImportOptions) -> Result<(), String> {
+    ensure_distinct_paths("database", &options.database, "output", &options.output)?;
+    ensure_distinct_paths("database", &options.database, "corpus", &options.corpus)?;
+    ensure_distinct_paths("output", &options.output, "corpus", &options.corpus)?;
+    ensure_outside_directory("database", &options.database, "corpus", &options.corpus)?;
+    ensure_outside_directory("output", &options.output, "corpus", &options.corpus)?;
     if !options.corpus.exists() {
         return Err(format!(
             "corpus does not exist: {}",
@@ -627,6 +746,16 @@ fn run_import(options: &ImportOptions) -> Result<(), String> {
             "{} already exists; choose a new benchmark path or pass --replace",
             options.database.display()
         ));
+    }
+    if options.database.exists() {
+        let publications =
+            discover_publications(std::slice::from_ref(&options.corpus)).map_err(display_error)?;
+        if publications.is_empty() {
+            return Err(format!(
+                "no EPUB or PDF files found beneath {}; existing database was preserved",
+                options.corpus.display()
+            ));
+        }
     }
     remove_database_files(&options.database)?;
 
@@ -951,10 +1080,26 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     {
         fs::create_dir_all(parent).map_err(display_error)?;
     }
-    let file = File::create(path).map_err(display_error)?;
-    let mut writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, value).map_err(display_error)?;
-    writer.write_all(b"\n").map_err(display_error)
+    let mut temporary = path.as_os_str().to_os_string();
+    temporary.push(format!(".tmp-{}", process::id()));
+    let temporary = PathBuf::from(temporary);
+    let result = (|| {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(display_error)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, value).map_err(display_error)?;
+        writer.write_all(b"\n").map_err(display_error)?;
+        writer.flush().map_err(display_error)?;
+        drop(writer);
+        fs::rename(&temporary, path).map_err(display_error)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn display_error(error: impl std::fmt::Display) -> String {
@@ -963,10 +1108,11 @@ fn display_error(error: impl std::fmt::Display) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::{ffi::OsString, path::Path};
 
     use super::{
-        Arguments, ImportOptions, QueryOptions, SeedOptions, benchmark_record, nearest_rank,
+        Arguments, BENCHMARK_COVER_HEIGHT, BENCHMARK_COVER_WIDTH, ImportOptions, QueryOptions,
+        SeedOptions, benchmark_record, ensure_distinct_paths, make_benchmark_cover, nearest_rank,
         parse_linux_rss_bytes, splitmix64,
     };
 
@@ -1041,6 +1187,28 @@ mod tests {
         assert_eq!(first, repeated);
         assert_ne!(first.book.title, other.book.title);
         assert_eq!(splitmix64(7), splitmix64(7));
+    }
+
+    #[test]
+    fn benchmark_cover_has_representative_dimensions() {
+        let encoded = make_benchmark_cover().expect("encode benchmark cover");
+        let image = image::load_from_memory(&encoded).expect("decode benchmark cover");
+
+        assert_eq!(image.width(), BENCHMARK_COVER_WIDTH);
+        assert_eq!(image.height(), BENCHMARK_COVER_HEIGHT);
+        assert!(encoded.len() > 10_000);
+    }
+
+    #[test]
+    fn equivalent_paths_are_not_accepted_as_distinct() {
+        let result = ensure_distinct_paths(
+            "database",
+            Path::new("target/../benchmark.json"),
+            "output",
+            Path::new("benchmark.json"),
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
