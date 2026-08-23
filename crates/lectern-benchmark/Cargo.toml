@@ -1,0 +1,22 @@
+[package]
+name = "lectern-benchmark"
+description = "Exploratory performance harness for Lectern"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "lectern-benchmark"
+path = "src/main.rs"
+
+[dependencies]
+image.workspace = true
+lectern-core.workspace = true
+lectern-import.workspace = true
+lectern-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
