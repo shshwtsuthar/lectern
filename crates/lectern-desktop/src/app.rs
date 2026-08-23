@@ -6,9 +6,10 @@ use std::{
 use directories::ProjectDirs;
 use eframe::egui::{self, Align, Color32, FontId, RichText, Sense, Stroke, StrokeKind, Vec2};
 use lectern_core::{BookFormat, BookId, BookSummary, LibraryQuery, SortOrder};
+use lectern_import::{ImportProgress, ImportSummary};
 use lectern_storage::LibraryDatabase;
 
-use crate::workers::{DecodedCover, QueryRequest, WorkerEvent, WorkerSet};
+use crate::workers::{DecodedCover, ImportRequest, QueryRequest, WorkerEvent, WorkerSet};
 
 const BACKGROUND: Color32 = Color32::from_rgb(18, 20, 24);
 const PANEL: Color32 = Color32::from_rgb(24, 27, 32);
@@ -41,6 +42,10 @@ pub(crate) struct LecternApp {
     covers: HashMap<BookId, CachedCover>,
     frame_number: u64,
     status: String,
+    importing: bool,
+    import_progress: Option<ImportProgress>,
+    import_summary: Option<ImportSummary>,
+    show_import_summary: bool,
 }
 
 impl LecternApp {
@@ -65,6 +70,10 @@ impl LecternApp {
             covers: HashMap::new(),
             frame_number: 0,
             status,
+            importing: false,
+            import_progress: None,
+            import_summary: None,
+            show_import_summary: false,
         };
         app.refresh_library();
         app
@@ -115,6 +124,28 @@ impl LecternApp {
                         }
                     }
                 }
+                WorkerEvent::ImportProgress(progress) => {
+                    self.import_progress = Some(progress);
+                    self.status = import_status(progress);
+                }
+                WorkerEvent::ImportFinished(result) => {
+                    self.importing = false;
+                    self.import_progress = None;
+                    match result {
+                        Ok(summary) => {
+                            self.status = format!(
+                                "Imported {} of {} EPUBs; {} failed",
+                                summary.imported, summary.discovered, summary.failed
+                            );
+                            self.show_import_summary = summary.failed > 0;
+                            self.import_summary = Some(summary);
+                            self.covers.clear();
+                            self.missing_covers.clear();
+                            self.refresh_library();
+                        }
+                        Err(error) => self.status = format!("Import failed: {error}"),
+                    }
+                }
                 WorkerEvent::Error(error) => self.status = format!("Background worker: {error}"),
             }
         }
@@ -154,7 +185,9 @@ impl LecternApp {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_centered(|ui| {
+        let mut add_books = false;
+        let mut add_folder = false;
+        ui.horizontal(|ui| {
             ui.heading(RichText::new("Lectern").size(26.0).strong());
             ui.label(
                 RichText::new(format!("{} books", self.books.len()))
@@ -164,7 +197,41 @@ impl LecternApp {
             if self.query_pending {
                 ui.spinner();
             }
+            if self.importing {
+                ui.label(RichText::new("Importing…").color(ACCENT).size(12.0));
+            }
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                add_folder = ui
+                    .add_enabled(!self.importing, egui::Button::new("Add folder"))
+                    .clicked();
+                add_books = ui
+                    .add_enabled(!self.importing, egui::Button::new("Add books"))
+                    .clicked();
+                if self
+                    .import_summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.failed > 0)
+                    && ui.button("Import report").clicked()
+                {
+                    self.show_import_summary = true;
+                }
+            });
         });
+        if add_books
+            && let Some(paths) = rfd::FileDialog::new()
+                .set_title("Add books to Lectern")
+                .add_filter("EPUB books", &["epub"])
+                .pick_files()
+        {
+            self.start_import(paths);
+        }
+        if add_folder
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Add a folder to Lectern")
+                .pick_folder()
+        {
+            self.start_import(vec![path]);
+        }
         ui.add_space(10.0);
 
         let mut query_changed = false;
@@ -209,6 +276,79 @@ impl LecternApp {
         if query_changed {
             self.refresh_library();
         }
+    }
+
+    fn start_import(&mut self, roots: Vec<PathBuf>) {
+        if roots.is_empty() {
+            return;
+        }
+        if self.importing {
+            "An import is already running".clone_into(&mut self.status);
+            return;
+        }
+        if self.workers.import(ImportRequest { roots }) {
+            self.importing = true;
+            self.import_progress = Some(ImportProgress::default());
+            self.import_summary = None;
+            "Discovering EPUB files…".clone_into(&mut self.status);
+        } else {
+            "Import worker is unavailable".clone_into(&mut self.status);
+        }
+    }
+
+    fn accept_dropped_files(&mut self, ui: &egui::Ui) {
+        let paths = ui.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        if !paths.is_empty() {
+            self.start_import(paths);
+        }
+    }
+
+    fn import_summary_window(&mut self, context: &egui::Context) {
+        let Some(summary) = &self.import_summary else {
+            return;
+        };
+        let mut open = self.show_import_summary;
+        egui::Window::new("Import report")
+            .open(&mut open)
+            .default_width(560.0)
+            .collapsible(false)
+            .show(context, |ui| {
+                ui.heading(format!(
+                    "{} imported · {} failed",
+                    summary.imported, summary.failed
+                ));
+                ui.label(format!(
+                    "{} EPUB files were discovered.",
+                    summary.discovered
+                ));
+                if !summary.failures.is_empty() {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for failure in summary.failures.iter().take(200) {
+                                ui.label(
+                                    RichText::new(failure.path.display().to_string()).strong(),
+                                );
+                                ui.label(RichText::new(&failure.message).color(MUTED));
+                                ui.add_space(7.0);
+                            }
+                            let hidden = summary.failures.len().saturating_sub(200);
+                            if hidden > 0 {
+                                ui.label(format!("…and {hidden} more failures."));
+                            }
+                        });
+                }
+            });
+        self.show_import_summary = open;
     }
 
     fn library(&mut self, ui: &mut egui::Ui) {
@@ -349,6 +489,9 @@ impl LecternApp {
 
     fn status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
+            if self.importing {
+                ui.spinner();
+            }
             ui.label(RichText::new(&self.status).color(MUTED).size(12.0));
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
@@ -365,6 +508,8 @@ impl eframe::App for LecternApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frame_number = self.frame_number.wrapping_add(1);
         self.poll_workers(ui.ctx());
+        self.accept_dropped_files(ui);
+        let files_hovering = ui.input(|input| !input.raw.hovered_files.is_empty());
 
         egui::Panel::top("toolbar")
             .frame(
@@ -387,6 +532,22 @@ impl eframe::App for LecternApp {
                     .inner_margin(egui::Margin::symmetric(22, 18)),
             )
             .show(ui, |ui| self.library(ui));
+        self.import_summary_window(ui.ctx());
+
+        if files_hovering {
+            let rect = ui.max_rect().shrink(18.0);
+            ui.painter()
+                .rect_filled(rect, 14, Color32::from_rgba_premultiplied(23, 43, 58, 238));
+            ui.painter()
+                .rect_stroke(rect, 14, Stroke::new(2.0, ACCENT), StrokeKind::Inside);
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop EPUBs or folders to import",
+                FontId::proportional(24.0),
+                Color32::WHITE,
+            );
+        }
     }
 }
 
@@ -438,9 +599,21 @@ fn centered_message(ui: &mut egui::Ui, title: &str, detail: &str, spinner: bool)
     });
 }
 
+fn import_status(progress: ImportProgress) -> String {
+    if progress.discovered == 0 {
+        return "Discovering EPUB files…".to_owned();
+    }
+    format!(
+        "Importing {}/{} · {} imported · {} failed",
+        progress.processed, progress.discovered, progress.imported, progress.failed
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CARD_GAP, CARD_WIDTH, column_count};
+    use lectern_import::ImportProgress;
+
+    use super::{CARD_GAP, CARD_WIDTH, column_count, import_status};
 
     #[test]
     fn grid_always_has_a_column() {
@@ -452,5 +625,22 @@ mod tests {
     fn grid_adds_only_complete_columns() {
         assert_eq!(column_count(CARD_WIDTH * 2.0 + CARD_GAP - 1.0), 1);
         assert_eq!(column_count(CARD_WIDTH * 2.0 + CARD_GAP), 2);
+    }
+
+    #[test]
+    fn import_progress_is_human_readable() {
+        assert_eq!(
+            import_status(ImportProgress::default()),
+            "Discovering EPUB files…"
+        );
+        assert_eq!(
+            import_status(ImportProgress {
+                discovered: 10,
+                processed: 4,
+                imported: 3,
+                failed: 1,
+            }),
+            "Importing 4/10 · 3 imported · 1 failed"
+        );
     }
 }

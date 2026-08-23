@@ -8,6 +8,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use eframe::egui;
 use image::{ImageReader, Limits};
 use lectern_core::{BookId, BookSummary, LibraryQuery};
+use lectern_import::{ImportProgress, ImportSummary, import_paths};
 use lectern_storage::LibraryDatabase;
 
 const COVER_QUEUE_CAPACITY: usize = 128;
@@ -19,6 +20,10 @@ const MAX_STORED_COVER_ALLOCATION: u64 = 16 * 1024 * 1024;
 pub(crate) struct QueryRequest {
     pub(crate) generation: u64,
     pub(crate) query: LibraryQuery,
+}
+
+pub(crate) struct ImportRequest {
+    pub(crate) roots: Vec<PathBuf>,
 }
 
 pub(crate) struct DecodedCover {
@@ -35,12 +40,15 @@ pub(crate) enum WorkerEvent {
         id: BookId,
         result: Result<Option<DecodedCover>, String>,
     },
+    ImportProgress(ImportProgress),
+    ImportFinished(Result<ImportSummary, String>),
     Error(String),
 }
 
 pub(crate) struct WorkerSet {
     query_sender: Sender<QueryRequest>,
     cover_sender: Sender<BookId>,
+    import_sender: Sender<ImportRequest>,
     event_receiver: Receiver<WorkerEvent>,
 }
 
@@ -48,6 +56,7 @@ impl WorkerSet {
     pub(crate) fn spawn(database_path: &Path, context: &egui::Context) -> Self {
         let (query_sender, query_receiver) = unbounded();
         let (cover_sender, cover_receiver) = bounded(COVER_QUEUE_CAPACITY);
+        let (import_sender, import_receiver) = bounded(1);
         let (event_sender, event_receiver) = unbounded();
 
         spawn_query_worker(
@@ -69,10 +78,17 @@ impl WorkerSet {
                 context.clone(),
             );
         }
+        spawn_import_worker(
+            database_path.to_path_buf(),
+            import_receiver,
+            event_sender,
+            context.clone(),
+        );
 
         Self {
             query_sender,
             cover_sender,
+            import_sender,
             event_receiver,
         }
     }
@@ -88,8 +104,49 @@ impl WorkerSet {
         }
     }
 
+    pub(crate) fn import(&self, request: ImportRequest) -> bool {
+        self.import_sender.try_send(request).is_ok()
+    }
+
     pub(crate) fn next_event(&self) -> Option<WorkerEvent> {
         self.event_receiver.try_recv().ok()
+    }
+}
+
+fn spawn_import_worker(
+    database_path: PathBuf,
+    receiver: Receiver<ImportRequest>,
+    events: Sender<WorkerEvent>,
+    context: egui::Context,
+) {
+    let failure_events = events.clone();
+    let failure_context = context.clone();
+    let result = thread::Builder::new()
+        .name("lectern-import".into())
+        .spawn(move || import_worker(&database_path, &receiver, &events, &context));
+    if let Err(error) = result {
+        publish(
+            &failure_events,
+            &failure_context,
+            WorkerEvent::Error(format!("Could not start import worker: {error}")),
+        );
+    }
+}
+
+fn import_worker(
+    database_path: &PathBuf,
+    receiver: &Receiver<ImportRequest>,
+    events: &Sender<WorkerEvent>,
+    context: &egui::Context,
+) {
+    while let Ok(request) = receiver.recv() {
+        let result = import_paths(database_path, &request.roots, |progress| {
+            publish(events, context, WorkerEvent::ImportProgress(progress));
+        })
+        .map_err(|error| error.to_string());
+        if !publish(events, context, WorkerEvent::ImportFinished(result)) {
+            break;
+        }
     }
 }
 
