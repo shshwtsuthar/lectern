@@ -574,12 +574,26 @@ fn configure_persistent_database(connection: &Connection) -> Result<()> {
         row.get::<_, String>(0)
     })?;
 
-    // FULL is safe in both WAL and rollback-journal modes. SQLite may decline WAL on an
-    // unsupported filesystem, so do not combine an unchecked journal-mode request with NORMAL.
+    // SQLite may decline WAL on an unsupported filesystem. In that case, explicitly activate a
+    // durable rollback journal instead of accepting modes such as MEMORY or OFF.
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        let fallback = connection.query_row("PRAGMA journal_mode = DELETE", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+        if !fallback.eq_ignore_ascii_case("delete") {
+            return Err(StorageError::Integrity(format!(
+                "SQLite could not activate WAL or rollback journaling (reported '{fallback}')"
+            )));
+        }
+    }
+
+    // FULL is safe in both WAL and rollback-journal modes.
     connection.pragma_update(None, "synchronous", "FULL")?;
-    if journal_mode.is_empty() {
+    let synchronous =
+        connection.pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))?;
+    if synchronous != 2 {
         return Err(StorageError::Integrity(
-            "SQLite did not report an active journal mode".into(),
+            "SQLite could not activate full synchronization".into(),
         ));
     }
     Ok(())
@@ -1002,7 +1016,8 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        BookImport, ImportRecord, LibraryDatabase, SCHEMA_VERSION, StorageError, decode_path,
+        BookImport, ImportRecord, LibraryDatabase, SCHEMA_VERSION, StorageError,
+        configure_persistent_database, decode_path,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -1176,6 +1191,31 @@ mod tests {
         assert_eq!(book.assets.len(), 2);
         assert_eq!(book.assets[0].format, BookFormat::Epub);
         assert_eq!(book.assets[1].format, BookFormat::Pdf);
+    }
+
+    #[test]
+    fn persistent_libraries_require_durable_journaling_and_full_sync() {
+        let database_file = TestDatabase::new("durability");
+        let database = LibraryDatabase::open(database_file.path()).expect("open library");
+        let journal_mode = database
+            .connection
+            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+            .expect("read journal mode");
+        let synchronous = database
+            .connection
+            .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+            .expect("read synchronization mode");
+
+        assert!(
+            journal_mode.eq_ignore_ascii_case("wal") || journal_mode.eq_ignore_ascii_case("delete")
+        );
+        assert_eq!(synchronous, 2);
+
+        let memory = Connection::open_in_memory().expect("open memory database");
+        assert!(matches!(
+            configure_persistent_database(&memory),
+            Err(StorageError::Integrity(message)) if message.contains("rollback journaling")
+        ));
     }
 
     #[test]
