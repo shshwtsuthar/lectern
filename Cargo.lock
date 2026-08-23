@@ -1772,6 +1772,7 @@ dependencies = [
  "image",
  "lectern-core",
  "lectern-storage",
+ "percent-encoding",
  "quick-xml",
  "rayon",
  "thiserror 2.0.20",

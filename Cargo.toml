@@ -17,6 +17,7 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 lectern-import = { path = "crates/lectern-import", version = "0.1.0" }
 lectern-core = { path = "crates/lectern-core", version = "0.1.0" }
 lectern-storage = { path = "crates/lectern-storage", version = "0.1.0" }
+percent-encoding = "2.3.2"
 quick-xml = "0.41.0"
 rayon = "1.12.0"
 rfd = "0.17.2"
