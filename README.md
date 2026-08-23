@@ -1,13 +1,14 @@
 # Lectern
 
 Lectern is a fast, native-feeling library manager for people who own ebooks. The current thin
-application is deliberately focused: it imports EPUBs into a local library, makes them immediately
-searchable, renders a cover grid, and edits their metadata.
+application is deliberately focused: it imports EPUB and PDF books into a local library, makes them
+immediately searchable, renders a cover grid, and edits their metadata.
 
 ## What works
 
-- Add individual EPUBs, recursively import a folder, or drop either onto the window.
-- Extract title, authors, series, publisher, language, description, and a bounded cover thumbnail.
+- Add individual EPUB or PDF books, recursively import a folder, or drop either onto the window.
+- Extract EPUB metadata and embedded covers; extract standard PDF metadata and render the first page
+  as a bounded cover thumbnail.
 - Search title, author, series, and publisher with SQLite FTS5 prefix indexes.
 - Filter by format and sort by title, author, or recently added.
 - Browse a virtualized grid whose cover I/O, image decoding, and database queries stay off the UI
@@ -15,7 +16,8 @@ searchable, renders a cover grid, and edits their metadata.
 - Edit metadata in place and refresh the search index as soon as it is saved.
 
 Bulk editing, device export, filesystem export, and Calibre-library import are not implemented yet.
-They remain product work rather than hidden placeholders in this release.
+Password-protected PDFs also require a future password prompt. These remain product work rather
+than hidden placeholders in this release.
 
 ## Quick start
 
@@ -47,7 +49,7 @@ book card to open its metadata editor; `Ctrl-S` on Windows/Linux or `Cmd-S` on m
 crates/
 ├── lectern-core/     # UI- and infrastructure-independent application boundary
 ├── lectern-desktop/  # Native application
-├── lectern-import/   # EPUB discovery and ingestion
+├── lectern-import/   # EPUB and PDF discovery and ingestion
 ├── lectern-storage/  # SQLite persistence
 └── lectern-cli/      # Command-line diagnostics and automation
 docs/
@@ -55,8 +57,9 @@ docs/
 ```
 
 Shared dependency versions live at the workspace root, while adapter-specific dependencies stay in
-their owning crates. The desktop uses egui/eframe, storage uses bundled SQLite through rusqlite, and
-EPUB ingestion uses bounded ZIP, XML, and image processing.
+their owning crates. The desktop uses egui/eframe, storage uses bundled SQLite through rusqlite,
+EPUB ingestion uses bounded ZIP, XML, and image processing, and PDF ingestion uses bounded parsing
+with a native CPU renderer.
 
 The application has performance-conscious boundaries but makes no unmeasured performance claims.
 Once the thin workflow and representative libraries are stable, profiling and targeted benchmarks

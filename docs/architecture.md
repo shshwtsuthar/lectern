@@ -24,7 +24,8 @@ CLI-first product.
 
 - `lectern-core` owns book, query, format, and sort types without infrastructure dependencies.
 - `lectern-storage` owns schema migration, transactional writes, FTS5 queries, and cover blobs.
-- `lectern-import` owns EPUB discovery, bounded archive/XML/image parsing, and batched ingestion.
+- `lectern-import` owns EPUB/PDF discovery, bounded parsing and cover rendering, and batched
+  ingestion.
 - `lectern-desktop` owns native presentation, worker coordination, and platform dialogs.
 - `lectern-cli` remains a small diagnostic executable.
 
@@ -42,7 +43,8 @@ only when background work completes or interaction requires it.
 
 SQLite runs in WAL mode for the persistent library. FTS5 triggers keep search data consistent with
 imports and metadata edits. Imports never extract archive members to disk, reject unsafe archive
-paths, and cap XML, cover entry, decoded-image, and batch sizes.
+paths, and cap XML, cover entry, decoded-image, PDF file, thumbnail, and batch sizes. PDF first pages
+are rendered on the CPU without a system PDF runtime.
 
 ## Operational principles
 

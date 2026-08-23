@@ -190,7 +190,7 @@ impl LecternApp {
                     match result {
                         Ok(summary) => {
                             self.status = format!(
-                                "Imported {} of {} EPUBs; {} failed",
+                                "Imported {} of {} books; {} failed",
                                 summary.imported, summary.discovered, summary.failed
                             );
                             self.show_import_summary = summary.failed > 0;
@@ -309,7 +309,7 @@ impl LecternApp {
         if add_books
             && let Some(paths) = rfd::FileDialog::new()
                 .set_title("Add books to Lectern")
-                .add_filter("EPUB books", &["epub"])
+                .add_filter("Ebooks", &["epub", "pdf"])
                 .pick_files()
         {
             self.start_import(paths);
@@ -379,7 +379,7 @@ impl LecternApp {
             self.importing = true;
             self.import_progress = Some(ImportProgress::default());
             self.import_summary = None;
-            "Discovering EPUB files…".clone_into(&mut self.status);
+            "Discovering book files…".clone_into(&mut self.status);
         } else {
             "Import worker is unavailable".clone_into(&mut self.status);
         }
@@ -414,7 +414,7 @@ impl LecternApp {
                     summary.imported, summary.failed
                 ));
                 ui.label(format!(
-                    "{} EPUB files were discovered.",
+                    "{} book files were discovered.",
                     summary.discovered
                 ));
                 if !summary.failures.is_empty() {
@@ -545,7 +545,7 @@ impl LecternApp {
                 centered_message(
                     ui,
                     "Your library is ready",
-                    "Drop EPUB files here to start building it.",
+                    "Drop EPUB or PDF files here to start building it.",
                     false,
                 );
             } else {
@@ -725,7 +725,7 @@ impl eframe::App for LecternApp {
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Drop EPUBs or folders to import",
+                "Drop EPUBs, PDFs, or folders to import",
                 FontId::proportional(24.0),
                 Color32::WHITE,
             );
@@ -783,7 +783,7 @@ fn centered_message(ui: &mut egui::Ui, title: &str, detail: &str, spinner: bool)
 
 fn import_status(progress: ImportProgress) -> String {
     if progress.discovered == 0 {
-        return "Discovering EPUB files…".to_owned();
+        return "Discovering book files…".to_owned();
     }
     format!(
         "Importing {}/{} · {} imported · {} failed",
@@ -892,7 +892,7 @@ mod tests {
     fn import_progress_is_human_readable() {
         assert_eq!(
             import_status(ImportProgress::default()),
-            "Discovering EPUB files…"
+            "Discovering book files…"
         );
         assert_eq!(
             import_status(ImportProgress {
