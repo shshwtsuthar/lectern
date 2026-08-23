@@ -55,17 +55,20 @@ impl fmt::Display for BookId {
 pub enum BookFormat {
     /// EPUB publication.
     Epub,
+    /// Portable Document Format publication.
+    Pdf,
 }
 
 impl BookFormat {
     /// All currently supported formats.
-    pub const ALL: [Self; 1] = [Self::Epub];
+    pub const ALL: [Self; 2] = [Self::Epub, Self::Pdf];
 
     /// Returns the stable lowercase storage value.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Epub => "epub",
+            Self::Pdf => "pdf",
         }
     }
 
@@ -74,6 +77,7 @@ impl BookFormat {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "epub" => Some(Self::Epub),
+            "pdf" => Some(Self::Pdf),
             _ => None,
         }
     }
@@ -83,6 +87,7 @@ impl fmt::Display for BookFormat {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Epub => formatter.write_str("EPUB"),
+            Self::Pdf => formatter.write_str("PDF"),
         }
     }
 }
@@ -209,7 +214,9 @@ mod tests {
     #[test]
     fn formats_have_stable_storage_values() {
         assert_eq!(BookFormat::Epub.as_str(), "epub");
+        assert_eq!(BookFormat::Pdf.as_str(), "pdf");
         assert_eq!(BookFormat::parse("epub"), Some(BookFormat::Epub));
-        assert_eq!(BookFormat::parse("pdf"), None);
+        assert_eq!(BookFormat::parse("pdf"), Some(BookFormat::Pdf));
+        assert_eq!(BookFormat::parse("mobi"), None);
     }
 }

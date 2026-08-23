@@ -6,7 +6,7 @@ use lectern_core::{Book, BookDraft, BookFormat, BookId, BookSummary, LibraryQuer
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = r"
 CREATE TABLE books (
@@ -19,7 +19,7 @@ CREATE TABLE books (
     publisher   TEXT,
     language    TEXT,
     description TEXT,
-    format      TEXT NOT NULL CHECK (format IN ('epub')),
+    format      TEXT NOT NULL CHECK (format IN ('epub', 'pdf')),
     source_path TEXT NOT NULL UNIQUE,
     added_at    INTEGER NOT NULL DEFAULT (unixepoch()),
     modified_at INTEGER NOT NULL DEFAULT (unixepoch())
@@ -63,7 +63,97 @@ CREATE TRIGGER books_after_update AFTER UPDATE ON books BEGIN
     VALUES (new.id, new.title, new.authors, new.series, new.publisher);
 END;
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
+";
+
+const MIGRATE_1_TO_2: &str = r"
+BEGIN IMMEDIATE;
+
+DROP TRIGGER books_after_insert;
+DROP TRIGGER books_after_delete;
+DROP TRIGGER books_after_update;
+DROP TABLE books_fts;
+DROP INDEX books_sort_title_idx;
+DROP INDEX books_sort_authors_idx;
+DROP INDEX books_added_at_idx;
+DROP INDEX books_format_title_idx;
+
+ALTER TABLE book_covers RENAME TO book_covers_v1;
+ALTER TABLE books RENAME TO books_v1;
+
+CREATE TABLE books (
+    id          INTEGER PRIMARY KEY,
+    title       TEXT NOT NULL,
+    sort_title  TEXT NOT NULL,
+    authors     TEXT NOT NULL,
+    sort_authors TEXT NOT NULL,
+    series      TEXT,
+    publisher   TEXT,
+    language    TEXT,
+    description TEXT,
+    format      TEXT NOT NULL CHECK (format IN ('epub', 'pdf')),
+    source_path TEXT NOT NULL UNIQUE,
+    added_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+    modified_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+INSERT INTO books (
+    id, title, sort_title, authors, sort_authors, series, publisher, language, description,
+    format, source_path, added_at, modified_at
+)
+SELECT
+    id, title, sort_title, authors, sort_authors, series, publisher, language, description,
+    format, source_path, added_at, modified_at
+FROM books_v1;
+
+CREATE INDEX books_sort_title_idx ON books(sort_title, id);
+CREATE INDEX books_sort_authors_idx ON books(sort_authors, sort_title, id);
+CREATE INDEX books_added_at_idx ON books(added_at DESC, id DESC);
+CREATE INDEX books_format_title_idx ON books(format, sort_title, id);
+
+CREATE TABLE book_covers (
+    book_id INTEGER PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
+    jpeg    BLOB NOT NULL
+);
+
+INSERT INTO book_covers(book_id, jpeg)
+SELECT book_id, jpeg FROM book_covers_v1;
+
+DROP TABLE book_covers_v1;
+DROP TABLE books_v1;
+
+CREATE VIRTUAL TABLE books_fts USING fts5(
+    title,
+    authors,
+    series,
+    publisher,
+    content='books',
+    content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2',
+    prefix='2 3'
+);
+
+CREATE TRIGGER books_after_insert AFTER INSERT ON books BEGIN
+    INSERT INTO books_fts(rowid, title, authors, series, publisher)
+    VALUES (new.id, new.title, new.authors, new.series, new.publisher);
+END;
+
+CREATE TRIGGER books_after_delete AFTER DELETE ON books BEGIN
+    INSERT INTO books_fts(books_fts, rowid, title, authors, series, publisher)
+    VALUES ('delete', old.id, old.title, old.authors, old.series, old.publisher);
+END;
+
+CREATE TRIGGER books_after_update AFTER UPDATE ON books BEGIN
+    INSERT INTO books_fts(books_fts, rowid, title, authors, series, publisher)
+    VALUES ('delete', old.id, old.title, old.authors, old.series, old.publisher);
+    INSERT INTO books_fts(rowid, title, authors, series, publisher)
+    VALUES (new.id, new.title, new.authors, new.series, new.publisher);
+END;
+
+INSERT INTO books_fts(books_fts) VALUES ('rebuild');
+PRAGMA user_version = 2;
+
+COMMIT;
 ";
 
 /// Failure returned by the persistence adapter.
@@ -141,6 +231,7 @@ impl LibraryDatabase {
         let version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match version {
             0 => connection.execute_batch(SCHEMA)?,
+            1 => migrate_from_version_one(&connection)?,
             SCHEMA_VERSION => {}
             unsupported => return Err(StorageError::UnsupportedSchema(unsupported)),
         }
@@ -310,6 +401,15 @@ impl LibraryDatabase {
     }
 }
 
+fn migrate_from_version_one(connection: &Connection) -> Result<()> {
+    connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let migration = connection.execute_batch(MIGRATE_1_TO_2);
+    let restore_foreign_keys = connection.execute_batch("PRAGMA foreign_keys = ON;");
+    migration?;
+    restore_foreign_keys?;
+    Ok(())
+}
+
 fn upsert_record(transaction: &Transaction<'_>, record: &ImportRecord) -> rusqlite::Result<BookId> {
     let book = &record.book;
     let source_path = book.source_path.to_string_lossy();
@@ -380,13 +480,53 @@ fn build_fts_query(input: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     use lectern_core::{BookDraft, BookFormat, LibraryQuery, SortOrder};
+    use rusqlite::Connection;
 
-    use super::{ImportRecord, LibraryDatabase, StorageError};
+    use super::{ImportRecord, LibraryDatabase, SCHEMA, SCHEMA_VERSION, StorageError};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDatabase(PathBuf);
+
+    impl TestDatabase {
+        fn new(label: &str) -> Self {
+            let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "lectern-storage-{label}-{}-{id}.sqlite3",
+                std::process::id()
+            )))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            if self.0.exists() {
+                fs::remove_file(&self.0).expect("remove test database");
+            }
+        }
+    }
 
     fn record(path: &str, title: &str, authors: &str) -> ImportRecord {
+        record_with_format(path, title, authors, BookFormat::Epub)
+    }
+
+    fn record_with_format(
+        path: &str,
+        title: &str,
+        authors: &str,
+        format: BookFormat,
+    ) -> ImportRecord {
         ImportRecord {
             book: BookDraft {
                 title: title.into(),
@@ -395,11 +535,104 @@ mod tests {
                 publisher: None,
                 language: Some("en".into()),
                 description: None,
-                format: BookFormat::Epub,
+                format,
                 source_path: PathBuf::from(path),
             },
             cover_thumbnail: None,
         }
+    }
+
+    #[test]
+    fn stores_and_filters_pdf_books() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        database
+            .import_batch(&[
+                record("/books/dune.epub", "Dune", "Frank Herbert"),
+                record_with_format(
+                    "/books/manual.pdf",
+                    "Field Manual",
+                    "Octavia Butler",
+                    BookFormat::Pdf,
+                ),
+            ])
+            .expect("import books");
+
+        let results = database
+            .query(&LibraryQuery {
+                format: Some(BookFormat::Pdf),
+                ..LibraryQuery::default()
+            })
+            .expect("query PDFs");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Field Manual");
+        assert_eq!(results[0].format, BookFormat::Pdf);
+    }
+
+    #[test]
+    fn migrates_version_one_libraries_without_losing_data() {
+        let database_file = TestDatabase::new("migration");
+        let version_one_schema = SCHEMA
+            .replace(
+                "CHECK (format IN ('epub', 'pdf'))",
+                "CHECK (format IN ('epub'))",
+            )
+            .replace("PRAGMA user_version = 2", "PRAGMA user_version = 1");
+        let connection = Connection::open(database_file.path()).expect("open v1 database");
+        connection
+            .execute_batch(&version_one_schema)
+            .expect("create v1 schema");
+        connection
+            .execute(
+                "INSERT INTO books (
+                    id, title, sort_title, authors, sort_authors, format, source_path
+                 ) VALUES (7, 'Dune', 'dune', 'Frank Herbert', 'frank herbert', 'epub',
+                           '/books/dune.epub')",
+                [],
+            )
+            .expect("insert v1 book");
+        connection
+            .execute(
+                "INSERT INTO book_covers(book_id, jpeg) VALUES (7, x'010203')",
+                [],
+            )
+            .expect("insert v1 cover");
+        drop(connection);
+
+        let mut database = LibraryDatabase::open(database_file.path()).expect("migrate database");
+
+        let version: i64 = database
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(database.count().expect("count migrated books"), 1);
+        assert_eq!(
+            database
+                .load_cover(lectern_core::BookId::new(7))
+                .expect("load migrated cover"),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            database
+                .query(&LibraryQuery {
+                    search: "Dun".into(),
+                    ..LibraryQuery::default()
+                })
+                .expect("search migrated library")
+                .len(),
+            1
+        );
+
+        database
+            .import_batch(&[record_with_format(
+                "/books/manual.pdf",
+                "Field Manual",
+                "Octavia Butler",
+                BookFormat::Pdf,
+            )])
+            .expect("insert PDF after migration");
+        assert_eq!(database.count().expect("count books"), 2);
     }
 
     #[test]
