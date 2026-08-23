@@ -1,4 +1,4 @@
-//! `EPUB` discovery and import pipeline for Lectern.
+//! Publication discovery and import pipeline for Lectern.
 
 use std::{
     fs::File,
@@ -6,9 +6,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use hayro::{
+    RenderCache, RenderSettings, hayro_interpret::InterpreterSettings, hayro_syntax::Pdf, render,
+    vello_cpu::color::palette::css::WHITE,
+};
 use image::{ImageReader, Limits, codecs::jpeg::JpegEncoder};
 use lectern_core::{BookDraft, BookFormat};
 use lectern_storage::{ImportRecord, LibraryDatabase};
+use lopdf::Document;
 use percent_encoding::percent_decode_str;
 use quick_xml::{Reader, XmlVersion, events::BytesStart, events::Event};
 use rayon::prelude::*;
@@ -22,6 +27,7 @@ const MAX_PACKAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_COVER_BYTES: usize = 24 * 1024 * 1024;
 const MAX_COVER_DIMENSION: u32 = 8_192;
 const MAX_COVER_ALLOCATION: u64 = 96 * 1024 * 1024;
+const MAX_PDF_BYTES: usize = 512 * 1024 * 1024;
 const THUMBNAIL_WIDTH: u32 = 320;
 const THUMBNAIL_HEIGHT: u32 = 480;
 const IMPORT_BATCH_SIZE: usize = 64;
@@ -44,6 +50,23 @@ pub enum ImportError {
     /// A required publication structure was absent.
     #[error("invalid EPUB: {0}")]
     InvalidPublication(&'static str),
+    /// A PDF document could not be decoded.
+    #[error("invalid PDF: {0}")]
+    Pdf(#[from] lopdf::Error),
+    /// A required PDF structure was absent or unsupported.
+    #[error("invalid PDF: {0}")]
+    InvalidPdf(&'static str),
+    /// A PDF exceeded the defensive in-memory parsing limit.
+    #[error("PDF exceeds the {limit}-byte import limit ({size} bytes)")]
+    PdfTooLarge {
+        /// Actual file size in bytes.
+        size: u64,
+        /// Maximum accepted file size in bytes.
+        limit: usize,
+    },
+    /// A directly parsed path did not use a supported extension.
+    #[error("unsupported publication format: {0}")]
+    UnsupportedFormat(PathBuf),
     /// An archive member exceeded a defensive size limit.
     #[error("EPUB entry {name} exceeds the {limit}-byte limit")]
     EntryTooLarge {
@@ -78,7 +101,7 @@ pub struct ImportFailure {
 /// Monotonic progress emitted by an import job.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ImportProgress {
-    /// Number of EPUB files found before parsing began.
+    /// Number of supported publication files found before parsing began.
     pub discovered: usize,
     /// Number of files parsed or rejected so far.
     pub processed: usize,
@@ -91,7 +114,7 @@ pub struct ImportProgress {
 /// Final outcome of a completed import job.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImportSummary {
-    /// Number of EPUB files found.
+    /// Number of supported publication files found.
     pub discovered: usize,
     /// Number of files committed to the library.
     pub imported: usize,
@@ -101,17 +124,17 @@ pub struct ImportSummary {
     pub failures: Vec<ImportFailure>,
 }
 
-/// Recursively discovers EPUB files below `roots` without following directory symlinks.
+/// Recursively discovers supported publications below `roots` without following symlinks.
 ///
 /// # Errors
 ///
 /// Returns an error when a directory cannot be traversed.
-pub fn discover_epubs(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+pub fn discover_publications(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut publications = Vec::new();
 
     for root in roots {
         if root.is_file() {
-            if is_epub(root) {
+            if format_for_path(root).is_some() {
                 publications.push(root.clone());
             }
             continue;
@@ -122,7 +145,7 @@ pub fn discover_epubs(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
 
         for entry in WalkDir::new(root).follow_links(false) {
             let entry = entry?;
-            if entry.file_type().is_file() && is_epub(entry.path()) {
+            if entry.file_type().is_file() && format_for_path(entry.path()).is_some() {
                 publications.push(entry.into_path());
             }
         }
@@ -133,7 +156,7 @@ pub fn discover_epubs(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(publications)
 }
 
-/// Imports discovered EPUB files into a persistent Lectern library.
+/// Imports discovered EPUB and PDF files into a persistent Lectern library.
 ///
 /// Parsing and thumbnail generation run in parallel. Successful records are committed in bounded
 /// transactions, while malformed publications are isolated and reported in the final summary.
@@ -141,13 +164,13 @@ pub fn discover_epubs(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// # Errors
 ///
 /// Returns an error when discovery cannot finish or the library database cannot be opened or
-/// updated. Individual malformed EPUB files are returned in [`ImportSummary::failures`].
+/// updated. Individual malformed publications are returned in [`ImportSummary::failures`].
 pub fn import_paths(
     database_path: impl AsRef<Path>,
     roots: &[PathBuf],
     mut report_progress: impl FnMut(ImportProgress),
 ) -> Result<ImportSummary> {
-    let publications = discover_epubs(roots)?;
+    let publications = discover_publications(roots)?;
     let discovered = publications.len();
     let mut progress = ImportProgress {
         discovered,
@@ -161,7 +184,7 @@ pub fn import_paths(
     for batch in publications.chunks(IMPORT_BATCH_SIZE) {
         let parsed = batch
             .par_iter()
-            .map(|path| (path, parse_epub(path)))
+            .map(|path| (path, parse_publication(path)))
             .collect::<Vec<_>>();
         let mut records = Vec::with_capacity(parsed.len());
 
@@ -191,6 +214,21 @@ pub fn import_paths(
         failed: failures.len(),
         failures,
     })
+}
+
+/// Parses one supported publication and prepares it for storage.
+///
+/// # Errors
+///
+/// Returns an error when the path has an unsupported extension or the selected parser cannot
+/// read the publication.
+pub fn parse_publication(path: impl AsRef<Path>) -> Result<ImportRecord> {
+    let path = path.as_ref();
+    match format_for_path(path) {
+        Some(BookFormat::Epub) => parse_epub(path),
+        Some(BookFormat::Pdf) => parse_pdf(path),
+        None => Err(ImportError::UnsupportedFormat(path.to_path_buf())),
+    }
 }
 
 /// Parses metadata and a bounded cover thumbnail from one EPUB publication.
@@ -227,6 +265,53 @@ pub fn parse_epub(path: impl AsRef<Path>) -> Result<ImportRecord> {
             language: metadata.language,
             description: metadata.description,
             format: BookFormat::Epub,
+            source_path: path.to_path_buf(),
+        },
+        cover_thumbnail,
+    })
+}
+
+/// Parses standard document metadata and a first-page thumbnail from one PDF publication.
+///
+/// A page that cannot be rendered is imported without a thumbnail so readable metadata is not
+/// lost. Password-protected documents are currently rejected because Lectern has no password
+/// prompt yet.
+///
+/// # Errors
+///
+/// Returns an error when the file is too large for bounded in-memory parsing, is not a readable
+/// PDF, contains no pages, or is password protected.
+pub fn parse_pdf(path: impl AsRef<Path>) -> Result<ImportRecord> {
+    let path = path.as_ref();
+    let bytes = read_bounded_file(path, MAX_PDF_BYTES)?;
+    let metadata = Document::load_metadata_mem(&bytes)?;
+    if metadata.encrypted {
+        return Err(ImportError::InvalidPdf(
+            "password-protected documents are not supported",
+        ));
+    }
+    if metadata.page_count == 0 {
+        return Err(ImportError::InvalidPdf("document contains no pages"));
+    }
+
+    let fallback_title = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map_or_else(|| "Untitled".to_owned(), clean_text);
+    let title = clean_optional(metadata.title).unwrap_or(fallback_title);
+    let authors = clean_optional(metadata.author).unwrap_or_default();
+    let description = clean_optional(metadata.subject);
+    let cover_thumbnail = render_pdf_cover(bytes);
+
+    Ok(ImportRecord {
+        book: BookDraft {
+            title,
+            authors,
+            series: None,
+            publisher: None,
+            language: None,
+            description,
+            format: BookFormat::Pdf,
             source_path: path.to_path_buf(),
         },
         cover_thumbnail,
@@ -510,6 +595,38 @@ fn extract_cover(
 ) -> Result<Vec<u8>> {
     let cover_path = normalize_archive_path(Some(package_path), href)?;
     let bytes = read_entry(archive, &cover_path, MAX_COVER_BYTES)?;
+    encode_thumbnail(&bytes)
+}
+
+fn render_pdf_cover(bytes: Vec<u8>) -> Option<Vec<u8>> {
+    let pdf = Pdf::new(bytes).ok()?;
+    let page = pdf.pages().first()?;
+    let (width, height) = page.render_dimensions();
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+
+    let scale = (320.0 / width).min(480.0 / height);
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+
+    let pixmap = render(
+        page,
+        &RenderCache::new(),
+        &InterpreterSettings::default(),
+        &RenderSettings {
+            x_scale: scale,
+            y_scale: scale,
+            bg_color: WHITE,
+            ..RenderSettings::default()
+        },
+    );
+    let png = pixmap.into_png().ok()?;
+    encode_thumbnail(&png).ok()
+}
+
+fn encode_thumbnail(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_COVER_DIMENSION);
@@ -522,6 +639,26 @@ fn extract_cover(
     let mut encoded = Vec::new();
     JpegEncoder::new_with_quality(&mut encoded, 84).encode_image(&thumbnail)?;
     Ok(encoded)
+}
+
+fn read_bounded_file(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let size = file.metadata()?.len();
+    if size > u64::try_from(limit).unwrap_or(u64::MAX) {
+        return Err(ImportError::PdfTooLarge { size, limit });
+    }
+
+    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(limit).min(limit));
+    file.by_ref()
+        .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(ImportError::PdfTooLarge {
+            size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            limit,
+        });
+    }
+    Ok(bytes)
 }
 
 fn read_entry(archive: &mut ZipArchive<File>, name: &str, limit: usize) -> Result<Vec<u8>> {
@@ -579,10 +716,21 @@ fn normalize_archive_path(base_file: Option<&str>, path: &str) -> Result<String>
     Ok(parts.join("/"))
 }
 
-fn is_epub(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+fn format_for_path(path: &Path) -> Option<BookFormat> {
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("epub") {
+        Some(BookFormat::Epub)
+    } else if extension.eq_ignore_ascii_case("pdf") {
+        Some(BookFormat::Pdf)
+    } else {
+        None
+    }
+}
+
+fn clean_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| clean_text(&value))
+        .filter(|value| !value.is_empty())
 }
 
 fn clean_text(value: &str) -> String {
@@ -620,11 +768,19 @@ mod tests {
     };
 
     use image::{DynamicImage, Rgb, RgbImage, codecs::jpeg::JpegEncoder};
-    use lectern_core::{LibraryQuery, SortOrder};
+    use lectern_core::{BookFormat, LibraryQuery, SortOrder};
     use lectern_storage::LibraryDatabase;
+    use lopdf::{
+        Document, Object, Stream,
+        content::{Content, Operation},
+        dictionary,
+    };
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-    use super::{ImportProgress, discover_epubs, import_paths, parse_epub};
+    use super::{
+        ImportProgress, discover_publications, import_paths, parse_epub, parse_pdf,
+        parse_publication,
+    };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -709,6 +865,51 @@ mod tests {
         encoded
     }
 
+    fn create_pdf(path: &Path, title: &str) {
+        let mut document = Document::with_version("1.5");
+        let page_tree_id = document.new_object_id();
+        let content = Content {
+            operations: vec![
+                Operation::new("q", vec![]),
+                Operation::new("rg", vec![0.09.into(), 0.31.into(), 0.55.into()]),
+                Operation::new("re", vec![0.into(), 0.into(), 300.into(), 450.into()]),
+                Operation::new("f", vec![]),
+                Operation::new("Q", vec![]),
+            ],
+        };
+        let content_id = document.add_object(Stream::new(
+            dictionary! {},
+            content.encode().expect("encode PDF content"),
+        ));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => page_tree_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 450.into()],
+            "Resources" => dictionary! {},
+        });
+        document.objects.insert(
+            page_tree_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => page_tree_id,
+        });
+        let info_id = document.add_object(dictionary! {
+            "Title" => Object::string_literal(title),
+            "Author" => Object::string_literal("Octavia E. Butler"),
+            "Subject" => Object::string_literal("A field guide to many worlds."),
+        });
+        document.trailer.set("Root", catalog_id);
+        document.trailer.set("Info", info_id);
+        document.save(path).expect("save PDF");
+    }
+
     #[test]
     fn parses_metadata_and_cover() {
         let directory = TestDirectory::new("parse");
@@ -730,18 +931,51 @@ mod tests {
     }
 
     #[test]
-    fn discovers_epubs_recursively_and_case_insensitively() {
+    fn parses_pdf_metadata_and_first_page_cover() {
+        let directory = TestDirectory::new("parse-pdf");
+        let path = directory.0.join("field-guide.pdf");
+        create_pdf(&path, "Field Guide");
+
+        let record = parse_pdf(&path).expect("parse PDF");
+
+        assert_eq!(record.book.title, "Field Guide");
+        assert_eq!(record.book.authors, "Octavia E. Butler");
+        assert_eq!(
+            record.book.description.as_deref(),
+            Some("A field guide to many worlds.")
+        );
+        assert_eq!(record.book.format, BookFormat::Pdf);
+        let cover = record.cover_thumbnail.expect("render first page");
+        let image = image::load_from_memory(&cover).expect("decode rendered cover");
+        assert!(image.width() <= super::THUMBNAIL_WIDTH);
+        assert!(image.height() <= super::THUMBNAIL_HEIGHT);
+    }
+
+    #[test]
+    fn dispatches_publications_by_case_insensitive_extension() {
+        let directory = TestDirectory::new("dispatch");
+        let path = directory.0.join("guide.PDF");
+        create_pdf(&path, "Guide");
+
+        let record = parse_publication(&path).expect("parse publication");
+
+        assert_eq!(record.book.format, BookFormat::Pdf);
+    }
+
+    #[test]
+    fn discovers_supported_publications_recursively_and_case_insensitively() {
         let directory = TestDirectory::new("discover");
         let nested = directory.0.join("nested");
         fs::create_dir(&nested).expect("create nested directory");
         create_epub(&directory.0.join("one.epub"), "One");
         create_epub(&nested.join("two.EPUB"), "Two");
+        create_pdf(&nested.join("three.PDF"), "Three");
         File::create(directory.0.join("notes.txt")).expect("create unrelated file");
 
-        let discovered =
-            discover_epubs(std::slice::from_ref(&directory.0)).expect("discover EPUBs");
+        let discovered = discover_publications(std::slice::from_ref(&directory.0))
+            .expect("discover publications");
 
-        assert_eq!(discovered.len(), 2);
+        assert_eq!(discovered.len(), 3);
         assert!(discovered[0] < discovered[1]);
     }
 
@@ -749,9 +983,11 @@ mod tests {
     fn imports_valid_books_and_isolates_bad_archives() {
         let directory = TestDirectory::new("pipeline");
         let valid = directory.0.join("valid.epub");
+        let valid_pdf = directory.0.join("valid.pdf");
         let invalid = directory.0.join("invalid.epub");
         let database_path = directory.0.join("library.sqlite3");
         create_epub(&valid, "The Dispossessed");
+        create_pdf(&valid_pdf, "Parable of the Sower");
         File::create(&invalid)
             .expect("create invalid EPUB")
             .write_all(b"not a zip")
@@ -765,10 +1001,10 @@ mod tests {
         )
         .expect("run import");
 
-        assert_eq!(summary.discovered, 2);
-        assert_eq!(summary.imported, 1);
+        assert_eq!(summary.discovered, 3);
+        assert_eq!(summary.imported, 2);
         assert_eq!(summary.failed, 1);
-        assert_eq!(updates.last().map(|progress| progress.processed), Some(2));
+        assert_eq!(updates.last().map(|progress| progress.processed), Some(3));
         let database = LibraryDatabase::open(&database_path).expect("open imported library");
         let books = database
             .query(&LibraryQuery {
@@ -778,5 +1014,13 @@ mod tests {
             })
             .expect("query imported books");
         assert_eq!(books.len(), 1);
+        let pdfs = database
+            .query(&LibraryQuery {
+                format: Some(BookFormat::Pdf),
+                ..LibraryQuery::default()
+            })
+            .expect("query imported PDFs");
+        assert_eq!(pdfs.len(), 1);
+        assert_eq!(pdfs[0].title, "Parable of the Sower");
     }
 }

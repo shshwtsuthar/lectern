@@ -13,10 +13,12 @@ publish = false
 crossbeam-channel = "0.5.16"
 directories = "6.0.0"
 eframe = "0.36.1"
+hayro = "0.7.1"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 lectern-import = { path = "crates/lectern-import", version = "0.1.0" }
 lectern-core = { path = "crates/lectern-core", version = "0.1.0" }
 lectern-storage = { path = "crates/lectern-storage", version = "0.1.0" }
+lopdf = { version = "0.44.0", default-features = false }
 percent-encoding = "2.3.2"
 quick-xml = "0.41.0"
 rayon = "1.12.0"
