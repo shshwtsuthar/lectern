@@ -318,9 +318,9 @@ def main(arguments: list[str]) -> int:
         "startup": {
             "runs": startup_results,
             "main_entry_to_populated_library_samples_ns": startup_samples(
-                desktop_results
+                startup_results
             ),
-            "summary_ns": summarize(startup_samples(desktop_results)),
+            "summary_ns": summarize(startup_samples(startup_results)),
         },
         "queries": query_result,
         "scrolling": scroll_result,
