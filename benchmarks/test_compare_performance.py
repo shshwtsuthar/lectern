@@ -43,6 +43,10 @@ def result(
         "schema_version": 1,
         "kind": "lectern-query-performance-regression",
         "status": status,
+        "budget": {
+            "schema_version": 1,
+            "kind": "lectern-query-regression-budget",
+        },
         "repository": {"commit": commit, "branch": "test", "dirty": False},
         "environment": {
             "platform": platform,
@@ -67,6 +71,24 @@ def result(
 
 
 class ComparePerformanceTests(unittest.TestCase):
+    def test_accepts_registered_organisation_budget_and_seed_shape(self) -> None:
+        configured = budget()
+        configured["kind"] = "lectern-organisation-regression-budget"
+        configured["workload"]["cover_every"] = 3
+        base = result(2.0, 10.0, commit="base")
+        candidate = result(2.1, 10.1, commit="candidate")
+        for measured in (base, candidate):
+            measured["budget"]["kind"] = configured["kind"]
+            measured["seed"] = {
+                "library_books": 50,
+                "seed": 7,
+                "covers": 17,
+            }
+
+        report = COMPARE.compare_results(base, candidate, configured)
+
+        self.assertTrue(all(decision["passed"] for decision in report["decisions"]))
+
     def test_accepts_improvement_and_small_materially_insignificant_change(self) -> None:
         report = COMPARE.compare_results(
             result(2.0, 10.0, commit="base"),

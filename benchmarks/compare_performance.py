@@ -13,7 +13,8 @@ import sys
 from typing import Any
 
 
-BUDGET_KIND = "lectern-query-regression-budget"
+BUDGET_KIND_PREFIX = "lectern-"
+BUDGET_KIND_SUFFIX = "-regression-budget"
 INPUT_KIND = "lectern-query-performance-regression"
 RESULT_KIND = "lectern-query-performance-comparison"
 
@@ -105,7 +106,7 @@ def compare_result_sets(
         for index, result in enumerate(candidate_results, start=1)
     ]
     for label, result in labelled_results:
-        validate_result(result, label)
+        validate_result(result, budget, label)
         validate_same_workload(result, budget, label)
     if any(candidate.get("status") != "passed" for candidate in candidate_results):
         raise ComparisonError("every candidate run must pass its absolute performance budget")
@@ -180,8 +181,14 @@ def compare_result_sets(
 
 
 def validate_budget(budget: dict[str, Any]) -> None:
-    if budget.get("schema_version") != 1 or budget.get("kind") != BUDGET_KIND:
-        raise ComparisonError("comparison requires a version 1 query-regression budget")
+    kind = budget.get("kind")
+    if (
+        budget.get("schema_version") != 1
+        or not isinstance(kind, str)
+        or not kind.startswith(BUDGET_KIND_PREFIX)
+        or not kind.endswith(BUDGET_KIND_SUFFIX)
+    ):
+        raise ComparisonError("comparison requires a version 1 Lectern regression budget")
     budgets = budget.get("budgets")
     if not isinstance(budgets, dict) or not budgets:
         raise ComparisonError("budget.budgets must be a non-empty object")
@@ -205,7 +212,9 @@ def validate_budget(budget: dict[str, Any]) -> None:
     )
 
 
-def validate_result(result: dict[str, Any], label: str) -> None:
+def validate_result(
+    result: dict[str, Any], budget: dict[str, Any], label: str
+) -> None:
     if result.get("schema_version") != 1 or result.get("kind") != INPUT_KIND:
         raise ComparisonError(f"{label} is not a version 1 query-performance result")
     if result.get("status") not in ("passed", "failed"):
@@ -218,6 +227,14 @@ def validate_result(result: dict[str, Any], label: str) -> None:
         raise ComparisonError(f"{label}.seed must be an object")
     if not isinstance(result.get("query"), dict):
         raise ComparisonError(f"{label}.query must be an object")
+    result_budget = result.get("budget")
+    if not isinstance(result_budget, dict):
+        raise ComparisonError(f"{label}.budget must be an object")
+    if (
+        result_budget.get("schema_version") != budget["schema_version"]
+        or result_budget.get("kind") != budget["kind"]
+    ):
+        raise ComparisonError(f"{label} was not measured against the supplied budget kind")
 
 
 def validate_same_environment(
@@ -239,17 +256,31 @@ def validate_same_workload(
     workload = budget.get("workload")
     if not isinstance(workload, dict):
         raise ComparisonError("budget.workload must be an object")
-    fields = {
-        "requested_books": workload.get("books"),
-        "metadata_seed": workload.get("seed"),
-        "cover_every": workload.get("cover_every"),
-    }
-    for field, expected in fields.items():
-        value = result["seed"].get(field)
+    seed = result["seed"]
+    fields = (
+        ("books", seed.get("requested_books", seed.get("library_books"))),
+        ("seed", seed.get("metadata_seed", seed.get("seed"))),
+    )
+    for field, value in fields:
+        expected = workload.get(field)
         if value != expected:
             raise ComparisonError(
                 f"seed workload mismatch for {field}: expected={expected!r}, "
                 f"{label}={value!r}"
+            )
+    if "cover_every" in seed and seed["cover_every"] != workload.get("cover_every"):
+        raise ComparisonError(
+            "seed workload mismatch for cover_every: "
+            f"expected={workload.get('cover_every')!r}, "
+            f"{label}={seed['cover_every']!r}"
+        )
+    if "covers" in seed and workload.get("cover_every"):
+        cover_every = workload["cover_every"]
+        expected_covers = (workload["books"] + cover_every - 1) // cover_every
+        if seed["covers"] != expected_covers:
+            raise ComparisonError(
+                f"seed workload mismatch for covers: expected={expected_covers!r}, "
+                f"{label}={seed['covers']!r}"
             )
     expected_books = workload.get("books")
     if result["query"].get("library_books") != expected_books:
