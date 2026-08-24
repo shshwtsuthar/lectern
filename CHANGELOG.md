@@ -9,6 +9,8 @@ follow [Semantic Versioning](https://semver.org/) once releases begin.
 
 ### Added
 
+- Validated EPUB/PDF format attachment for existing logical books, preserving metadata, covers,
+  source bytes, and existing asset identities.
 - Confirmed single-book removal that clears library metadata, asset records, covers, and search
   entries without deleting the user's EPUB or PDF source files.
 - A conservative performance-impact classifier and stable pull-request gate with a versioned suite

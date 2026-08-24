@@ -51,6 +51,11 @@ enum MetadataRequest {
 
 enum AssetMaintenanceRequest {
     Scan,
+    Attach {
+        book_id: BookId,
+        format: BookFormat,
+        path: PathBuf,
+    },
     Relink {
         book_id: BookId,
         asset_id: AssetId,
@@ -94,6 +99,11 @@ pub(crate) enum WorkerEvent {
         result: Result<bool, String>,
     },
     AssetHealthScanned(Result<AssetHealthReport, String>),
+    AssetAttached {
+        book_id: BookId,
+        format: BookFormat,
+        result: Result<(), String>,
+    },
     AssetRelinked {
         book_id: BookId,
         asset_id: AssetId,
@@ -206,6 +216,21 @@ impl WorkerSet {
     pub(crate) fn rescan_reference_assets(&self) -> bool {
         self.asset_maintenance_sender
             .try_send(AssetMaintenanceRequest::Scan)
+            .is_ok()
+    }
+
+    pub(crate) fn attach_reference_asset(
+        &self,
+        book_id: BookId,
+        format: BookFormat,
+        path: PathBuf,
+    ) -> bool {
+        self.asset_maintenance_sender
+            .try_send(AssetMaintenanceRequest::Attach {
+                book_id,
+                format,
+                path,
+            })
             .is_ok()
     }
 
@@ -335,6 +360,29 @@ fn asset_maintenance_worker(
                         .map_err(|error| error.to_string()),
                 ),
             ),
+            AssetMaintenanceRequest::Attach {
+                book_id,
+                format,
+                path,
+            } => {
+                let result = validate_publication(&path, format)
+                    .and_then(|()| {
+                        database
+                            .attach_reference_asset(book_id, format, &path)
+                            .map(|_| ())
+                            .map_err(lectern_import::ImportError::from)
+                    })
+                    .map_err(|error| error.to_string());
+                publish(
+                    events,
+                    context,
+                    WorkerEvent::AssetAttached {
+                        book_id,
+                        format,
+                        result,
+                    },
+                )
+            }
             AssetMaintenanceRequest::Relink {
                 book_id,
                 asset_id,

@@ -44,6 +44,15 @@ struct CachedPage {
     last_used: u64,
 }
 
+#[derive(Default)]
+struct MetadataActions {
+    save: bool,
+    reset: bool,
+    relink: Option<(AssetId, BookFormat)>,
+    attach: Option<BookFormat>,
+    remove: bool,
+}
+
 struct BookEditor {
     original: Book,
     title: String,
@@ -61,7 +70,14 @@ struct AssetMaintenanceUi {
     scanning: bool,
     report: Option<AssetHealthReport>,
     show_report: bool,
+    attaching_format: Option<BookFormat>,
     relinking_asset: Option<AssetId>,
+}
+
+impl AssetMaintenanceUi {
+    fn busy(&self) -> bool {
+        self.scanning || self.attaching_format.is_some() || self.relinking_asset.is_some()
+    }
 }
 
 #[derive(Clone)]
@@ -293,6 +309,11 @@ impl LecternApp {
                     self.book_removed(id, &title, result);
                 }
                 WorkerEvent::AssetHealthScanned(result) => self.asset_health_scanned(result),
+                WorkerEvent::AssetAttached {
+                    book_id,
+                    format,
+                    result,
+                } => self.asset_attached(book_id, format, result),
                 WorkerEvent::AssetRelinked {
                     book_id,
                     asset_id,
@@ -430,6 +451,29 @@ impl LecternApp {
                 self.reload_selected_book_after_asset_change();
             }
             Err(error) => self.status = format!("Could not scan library files: {error}"),
+        }
+    }
+
+    fn asset_attached(&mut self, book_id: BookId, format: BookFormat, result: Result<(), String>) {
+        if self.asset_maintenance.attaching_format == Some(format) {
+            self.asset_maintenance.attaching_format = None;
+        }
+        match result {
+            Ok(()) => {
+                self.status = format!("Attached {format} file");
+                self.refresh_library();
+                if self.selected == Some(book_id) {
+                    self.reload_selected_book_after_asset_change();
+                }
+            }
+            Err(error) => {
+                self.status = format!("Could not attach {format} file: {error}");
+                if let Some(editor) = &mut self.editor
+                    && editor.original.id == book_id
+                {
+                    editor.error = Some(error);
+                }
+            }
         }
     }
 
@@ -592,9 +636,8 @@ impl LecternApp {
         let mut add_books = false;
         let mut add_folder = false;
         let mut rescan_files = false;
-        let maintenance_busy = self.asset_maintenance.scanning
-            || self.asset_maintenance.relinking_asset.is_some()
-            || self.book_removal.removing.is_some();
+        let maintenance_busy =
+            self.asset_maintenance.busy() || self.book_removal.removing.is_some();
         ui.horizontal(|ui| {
             ui.heading(RichText::new("Lectern").size(26.0).strong());
             ui.label(
@@ -610,6 +653,13 @@ impl LecternApp {
             }
             if self.asset_maintenance.scanning {
                 ui.label(RichText::new("Scanning files…").color(ACCENT).size(12.0));
+            }
+            if let Some(format) = self.asset_maintenance.attaching_format {
+                ui.label(
+                    RichText::new(format!("Attaching {format}…"))
+                        .color(ACCENT)
+                        .size(12.0),
+                );
             }
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 add_folder = ui
@@ -685,10 +735,7 @@ impl LecternApp {
             "An import is already running".clone_into(&mut self.status);
             return;
         }
-        if self.asset_maintenance.scanning
-            || self.asset_maintenance.relinking_asset.is_some()
-            || self.book_removal.removing.is_some()
-        {
+        if self.asset_maintenance.busy() || self.book_removal.removing.is_some() {
             "Library file maintenance is already running".clone_into(&mut self.status);
             return;
         }
@@ -703,11 +750,7 @@ impl LecternApp {
     }
 
     fn start_asset_scan(&mut self) {
-        if self.importing
-            || self.asset_maintenance.scanning
-            || self.asset_maintenance.relinking_asset.is_some()
-            || self.book_removal.removing.is_some()
-        {
+        if self.importing || self.asset_maintenance.busy() || self.book_removal.removing.is_some() {
             "Library file maintenance is already running".clone_into(&mut self.status);
             return;
         }
@@ -850,11 +893,10 @@ impl LecternApp {
         let mut reset = false;
         let mut save = false;
         let mut relink = None;
+        let mut attach = None;
         let mut remove = false;
         let removal_busy = self.book_removal.removing.is_some();
-        let library_operation_busy = self.importing
-            || self.asset_maintenance.scanning
-            || self.asset_maintenance.relinking_asset.is_some();
+        let library_operation_busy = self.importing || self.asset_maintenance.busy();
         egui::Panel::right("metadata-editor")
             .default_size(370.0)
             .size_range(310.0..=520.0)
@@ -889,13 +931,15 @@ impl LecternApp {
                     ui,
                     editor,
                     self.asset_maintenance.relinking_asset,
+                    self.asset_maintenance.attaching_format,
                     removal_busy,
                     library_operation_busy,
                 );
-                save = actions.0;
-                reset = actions.1;
-                relink = actions.2;
-                remove = actions.3;
+                save = actions.save;
+                reset = actions.reset;
+                relink = actions.relink;
+                attach = actions.attach;
+                remove = actions.remove;
             });
 
         save |= !removal_busy
@@ -916,6 +960,8 @@ impl LecternApp {
             self.save_editor();
         } else if let Some((asset_id, format)) = relink {
             self.choose_asset_replacement(asset_id, format);
+        } else if let Some(format) = attach {
+            self.choose_format_attachment(format);
         } else if remove {
             self.request_book_removal();
         }
@@ -993,11 +1039,7 @@ impl LecternApp {
     }
 
     fn save_editor(&mut self) {
-        if self.book_removal.removing.is_some()
-            || self.importing
-            || self.asset_maintenance.scanning
-            || self.asset_maintenance.relinking_asset.is_some()
-        {
+        if self.book_removal.removing.is_some() || self.importing || self.asset_maintenance.busy() {
             return;
         }
         let Some(editor) = &mut self.editor else {
@@ -1017,13 +1059,10 @@ impl LecternApp {
     }
 
     fn choose_asset_replacement(&mut self, asset_id: AssetId, format: BookFormat) {
-        if self.asset_maintenance.relinking_asset.is_some() {
+        if self.asset_maintenance.busy() {
             return;
         }
-        let extension = match format {
-            BookFormat::Epub => "epub",
-            BookFormat::Pdf => "pdf",
-        };
+        let extension = format_extension(format);
         let title = format!("Relink {format} file");
         let Some(path) = rfd::FileDialog::new()
             .set_title(&title)
@@ -1044,6 +1083,43 @@ impl LecternApp {
                 editor.error = None;
             }
             "Validating replacement file…".clone_into(&mut self.status);
+        } else {
+            "Library maintenance worker is unavailable".clone_into(&mut self.status);
+        }
+    }
+
+    fn choose_format_attachment(&mut self, format: BookFormat) {
+        if self.importing || self.asset_maintenance.busy() || self.book_removal.removing.is_some() {
+            return;
+        }
+        let Some(editor) = &self.editor else {
+            return;
+        };
+        if editor.changed()
+            || editor
+                .original
+                .assets
+                .iter()
+                .any(|asset| asset.format == format)
+        {
+            return;
+        }
+        let extension = format_extension(format);
+        let title = format!("Attach {format} file");
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(&title)
+            .add_filter(format.to_string(), &[extension])
+            .pick_file()
+        else {
+            return;
+        };
+        let book_id = editor.original.id;
+        if self.workers.attach_reference_asset(book_id, format, path) {
+            self.asset_maintenance.attaching_format = Some(format);
+            if let Some(editor) = &mut self.editor {
+                editor.error = None;
+            }
+            self.status = format!("Validating {format} file…");
         } else {
             "Library maintenance worker is unavailable".clone_into(&mut self.status);
         }
@@ -1383,38 +1459,41 @@ fn asset_health_status(report: AssetHealthReport) -> String {
     )
 }
 
-fn metadata_text_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
+fn metadata_text_field(ui: &mut egui::Ui, label: &str, value: &mut String, enabled: bool) {
     ui.add_space(4.0);
     ui.label(RichText::new(label).strong());
-    ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
+    ui.add_enabled(
+        enabled,
+        egui::TextEdit::singleline(value).desired_width(f32::INFINITY),
+    );
 }
 
 fn metadata_form(
     ui: &mut egui::Ui,
     editor: &mut BookEditor,
     relinking_asset: Option<AssetId>,
+    attaching_format: Option<BookFormat>,
     removal_busy: bool,
     library_operation_busy: bool,
-) -> (bool, bool, Option<(AssetId, BookFormat)>, bool) {
-    let mut save = false;
-    let mut reset = false;
-    let mut relink = None;
-    let mut remove = false;
+) -> MetadataActions {
+    let mut actions = MetadataActions::default();
+    let editing_enabled = !editor.saving && !removal_busy && !library_operation_busy;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            metadata_text_field(ui, "Title", &mut editor.title);
+            metadata_text_field(ui, "Title", &mut editor.title, editing_enabled);
             if editor.title.trim().is_empty() {
                 ui.label(RichText::new("A title is required.").color(Color32::LIGHT_RED));
             }
-            metadata_text_field(ui, "Authors", &mut editor.authors);
-            metadata_text_field(ui, "Series", &mut editor.series);
-            metadata_text_field(ui, "Publisher", &mut editor.publisher);
-            metadata_text_field(ui, "Language", &mut editor.language);
+            metadata_text_field(ui, "Authors", &mut editor.authors, editing_enabled);
+            metadata_text_field(ui, "Series", &mut editor.series, editing_enabled);
+            metadata_text_field(ui, "Publisher", &mut editor.publisher, editing_enabled);
+            metadata_text_field(ui, "Language", &mut editor.language, editing_enabled);
 
             ui.add_space(4.0);
             ui.label(RichText::new("Description").strong());
-            ui.add(
+            ui.add_enabled(
+                editing_enabled,
                 egui::TextEdit::multiline(&mut editor.description)
                     .desired_width(f32::INFINITY)
                     .desired_rows(8),
@@ -1447,8 +1526,16 @@ fn metadata_form(
                         } else {
                             egui::Button::new("Relink…")
                         };
-                        if ui.add_enabled(relinking_asset.is_none(), button).clicked() {
-                            relink = Some((asset.id, asset.format));
+                        if ui
+                            .add_enabled(
+                                relinking_asset.is_none()
+                                    && !library_operation_busy
+                                    && !removal_busy,
+                                button,
+                            )
+                            .clicked()
+                        {
+                            actions.relink = Some((asset.id, asset.format));
                         }
                     }
                 });
@@ -1464,6 +1551,12 @@ fn metadata_form(
                 );
                 ui.add_space(4.0);
             }
+            actions.attach = format_attachment_controls(
+                ui,
+                editor,
+                attaching_format,
+                library_operation_busy || removal_busy,
+            );
 
             if let Some(error) = &editor.error {
                 ui.add_space(8.0);
@@ -1471,12 +1564,11 @@ fn metadata_form(
             }
 
             ui.add_space(12.0);
-            let editing_enabled = !removal_busy && !library_operation_busy;
-            (save, reset) = metadata_save_controls(ui, editor, editing_enabled);
+            (actions.save, actions.reset) = metadata_save_controls(ui, editor, editing_enabled);
 
             ui.add_space(12.0);
             ui.separator();
-            remove = book_removal_controls(
+            actions.remove = book_removal_controls(
                 ui,
                 editor,
                 relinking_asset,
@@ -1484,7 +1576,49 @@ fn metadata_form(
                 library_operation_busy,
             );
         });
-    (save, reset, relink, remove)
+    actions
+}
+
+fn format_attachment_controls(
+    ui: &mut egui::Ui,
+    editor: &BookEditor,
+    attaching_format: Option<BookFormat>,
+    operation_busy: bool,
+) -> Option<BookFormat> {
+    let missing = missing_book_formats(&editor.original);
+    if missing.is_empty() {
+        ui.label(
+            RichText::new("All supported formats are attached.")
+                .color(MUTED)
+                .size(11.0),
+        );
+        return None;
+    }
+
+    let enabled = !editor.saving && !editor.changed() && !operation_busy;
+    let hover = if editor.changed() {
+        "Save or reset metadata changes before attaching another format"
+    } else {
+        "Validate and attach another file without changing metadata or the cover"
+    };
+    let mut selected = None;
+    ui.horizontal_wrapped(|ui| {
+        for format in missing {
+            let text = if attaching_format == Some(format) {
+                format!("Attaching {format}…")
+            } else {
+                format!("Add {format}…")
+            };
+            if ui
+                .add_enabled(enabled, egui::Button::new(text))
+                .on_hover_text(hover)
+                .clicked()
+            {
+                selected = Some(format);
+            }
+        }
+    });
+    selected
 }
 
 fn metadata_save_controls(
@@ -1547,6 +1681,20 @@ fn removal_file_message(asset_count: usize) -> String {
         "The original book file will not be deleted.".into()
     } else {
         format!("The {asset_count} original book files will not be deleted.")
+    }
+}
+
+fn missing_book_formats(book: &Book) -> Vec<BookFormat> {
+    BookFormat::ALL
+        .into_iter()
+        .filter(|format| !book.assets.iter().any(|asset| asset.format == *format))
+        .collect()
+}
+
+fn format_extension(format: BookFormat) -> &'static str {
+    match format {
+        BookFormat::Epub => "epub",
+        BookFormat::Pdf => "pdf",
     }
 }
 
@@ -1630,6 +1778,37 @@ mod tests {
             removal_file_message(2),
             "The 2 original book files will not be deleted."
         );
+    }
+
+    #[test]
+    fn attachment_options_include_only_missing_formats() {
+        let mut book = Book {
+            id: BookId::new(7),
+            title: "Dune".into(),
+            authors: "Frank Herbert".into(),
+            series: None,
+            publisher: None,
+            language: None,
+            description: None,
+            assets: vec![BookAsset {
+                id: AssetId::new(11),
+                format: BookFormat::Epub,
+                storage: AssetStorage::Reference,
+                health: AssetHealth::Available,
+                path: PathBuf::from("/books/dune.epub"),
+            }],
+        };
+
+        assert_eq!(super::missing_book_formats(&book), vec![BookFormat::Pdf]);
+        assert_eq!(super::format_extension(BookFormat::Pdf), "pdf");
+        book.assets.push(BookAsset {
+            id: AssetId::new(12),
+            format: BookFormat::Pdf,
+            storage: AssetStorage::Reference,
+            health: AssetHealth::Available,
+            path: PathBuf::from("/books/dune.pdf"),
+        });
+        assert!(super::missing_book_formats(&book).is_empty());
     }
 
     #[test]

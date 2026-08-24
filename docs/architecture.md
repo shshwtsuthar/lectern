@@ -45,9 +45,10 @@ perform filesystem and write-heavy work off the UI thread. The metadata worker a
 confirmed single-book removal, which deletes library records and cached data while leaving source
 files untouched. Asset scans check referenced paths with
 metadata and openability checks, then persist only changed health states in one transaction;
-relinking validates publication structure without regenerating thumbnails. The UI retains at most
-256 cover textures and requests repainting only when background work completes or interaction
-requires it.
+relinking validates publication structure without regenerating thumbnails. Explicit format
+attachment validates the selected publication before atomically adding a referenced asset, leaving
+book metadata, covers, and existing assets untouched. The UI retains at most 256 cover textures and
+requests repainting only when background work completes or interaction requires it.
 
 SQLite runs in WAL mode for the persistent library. FTS5 triggers keep search data consistent with
 imports and metadata edits. Imports never extract archive members to disk, reject unsafe archive
