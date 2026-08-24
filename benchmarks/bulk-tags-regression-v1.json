@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-organisation-regression-budget",
+  "workload": {
+    "query_mode": "bulk-tags",
+    "books": 50000,
+    "seed": 20260825,
+    "cover_every": 3,
+    "contributors": 20000,
+    "series": 2500,
+    "tags": 500,
+    "tags_per_book": 8,
+    "contributors_per_book": {
+      "minimum": 1,
+      "maximum": 4
+    },
+    "series_membership_percent": 70,
+    "saved_searches": 250,
+    "matching_books": 10000,
+    "tags_added": 2,
+    "tags_removed": 1,
+    "page_size": 128,
+    "warmup_iterations": 10,
+    "measured_iterations": 40,
+    "compositor_samples": 40,
+    "scenarios": [
+      "bulk_tag_apply_and_refresh",
+      "selection_dispatch_to_busy_paint",
+      "completion_to_refreshed_grid_paint"
+    ],
+    "correctness": [
+      "exact_matched_added_removed_created_counts",
+      "ordinary_metadata_unchanged",
+      "assets_unchanged",
+      "exact_relationship_sets",
+      "fts_and_filter_visibility",
+      "injected_failure_rolls_back",
+      "inverse_operation_restores_relationships",
+      "selection_does_not_materialize_book_summaries"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 1.0
+  },
+  "budgets": {
+    "bulk_tag_apply_and_refresh": {
+      "max_p95_ms": 500,
+      "max_peak_rss_delta_bytes": 33554432
+    },
+    "selection_dispatch_to_busy_paint": {
+      "max_p95_ms": 50
+    },
+    "completion_to_refreshed_grid_paint": {
+      "max_p95_ms": 50
+    }
+  }
+}

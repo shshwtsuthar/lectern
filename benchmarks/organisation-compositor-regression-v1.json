@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-organisation-regression-budget",
+  "workload": {
+    "query_mode": "organisation-compositor",
+    "books": 50000,
+    "seed": 20260825,
+    "cover_every": 3,
+    "warmup_iterations": 10,
+    "measured_iterations": 40,
+    "scenarios": [
+      "selection_dispatch_to_busy_paint",
+      "bulk_completion_to_refreshed_grid_paint"
+    ],
+    "correctness": [
+      "busy_state_painted",
+      "refreshed_projection_painted",
+      "exact_selection_count",
+      "exact_bulk_result_counts"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 0.5
+  },
+  "budgets": {
+    "selection_dispatch_to_busy_paint": {
+      "max_p95_ms": 50
+    },
+    "bulk_completion_to_refreshed_grid_paint": {
+      "max_p95_ms": 50
+    }
+  }
+}
