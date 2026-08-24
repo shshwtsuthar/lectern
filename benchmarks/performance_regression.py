@@ -91,6 +91,7 @@ def main(arguments: list[str]) -> int:
             "page-covered": "queries.json",
             "remove": "removals.json",
             "attach": "attachments.json",
+            "reimport": "reimports.json",
         }
         query_output = output / result_names[mode]
         run_command(
@@ -134,6 +135,7 @@ def main(arguments: list[str]) -> int:
                     "page-covered": "query-page-covered",
                     "remove": "remove",
                     "attach": "attach",
+                    "reimport": "reimport",
                 }[mode],
                 "--database",
                 str(database),
@@ -151,6 +153,8 @@ def main(arguments: list[str]) -> int:
             decisions = evaluate_remove_result(query_result, budget)
         elif mode == "attach":
             decisions = evaluate_attach_result(query_result, budget)
+        elif mode == "reimport":
+            decisions = evaluate_reimport_result(query_result, budget)
         else:
             decisions = evaluate_query_result(query_result, budget)
         report["seed"] = seed
@@ -198,10 +202,17 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             "budget.workload.measured_iterations must be greater than zero"
         )
     query_mode = workload.get("query_mode", "full")
-    if query_mode not in ("full", "page", "page-covered", "remove", "attach"):
+    if query_mode not in (
+        "full",
+        "page",
+        "page-covered",
+        "remove",
+        "attach",
+        "reimport",
+    ):
         raise RegressionError(
             "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
-            "'remove', or 'attach'"
+            "'remove', 'attach', or 'reimport'"
         )
     if query_mode == "full":
         scenario_names = workload.get("full_library_scenarios")
@@ -231,9 +242,10 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 "budget.workload.full_count_scenarios must not repeat names"
             )
     else:
-        positive_or_zero_field(workload, "page_size", "budget.workload")
-        if workload["page_size"] == 0:
-            raise RegressionError("budget.workload.page_size must be greater than zero")
+        if query_mode in ("remove", "attach"):
+            positive_or_zero_field(workload, "page_size", "budget.workload")
+            if workload["page_size"] == 0:
+                raise RegressionError("budget.workload.page_size must be greater than zero")
         if query_mode == "attach":
             positive_or_zero_field(workload, "source_payload_bytes", "budget.workload")
             if workload["source_payload_bytes"] == 0:
@@ -543,6 +555,58 @@ def evaluate_attach_result(
     expected_names = set(workload["scenarios"])
     if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
         raise RegressionError("attach scenarios do not match the versioned budget")
+    return evaluate_latency_budgets(by_name, budget)
+
+
+def evaluate_reimport_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    books = workload["books"]
+    if positive_or_zero_field(result, "library_books", "re-import result") != books:
+        raise RegressionError("re-import workload initial library count does not match the budget")
+    if positive_or_zero_field(result, "final_library_books", "re-import result") != books:
+        raise RegressionError("re-import workload changed the logical-book count")
+    warmup = positive_or_zero_field(result, "warmup_iterations", "re-import result")
+    measured = positive_or_zero_field(result, "measured_iterations", "re-import result")
+    if warmup != workload["warmup_iterations"] or measured != workload["measured_iterations"]:
+        raise RegressionError("re-import iteration counts do not match the budget")
+    if result.get("metadata_preserved") is not True:
+        raise RegressionError("re-import workload did not preserve logical-book metadata")
+    if result.get("assets_preserved") is not True:
+        raise RegressionError("re-import workload did not preserve file assets")
+    if result.get("covers_preserved") is not True:
+        raise RegressionError("re-import workload did not preserve cached covers")
+
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError("re-import result must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, scenario in enumerate(scenarios):
+        context = f"re-import scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{context}.name must be unique and non-empty")
+        successful = positive_or_zero_field(scenario, "successful_reimports", context)
+        if successful != warmup + measured:
+            raise RegressionError(f"{context} successful re-import count does not reconcile")
+        samples = scenario.get("samples_ns")
+        if not isinstance(samples, list) or len(samples) != measured:
+            raise RegressionError(f"{context} sample count does not match the budget")
+        if any(
+            isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+            for sample in samples
+        ):
+            raise RegressionError(f"{context}.samples_ns must contain positive integers")
+        latency = object_field(scenario, "latency_ms", context)
+        positive_number_field(latency, "p95", f"{context}.latency_ms")
+        by_name[name] = scenario
+
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("re-import scenarios do not match the versioned budget")
     return evaluate_latency_budgets(by_name, budget)
 
 

@@ -216,6 +216,48 @@ def attach_result() -> dict:
     }
 
 
+def reimport_budget() -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "lectern-query-regression-budget",
+        "workload": {
+            "query_mode": "reimport",
+            "books": 50,
+            "seed": 7,
+            "cover_every": 3,
+            "warmup_iterations": 2,
+            "measured_iterations": 3,
+            "scenarios": ["reimport_known_path"],
+        },
+        "comparison": {
+            "paired_runs": 3,
+            "max_p95_regression_percent": 10,
+            "minimum_p95_delta_ms": 0.5,
+        },
+        "budgets": {"reimport_known_path": {"max_p95_ms": 25}},
+    }
+
+
+def reimport_result() -> dict:
+    return {
+        "library_books": 50,
+        "final_library_books": 50,
+        "warmup_iterations": 2,
+        "measured_iterations": 3,
+        "metadata_preserved": True,
+        "assets_preserved": True,
+        "covers_preserved": True,
+        "scenarios": [
+            {
+                "name": "reimport_known_path",
+                "successful_reimports": 5,
+                "latency_ms": {"p95": 2.0},
+                "samples_ns": [1_000_000, 2_000_000, 3_000_000],
+            }
+        ],
+    }
+
+
 class PerformanceRegressionTests(unittest.TestCase):
     def test_checked_in_budget_is_valid(self) -> None:
         checked_in = REGRESSION.load_budget(REGRESSION.DEFAULT_BUDGET)
@@ -265,6 +307,14 @@ class PerformanceRegressionTests(unittest.TestCase):
 
         self.assertEqual(checked_in["workload"]["query_mode"], "attach")
         self.assertEqual(checked_in["workload"]["source_payload_bytes"], 8_388_608)
+
+    def test_checked_in_reimport_budget_is_valid(self) -> None:
+        checked_in = REGRESSION.load_budget(
+            pathlib.Path(__file__).with_name("reimport-known-path-regression-v1.json")
+        )
+
+        self.assertEqual(checked_in["workload"]["query_mode"], "reimport")
+        self.assertEqual(checked_in["budgets"]["reimport_known_path"]["max_p95_ms"], 25)
 
     def test_load_budget_rejects_unpaired_ratio_fields(self) -> None:
         invalid = budget()
@@ -359,6 +409,20 @@ class PerformanceRegressionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(REGRESSION.RegressionError, "PDF count"):
             REGRESSION.evaluate_attach_result(invalid, attach_budget())
+
+    def test_evaluate_reimport_result_accepts_reconciled_workload(self) -> None:
+        decisions = REGRESSION.evaluate_reimport_result(
+            reimport_result(), reimport_budget()
+        )
+
+        self.assertTrue(all(decision["passed"] for decision in decisions))
+
+    def test_evaluate_reimport_result_requires_preserved_metadata(self) -> None:
+        invalid = reimport_result()
+        invalid["metadata_preserved"] = False
+
+        with self.assertRaisesRegex(REGRESSION.RegressionError, "metadata"):
+            REGRESSION.evaluate_reimport_result(invalid, reimport_budget())
 
 
 if __name__ == "__main__":

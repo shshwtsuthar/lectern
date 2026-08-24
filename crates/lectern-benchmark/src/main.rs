@@ -53,6 +53,7 @@ Usage:
   lectern-benchmark query-page-covered --database PATH --output PATH [OPTIONS]
   lectern-benchmark remove --database PATH --output PATH [OPTIONS]
   lectern-benchmark attach --database PATH --output PATH [OPTIONS]
+  lectern-benchmark reimport --database PATH --output PATH [OPTIONS]
   lectern-benchmark import --database PATH --corpus PATH --output PATH [OPTIONS]
 
 Seed options:
@@ -71,6 +72,10 @@ Remove options:
 
 Attach options:
   --iterations N     Measured validate-attach-refresh iterations (default: 100)
+  --warmup N         Warmup iterations (default: 10)
+
+Re-import options:
+  --iterations N     Measured known-path re-imports (default: 100)
   --warmup N         Warmup iterations (default: 10)
 
 Import options:
@@ -107,6 +112,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         "query-page-covered" => run_query_page_covered(&QueryOptions::parse(&mut args)?),
         "remove" => run_remove(&QueryOptions::parse(&mut args)?),
         "attach" => run_attach(&QueryOptions::parse(&mut args)?),
+        "reimport" => run_reimport(&QueryOptions::parse(&mut args)?),
         "import" => run_import(&ImportOptions::parse(&mut args)?),
         _ => Err(format!(
             "unknown command '{command}'. Run 'lectern-benchmark --help' for usage"
@@ -1466,6 +1472,203 @@ fn book_metadata_matches(original: &Book, updated: &Book) -> bool {
         && original.publisher == updated.publisher
         && original.language == updated.language
         && original.description == updated.description
+}
+
+#[derive(Serialize)]
+struct ReimportResult {
+    schema_version: u32,
+    kind: &'static str,
+    measured_at_unix_ms: u128,
+    database_path: String,
+    library_books: u64,
+    final_library_books: u64,
+    warmup_iterations: usize,
+    measured_iterations: usize,
+    metadata_preserved: bool,
+    assets_preserved: bool,
+    covers_preserved: bool,
+    scenarios: Vec<ReimportScenarioResult>,
+}
+
+#[derive(Serialize)]
+struct ReimportScenarioResult {
+    name: &'static str,
+    successful_reimports: usize,
+    latency_ms: LatencySummary,
+    samples_ns: Vec<u64>,
+}
+
+struct ReimportCandidate {
+    original: Book,
+    original_cover: Vec<u8>,
+    incoming: BookImport,
+}
+
+fn run_reimport(options: &QueryOptions) -> Result<(), String> {
+    ensure_distinct_paths("database", &options.database, "output", &options.output)?;
+    if !options.database.is_file() {
+        return Err(format!(
+            "benchmark database is not a file: {}",
+            options.database.display()
+        ));
+    }
+
+    let rounds = options
+        .warmup
+        .checked_add(options.iterations)
+        .ok_or_else(|| "re-import iteration count overflowed".to_owned())?;
+    let mut database = LibraryDatabase::open(&options.database).map_err(display_error)?;
+    let library_books = database.count().map_err(display_error)?;
+    if library_books == 0 {
+        return Err(format!(
+            "benchmark database contains no books: {}",
+            options.database.display()
+        ));
+    }
+    let candidates = prepare_reimport_candidates(&database, rounds)?;
+    let mut samples_ns = Vec::with_capacity(options.iterations);
+
+    for (round, candidate) in candidates.iter().enumerate() {
+        let started = Instant::now();
+        let ids = database
+            .import_books(std::slice::from_ref(&candidate.incoming))
+            .map_err(display_error)?;
+        let elapsed = started.elapsed();
+        if ids.as_slice() != [candidate.original.id] {
+            return Err(format!(
+                "known-path re-import did not retain book {}",
+                candidate.original.id
+            ));
+        }
+        validate_reimported_book(&database, candidate)?;
+        if round >= options.warmup {
+            samples_ns.push(duration_ns(elapsed)?);
+        }
+    }
+
+    let final_library_books = database.count().map_err(display_error)?;
+    if final_library_books != library_books {
+        return Err(format!(
+            "re-import benchmark changed book count: got {final_library_books}, expected {library_books}"
+        ));
+    }
+    let result = ReimportResult {
+        schema_version: 1,
+        kind: "reimport",
+        measured_at_unix_ms: unix_time_ms()?,
+        database_path: options.database.display().to_string(),
+        library_books,
+        final_library_books,
+        warmup_iterations: options.warmup,
+        measured_iterations: options.iterations,
+        metadata_preserved: true,
+        assets_preserved: true,
+        covers_preserved: true,
+        scenarios: vec![ReimportScenarioResult {
+            name: "reimport_known_path",
+            successful_reimports: rounds,
+            latency_ms: summarize_latency(&samples_ns),
+            samples_ns,
+        }],
+    };
+    write_json(&options.output, &result)?;
+    println!(
+        "Measured {} known-path re-imports over {} books",
+        options.iterations, library_books
+    );
+    Ok(())
+}
+
+fn prepare_reimport_candidates(
+    database: &LibraryDatabase,
+    rounds: usize,
+) -> Result<Vec<ReimportCandidate>, String> {
+    let summaries = database
+        .query(&LibraryQuery::default())
+        .map_err(display_error)?
+        .into_iter()
+        .filter(|book| book.has_cover)
+        .take(rounds)
+        .collect::<Vec<_>>();
+    if summaries.len() != rounds {
+        return Err(format!(
+            "re-import benchmark needs {rounds} covered books but found {}",
+            summaries.len()
+        ));
+    }
+
+    summaries
+        .into_iter()
+        .map(|summary| {
+            let original = database
+                .get_book(summary.id)
+                .map_err(display_error)?
+                .ok_or_else(|| format!("re-import candidate {} disappeared", summary.id))?;
+            let original_cover = database
+                .load_cover(summary.id)
+                .map_err(display_error)?
+                .ok_or_else(|| format!("re-import candidate {} lost its cover", summary.id))?;
+            let incoming = BookImport {
+                book: BookMetadataDraft {
+                    title: original.title.clone(),
+                    authors: original.authors.clone(),
+                    series: original.series.clone(),
+                    publisher: original.publisher.clone(),
+                    language: original.language.clone(),
+                    description: original.description.clone(),
+                },
+                assets: original
+                    .assets
+                    .iter()
+                    .map(|asset| BookAssetDraft {
+                        format: asset.format,
+                        storage: asset.storage,
+                        path: asset.path.clone(),
+                    })
+                    .collect(),
+                cover_thumbnail: None,
+            };
+            Ok(ReimportCandidate {
+                original,
+                original_cover,
+                incoming,
+            })
+        })
+        .collect()
+}
+
+fn validate_reimported_book(
+    database: &LibraryDatabase,
+    candidate: &ReimportCandidate,
+) -> Result<(), String> {
+    let updated = database
+        .get_book(candidate.original.id)
+        .map_err(display_error)?
+        .ok_or_else(|| format!("re-imported book {} disappeared", candidate.original.id))?;
+    if !book_metadata_matches(&candidate.original, &updated) {
+        return Err(format!(
+            "re-import changed metadata for book {}",
+            candidate.original.id
+        ));
+    }
+    if updated.assets != candidate.original.assets {
+        return Err(format!(
+            "re-import changed assets for book {}",
+            candidate.original.id
+        ));
+    }
+    if database
+        .load_cover(candidate.original.id)
+        .map_err(display_error)?
+        .as_deref()
+        != Some(candidate.original_cover.as_slice())
+    {
+        return Err(format!(
+            "re-import changed the cover for book {}",
+            candidate.original.id
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
