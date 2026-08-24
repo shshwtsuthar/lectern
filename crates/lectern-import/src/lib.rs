@@ -67,6 +67,16 @@ pub enum ImportError {
     /// A directly parsed path did not use a supported extension.
     #[error("unsupported publication format: {0}")]
     UnsupportedFormat(PathBuf),
+    /// A replacement file did not use the same format as its existing asset.
+    #[error("replacement format {found} does not match the expected {expected}: {path}")]
+    ReplacementFormatMismatch {
+        /// Replacement path selected by the user.
+        path: PathBuf,
+        /// Format stored for the asset being repaired.
+        expected: BookFormat,
+        /// Format inferred from the replacement file.
+        found: BookFormat,
+    },
     /// An archive member exceeded a defensive size limit.
     #[error("EPUB entry {name} exceeds the {limit}-byte limit")]
     EntryTooLarge {
@@ -231,6 +241,32 @@ pub fn parse_publication(path: impl AsRef<Path>) -> Result<BookImport> {
     }
 }
 
+/// Validates a replacement publication before an existing asset is relinked to it.
+///
+/// This checks the expected format and parses the publication structure, but deliberately skips
+/// cover extraction and thumbnail rendering so relinking does not redo import-only work.
+///
+/// # Errors
+///
+/// Returns an error when the replacement extension is unsupported or does not match `expected`,
+/// or when the EPUB/PDF cannot be read as a supported publication.
+pub fn validate_publication(path: impl AsRef<Path>, expected: BookFormat) -> Result<()> {
+    let path = path.as_ref();
+    let found = format_for_path(path).ok_or_else(|| ImportError::UnsupportedFormat(path.into()))?;
+    if found != expected {
+        return Err(ImportError::ReplacementFormatMismatch {
+            path: path.into(),
+            expected,
+            found,
+        });
+    }
+
+    match expected {
+        BookFormat::Epub => validate_epub(path),
+        BookFormat::Pdf => validate_pdf(path),
+    }
+}
+
 /// Parses metadata and a bounded cover thumbnail from one EPUB publication.
 ///
 /// A corrupt or unsupported cover is ignored so otherwise valid book metadata remains importable.
@@ -272,6 +308,16 @@ pub fn parse_epub(path: impl AsRef<Path>) -> Result<BookImport> {
         }],
         cover_thumbnail,
     })
+}
+
+fn validate_epub(path: &Path) -> Result<()> {
+    let mut archive = ZipArchive::new(File::open(path)?)?;
+    let container = read_entry(&mut archive, CONTAINER_PATH, MAX_CONTAINER_BYTES)?;
+    let package_path = parse_container(&container)?;
+    let package_path = normalize_archive_path(None, &package_path)?;
+    let package = read_entry(&mut archive, &package_path, MAX_PACKAGE_BYTES)?;
+    let _ = parse_package(&package)?;
+    Ok(())
 }
 
 /// Parses standard document metadata and a first-page thumbnail from one PDF publication.
@@ -322,6 +368,20 @@ pub fn parse_pdf(path: impl AsRef<Path>) -> Result<BookImport> {
         }],
         cover_thumbnail,
     })
+}
+
+fn validate_pdf(path: &Path) -> Result<()> {
+    let bytes = read_bounded_file(path, MAX_PDF_BYTES)?;
+    let metadata = Document::load_metadata_mem(&bytes)?;
+    if metadata.encrypted {
+        return Err(ImportError::InvalidPdf(
+            "password-protected documents are not supported",
+        ));
+    }
+    if metadata.page_count == 0 {
+        return Err(ImportError::InvalidPdf("document contains no pages"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -785,7 +845,7 @@ mod tests {
 
     use super::{
         ImportProgress, discover_publications, import_paths, parse_epub, parse_pdf,
-        parse_publication,
+        parse_publication, validate_publication,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -968,6 +1028,22 @@ mod tests {
 
         assert_eq!(record.assets.len(), 1);
         assert_eq!(record.assets[0].format, BookFormat::Pdf);
+    }
+
+    #[test]
+    fn validates_relink_targets_without_reimporting_them() {
+        let directory = TestDirectory::new("validate-relink");
+        let epub = directory.0.join("wizard.epub");
+        let pdf = directory.0.join("guide.pdf");
+        create_epub(&epub, "A Wizard");
+        create_pdf(&pdf, "Guide");
+
+        validate_publication(&epub, BookFormat::Epub).expect("validate EPUB replacement");
+        validate_publication(&pdf, BookFormat::Pdf).expect("validate PDF replacement");
+        assert!(matches!(
+            validate_publication(&pdf, BookFormat::Epub),
+            Err(super::ImportError::ReplacementFormatMismatch { .. })
+        ));
     }
 
     #[test]
