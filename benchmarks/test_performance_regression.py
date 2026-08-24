@@ -117,6 +117,51 @@ def page_query_result() -> dict:
     }
 
 
+def remove_budget() -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "lectern-query-regression-budget",
+        "workload": {
+            "query_mode": "remove",
+            "books": 50,
+            "seed": 7,
+            "cover_every": 0,
+            "page_size": 8,
+            "warmup_iterations": 2,
+            "measured_iterations": 3,
+            "scenarios": ["remove_book_and_refresh"],
+        },
+        "comparison": {
+            "paired_runs": 3,
+            "max_p95_regression_percent": 10,
+            "minimum_p95_delta_ms": 1.0,
+        },
+        "budgets": {"remove_book_and_refresh": {"max_p95_ms": 100}},
+    }
+
+
+def remove_result() -> dict:
+    return {
+        "library_books": 50,
+        "final_library_books": 50,
+        "page_size": 8,
+        "warmup_iterations": 2,
+        "measured_iterations": 3,
+        "source_files": ["candidate.epub", "candidate.pdf"],
+        "source_bytes_unchanged": True,
+        "scenarios": [
+            {
+                "name": "remove_book_and_refresh",
+                "successful_removals": 5,
+                "refreshed_total": 50,
+                "refreshed_result_count": 8,
+                "latency_ms": {"p95": 12.0},
+                "samples_ns": [1_000_000, 2_000_000, 3_000_000],
+            }
+        ],
+    }
+
+
 class PerformanceRegressionTests(unittest.TestCase):
     def test_checked_in_budget_is_valid(self) -> None:
         checked_in = REGRESSION.load_budget(REGRESSION.DEFAULT_BUDGET)
@@ -132,6 +177,14 @@ class PerformanceRegressionTests(unittest.TestCase):
 
         self.assertEqual(checked_in["workload"]["page_size"], 128)
         self.assertEqual(checked_in["workload"]["query_mode"], "page")
+
+    def test_checked_in_remove_budget_is_valid(self) -> None:
+        checked_in = REGRESSION.load_budget(
+            pathlib.Path(__file__).with_name("remove-book-regression-v1.json")
+        )
+
+        self.assertEqual(checked_in["workload"]["query_mode"], "remove")
+        self.assertEqual(checked_in["budgets"]["remove_book_and_refresh"]["max_p95_ms"], 100)
 
     def test_load_budget_rejects_unpaired_ratio_fields(self) -> None:
         invalid = budget()
@@ -195,6 +248,18 @@ class PerformanceRegressionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(REGRESSION.RegressionError, "page size"):
             REGRESSION.evaluate_query_result(invalid, page_budget())
+
+    def test_evaluate_remove_result_accepts_reconciled_workload(self) -> None:
+        decisions = REGRESSION.evaluate_remove_result(remove_result(), remove_budget())
+
+        self.assertTrue(all(decision["passed"] for decision in decisions))
+
+    def test_evaluate_remove_result_requires_untouched_sources(self) -> None:
+        invalid = remove_result()
+        invalid["source_bytes_unchanged"] = False
+
+        with self.assertRaisesRegex(REGRESSION.RegressionError, "source bytes"):
+            REGRESSION.evaluate_remove_result(invalid, remove_budget())
 
 
 if __name__ == "__main__":

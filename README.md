@@ -70,8 +70,9 @@ are the same book; trusted aggregate importers such as the planned Calibre adapt
 several formats atomically.
 
 The application has performance-conscious boundaries and deterministic weekly regression suites
-for full-result and paged 50,000-book release-query paths. The broader benchmark study retains raw
-measurements for cold launch, import throughput, scrolling, and memory; see
+for full-result queries, paged queries, and single-book removal with a bounded refresh against a
+50,000-book library. The broader benchmark study retains raw measurements for cold launch, import
+throughput, scrolling, and memory; see
 [`benchmarks/README.md`](benchmarks/README.md) for how to run and interpret both workflows.
 
 ## Quality gates

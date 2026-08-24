@@ -626,6 +626,22 @@ impl LibraryDatabase {
         Ok(())
     }
 
+    /// Removes one logical book and its stored library data.
+    ///
+    /// The database cascades this deletion to the book's asset records and cached cover. Referenced
+    /// or managed publication files are never deleted by this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the deletion cannot be executed.
+    pub fn remove_book(&self, id: BookId) -> Result<bool> {
+        let changed = self
+            .connection
+            .prepare_cached("DELETE FROM books WHERE id = ?1")?
+            .execute([id.value()])?;
+        Ok(changed == 1)
+    }
+
     /// Checks every externally referenced asset and records only changed health states.
     ///
     /// The scan uses filesystem metadata plus a file-open check. It intentionally does not parse
@@ -2140,16 +2156,18 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_book_cascades_to_assets_and_cover() {
+    fn removing_a_book_cascades_library_data_without_deleting_source_files() {
         let mut database = LibraryDatabase::open_in_memory().expect("open library");
-        let mut imported = record("/books/dune.epub", "Dune", "Frank Herbert");
+        let source = TestAsset::file("remove-source");
+        let mut imported = record(
+            source.path().to_str().expect("UTF-8 test path"),
+            "Dune",
+            "Frank Herbert",
+        );
         imported.cover_thumbnail = Some(vec![1, 2, 3]);
         let id = database.import_books(&[imported]).expect("import book")[0];
 
-        database
-            .connection
-            .execute("DELETE FROM books WHERE id = ?1", [id.value()])
-            .expect("delete book");
+        assert!(database.remove_book(id).expect("remove book"));
 
         let assets: i64 = database
             .connection
@@ -2157,6 +2175,22 @@ mod tests {
             .expect("count assets");
         assert_eq!(assets, 0);
         assert_eq!(database.load_cover(id).expect("load cover"), None);
+        assert_eq!(database.count().expect("count books"), 0);
+        assert_eq!(database.get_book(id).expect("load removed book"), None);
+        assert!(
+            database
+                .query(&LibraryQuery {
+                    search: "Dune".into(),
+                    ..LibraryQuery::default()
+                })
+                .expect("search removed book")
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read(source.path()).expect("read source"),
+            b"publication"
+        );
+        assert!(!database.remove_book(id).expect("remove absent book"));
     }
 
     #[test]

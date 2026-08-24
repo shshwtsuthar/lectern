@@ -16,9 +16,12 @@ use std::{
 };
 
 use image::{Rgb, RgbImage, codecs::jpeg::JpegEncoder};
-use lectern_core::{AssetHealth, BookDraft, BookFormat, LibraryQuery, SortOrder};
+use lectern_core::{
+    AssetHealth, AssetStorage, BookAssetDraft, BookDraft, BookFormat, BookMetadataDraft,
+    LibraryQuery, SortOrder,
+};
 use lectern_import::{ImportProgress, ImportSummary, discover_publications, import_paths};
-use lectern_storage::{ImportRecord, LibraryDatabase};
+use lectern_storage::{BookImport, ImportRecord, LibraryDatabase};
 use serde::Serialize;
 
 const DEFAULT_BOOKS: usize = 50_000;
@@ -31,6 +34,7 @@ const MAX_RECORDED_FAILURES: usize = 200;
 const BENCHMARK_COVER_WIDTH: u32 = 320;
 const BENCHMARK_COVER_HEIGHT: u32 = 480;
 const BENCHMARK_ADDED_AT_UNIX_SECONDS: i64 = 1_700_000_000;
+const REMOVAL_SOURCE_CONTENTS: &[u8] = b"Lectern removal benchmark source bytes\n";
 
 const USAGE: &str = "Lectern exploratory performance harness
 
@@ -38,6 +42,7 @@ Usage:
   lectern-benchmark seed --database PATH --output PATH [OPTIONS]
   lectern-benchmark query --database PATH --output PATH [OPTIONS]
   lectern-benchmark query-page --database PATH --output PATH [OPTIONS]
+  lectern-benchmark remove --database PATH --output PATH [OPTIONS]
   lectern-benchmark import --database PATH --corpus PATH --output PATH [OPTIONS]
 
 Seed options:
@@ -49,6 +54,10 @@ Seed options:
 Query options:
   --iterations N     Measured iterations per scenario (default: 100)
   --warmup N         Warmup iterations per scenario (default: 10)
+
+Remove options:
+  --iterations N     Measured remove-and-refresh iterations (default: 100)
+  --warmup N         Warmup iterations (default: 10)
 
 Import options:
   --replace          Replace an existing benchmark database
@@ -81,6 +90,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         "seed" => run_seed(&SeedOptions::parse(&mut args)?),
         "query" => run_query(&QueryOptions::parse(&mut args)?),
         "query-page" => run_query_page(&QueryOptions::parse(&mut args)?),
+        "remove" => run_remove(&QueryOptions::parse(&mut args)?),
         "import" => run_import(&ImportOptions::parse(&mut args)?),
         _ => Err(format!(
             "unknown command '{command}'. Run 'lectern-benchmark --help' for usage"
@@ -812,6 +822,211 @@ fn run_query_page(options: &QueryOptions) -> Result<(), String> {
         options.iterations
     );
     Ok(())
+}
+
+#[derive(Serialize)]
+struct RemoveResult {
+    schema_version: u32,
+    kind: &'static str,
+    measured_at_unix_ms: u128,
+    database_path: String,
+    library_books: u64,
+    final_library_books: u64,
+    page_size: u32,
+    warmup_iterations: usize,
+    measured_iterations: usize,
+    source_files: Vec<String>,
+    source_bytes_unchanged: bool,
+    scenarios: Vec<RemoveScenarioResult>,
+}
+
+#[derive(Serialize)]
+struct RemoveScenarioResult {
+    name: &'static str,
+    successful_removals: usize,
+    refreshed_total: u64,
+    refreshed_result_count: usize,
+    latency_ms: LatencySummary,
+    samples_ns: Vec<u64>,
+}
+
+fn run_remove(options: &QueryOptions) -> Result<(), String> {
+    ensure_distinct_paths("database", &options.database, "output", &options.output)?;
+    if !options.database.is_file() {
+        return Err(format!(
+            "benchmark database is not a file: {}",
+            options.database.display()
+        ));
+    }
+    let source_epub = options.output.with_extension("source.epub");
+    let source_pdf = options.output.with_extension("source.pdf");
+    for source in [&source_epub, &source_pdf] {
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(source)
+            .and_then(|mut file| file.write_all(REMOVAL_SOURCE_CONTENTS))
+            .map_err(display_error)?;
+    }
+
+    let mut database = LibraryDatabase::open(&options.database).map_err(display_error)?;
+    let library_books = database.count().map_err(display_error)?;
+    if library_books == 0 {
+        return Err(format!(
+            "benchmark database contains no books: {}",
+            options.database.display()
+        ));
+    }
+    let cover = make_benchmark_cover()?;
+    let rounds = options.warmup + options.iterations;
+    let mut samples_ns = Vec::with_capacity(options.iterations);
+    let mut successful_removals = 0;
+    let mut refreshed_total = 0;
+    let mut refreshed_result_count = 0;
+
+    for round in 0..rounds {
+        let (elapsed, page) = remove_and_refresh(
+            &mut database,
+            round,
+            library_books,
+            &source_epub,
+            &source_pdf,
+            cover.clone(),
+        )?;
+        successful_removals += 1;
+        refreshed_total = page.total;
+        refreshed_result_count = page.books.len();
+        if round >= options.warmup {
+            samples_ns.push(duration_ns(elapsed)?);
+        }
+    }
+
+    let final_library_books = database.count().map_err(display_error)?;
+    if final_library_books != library_books {
+        return Err(format!(
+            "removal benchmark final count mismatch: got {final_library_books}, expected {library_books}"
+        ));
+    }
+    let result = RemoveResult {
+        schema_version: 1,
+        kind: "remove",
+        measured_at_unix_ms: unix_time_ms()?,
+        database_path: options.database.display().to_string(),
+        library_books,
+        final_library_books,
+        page_size: QUERY_PAGE_SIZE,
+        warmup_iterations: options.warmup,
+        measured_iterations: options.iterations,
+        source_files: vec![
+            source_epub.display().to_string(),
+            source_pdf.display().to_string(),
+        ],
+        source_bytes_unchanged: true,
+        scenarios: vec![RemoveScenarioResult {
+            name: "remove_book_and_refresh",
+            successful_removals,
+            refreshed_total,
+            refreshed_result_count,
+            latency_ms: summarize_latency(&samples_ns),
+            samples_ns,
+        }],
+    };
+    write_json(&options.output, &result)?;
+    println!(
+        "Measured {} remove-and-refresh iterations over {} books",
+        options.iterations, library_books
+    );
+    Ok(())
+}
+
+fn remove_and_refresh(
+    database: &mut LibraryDatabase,
+    round: usize,
+    library_books: u64,
+    source_epub: &Path,
+    source_pdf: &Path,
+    cover_thumbnail: Vec<u8>,
+) -> Result<(Duration, lectern_core::LibraryPage), String> {
+    let record = removal_candidate(round, source_epub, source_pdf, cover_thumbnail);
+    let ids = database.import_books(&[record]).map_err(display_error)?;
+    let id = *ids
+        .first()
+        .ok_or_else(|| "removal benchmark did not import its candidate".to_owned())?;
+    let expected_with_candidate = library_books
+        .checked_add(1)
+        .ok_or_else(|| "benchmark book count overflowed".to_owned())?;
+    if database.count().map_err(display_error)? != expected_with_candidate {
+        return Err("removal benchmark candidate count was not installed".into());
+    }
+
+    let started = Instant::now();
+    let removed = database.remove_book(id).map_err(display_error)?;
+    let page = database
+        .query_page(&LibraryQuery::default(), 0, QUERY_PAGE_SIZE)
+        .map_err(display_error)?;
+    let elapsed = started.elapsed();
+    if !removed {
+        return Err("removal benchmark could not remove its candidate".into());
+    }
+    let expected_results = usize::try_from(library_books.min(u64::from(QUERY_PAGE_SIZE)))
+        .expect("bounded page count fits usize");
+    if page.total != library_books || page.books.len() != expected_results {
+        return Err("removal benchmark refreshed page did not reconcile".into());
+    }
+    if database.get_book(id).map_err(display_error)?.is_some()
+        || database.load_cover(id).map_err(display_error)?.is_some()
+    {
+        return Err("removal benchmark left book data behind".into());
+    }
+    let search = database
+        .query(&LibraryQuery {
+            search: format!("lectern removal candidate {round}"),
+            ..LibraryQuery::default()
+        })
+        .map_err(display_error)?;
+    if !search.is_empty() {
+        return Err("removal benchmark left searchable metadata behind".into());
+    }
+    for source in [source_epub, source_pdf] {
+        if fs::read(source).map_err(display_error)? != REMOVAL_SOURCE_CONTENTS {
+            return Err(format!(
+                "removal benchmark changed source file {}",
+                source.display()
+            ));
+        }
+    }
+    Ok((elapsed, page))
+}
+
+fn removal_candidate(
+    round: usize,
+    source_epub: &Path,
+    source_pdf: &Path,
+    cover_thumbnail: Vec<u8>,
+) -> BookImport {
+    BookImport {
+        book: BookMetadataDraft {
+            title: format!("Lectern Removal Candidate {round}"),
+            authors: "Benchmark Author".into(),
+            series: Some("Removal Regression".into()),
+            publisher: Some("Lectern Benchmark".into()),
+            language: Some("en".into()),
+            description: Some("Deterministic aggregate removed after every measurement.".into()),
+        },
+        assets: vec![
+            BookAssetDraft {
+                format: BookFormat::Epub,
+                storage: AssetStorage::Reference,
+                path: source_epub.into(),
+            },
+            BookAssetDraft {
+                format: BookFormat::Pdf,
+                storage: AssetStorage::Reference,
+                path: source_pdf.into(),
+            },
+        ],
+        cover_thumbnail: Some(cover_thumbnail),
+    }
 }
 
 #[derive(Serialize)]

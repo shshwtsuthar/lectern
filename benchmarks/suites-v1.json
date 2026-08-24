@@ -9,6 +9,10 @@
     {
       "name": "query-page-v1",
       "budget": "benchmarks/query-page-regression-v1.json"
+    },
+    {
+      "name": "remove-book-v1",
+      "budget": "benchmarks/remove-book-regression-v1.json"
     }
   ]
 }

@@ -20,8 +20,9 @@ class CiPerformanceTests(unittest.TestCase):
     def test_checked_in_registry_is_valid(self) -> None:
         registry = CI_PERFORMANCE.load_registry(CI_PERFORMANCE.DEFAULT_REGISTRY)
 
-        self.assertEqual(len(registry["suites"]), 2)
+        self.assertEqual(len(registry["suites"]), 3)
         self.assertEqual(registry["suites"][0]["name"], "query-full-v1")
+        self.assertEqual(registry["suites"][2]["name"], "remove-book-v1")
 
     def test_registry_rejects_unsafe_budget_path(self) -> None:
         registry = {

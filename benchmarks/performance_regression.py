@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Run Lectern's deterministic query-performance regression suite.
+"""Run Lectern's deterministic storage-performance regression suites.
 
-This deliberately measures only the storage/query workload. The broader ``run.py``
+This deliberately measures only deterministic storage/query workloads. The broader ``run.py``
 study remains an opt-in exploratory benchmark because it also needs a prepared
 corpus and a native desktop session.
 """
@@ -35,7 +35,7 @@ class RegressionError(RuntimeError):
 
 def parse_arguments(arguments: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Lectern's deterministic release-query regression suite."
+        description="Run a deterministic Lectern release-storage regression suite."
     )
     parser.add_argument(
         "--budget",
@@ -84,7 +84,8 @@ def main(arguments: list[str]) -> int:
         workload = budget["workload"]
         database = output / "library.sqlite3"
         seed_output = output / "seed.json"
-        query_output = output / "queries.json"
+        mode = workload.get("query_mode", "full")
+        query_output = output / ("removals.json" if mode == "remove" else "queries.json")
         run_command(
             [
                 "cargo",
@@ -120,9 +121,7 @@ def main(arguments: list[str]) -> int:
                 "-p",
                 "lectern-benchmark",
                 "--",
-                "query-page"
-                if workload.get("query_mode", "full") == "page"
-                else "query",
+                {"full": "query", "page": "query-page", "remove": "remove"}[mode],
                 "--database",
                 str(database),
                 "--output",
@@ -135,7 +134,11 @@ def main(arguments: list[str]) -> int:
             commands,
         )
         query_result = read_json(query_output)
-        decisions = evaluate_query_result(query_result, budget)
+        decisions = (
+            evaluate_remove_result(query_result, budget)
+            if mode == "remove"
+            else evaluate_query_result(query_result, budget)
+        )
         report["seed"] = seed
         report["query"] = {
             "path": str(query_output),
@@ -145,7 +148,7 @@ def main(arguments: list[str]) -> int:
         failures = [decision for decision in decisions if not decision["passed"]]
         if failures:
             failed_names = ", ".join(decision["name"] for decision in failures)
-            raise RegressionError(f"query-performance budget exceeded: {failed_names}")
+            raise RegressionError(f"storage-performance budget exceeded: {failed_names}")
         report["status"] = "passed"
         print(f"Performance regression passed: {output / 'performance-regression.json'}")
         return 0
@@ -181,8 +184,10 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             "budget.workload.measured_iterations must be greater than zero"
         )
     query_mode = workload.get("query_mode", "full")
-    if query_mode not in ("full", "page"):
-        raise RegressionError("budget.workload.query_mode must be 'full' or 'page'")
+    if query_mode not in ("full", "page", "remove"):
+        raise RegressionError(
+            "budget.workload.query_mode must be 'full', 'page', or 'remove'"
+        )
     if query_mode == "full":
         scenario_names = workload.get("full_library_scenarios")
         if not isinstance(scenario_names, list) or not all(
@@ -195,7 +200,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             raise RegressionError(
                 "budget.workload.full_library_scenarios must not repeat names"
             )
-    else:
+    elif query_mode == "page":
         positive_or_zero_field(workload, "page_size", "budget.workload")
         if workload["page_size"] == 0:
             raise RegressionError("budget.workload.page_size must be greater than zero")
@@ -210,6 +215,17 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             raise RegressionError(
                 "budget.workload.full_count_scenarios must not repeat names"
             )
+    else:
+        positive_or_zero_field(workload, "page_size", "budget.workload")
+        if workload["page_size"] == 0:
+            raise RegressionError("budget.workload.page_size must be greater than zero")
+        scenario_names = workload.get("scenarios")
+        if not isinstance(scenario_names, list) or not all(
+            isinstance(name, str) and name for name in scenario_names
+        ):
+            raise RegressionError("budget.workload.scenarios must be a list of names")
+        if len(set(scenario_names)) != len(scenario_names):
+            raise RegressionError("budget.workload.scenarios must not repeat names")
 
     comparison = object_field(budget, "comparison", "budget")
     positive_or_zero_field(comparison, "paired_runs", "budget.comparison")
@@ -247,11 +263,11 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                     f"budget {name!r}.max_p95_ratio_to must name another scenario"
                 )
             positive_number_field(scenario_budget, "max_p95_ratio", f"budget {name!r}")
-    unknown_full_count = set(scenario_names).difference(budgets)
-    if unknown_full_count:
+    unknown_scenarios = set(scenario_names).difference(budgets)
+    if unknown_scenarios:
         raise RegressionError(
-            "full-count scenarios must have budgets: "
-            + ", ".join(sorted(unknown_full_count))
+            "configured scenarios must have budgets: "
+            + ", ".join(sorted(unknown_scenarios))
         )
     return budget
 
@@ -356,11 +372,80 @@ def evaluate_query_result(result: dict[str, Any], budget: dict[str, Any]) -> lis
                     f"got {by_name[name]['total_count']}, expected {books}"
                 )
 
+    return evaluate_latency_budgets(by_name, budget)
+
+
+def evaluate_remove_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    books = workload["books"]
+    if positive_or_zero_field(result, "library_books", "remove result") != books:
+        raise RegressionError("remove workload initial library count does not match the budget")
+    if positive_or_zero_field(result, "final_library_books", "remove result") != books:
+        raise RegressionError("remove workload final library count does not reconcile")
+    warmup = positive_or_zero_field(result, "warmup_iterations", "remove result")
+    measured = positive_or_zero_field(result, "measured_iterations", "remove result")
+    if warmup != workload["warmup_iterations"] or measured != workload["measured_iterations"]:
+        raise RegressionError("remove iteration counts do not match the budget")
+    page_size = positive_or_zero_field(result, "page_size", "remove result")
+    if page_size != workload["page_size"]:
+        raise RegressionError("remove refresh page size does not match the budget")
+    source_files = result.get("source_files")
+    if (
+        not isinstance(source_files, list)
+        or len(source_files) != 2
+        or not all(isinstance(path, str) and path for path in source_files)
+    ):
+        raise RegressionError("remove result must retain two source-file paths")
+    if result.get("source_bytes_unchanged") is not True:
+        raise RegressionError("remove workload did not preserve source bytes")
+
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError("remove result must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, scenario in enumerate(scenarios):
+        context = f"remove scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{context}.name must be unique and non-empty")
+        successful = positive_or_zero_field(scenario, "successful_removals", context)
+        if successful != warmup + measured:
+            raise RegressionError(f"{context} successful removal count does not reconcile")
+        if positive_or_zero_field(scenario, "refreshed_total", context) != books:
+            raise RegressionError(f"{context} refreshed total does not reconcile")
+        expected_page = min(books, page_size)
+        if positive_or_zero_field(scenario, "refreshed_result_count", context) != expected_page:
+            raise RegressionError(f"{context} refreshed page count does not reconcile")
+        samples = scenario.get("samples_ns")
+        if not isinstance(samples, list) or len(samples) != measured:
+            raise RegressionError(f"{context} sample count does not match the budget")
+        if any(
+            isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+            for sample in samples
+        ):
+            raise RegressionError(f"{context}.samples_ns must contain positive integers")
+        latency = object_field(scenario, "latency_ms", context)
+        positive_number_field(latency, "p95", f"{context}.latency_ms")
+        by_name[name] = scenario
+
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("remove scenarios do not match the versioned budget")
+    return evaluate_latency_budgets(by_name, budget)
+
+
+def evaluate_latency_budgets(
+    by_name: dict[str, dict[str, Any]], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
     p95_by_name = {
         name: float(scenario["latency_ms"]["p95"]) for name, scenario in by_name.items()
     }
     decisions = []
-    for name in sorted(expected_names):
+    for name in sorted(budget["budgets"]):
         scenario_budget = budget["budgets"][name]
         p95_ms = p95_by_name[name]
         maximum_ms = float(scenario_budget["max_p95_ms"])

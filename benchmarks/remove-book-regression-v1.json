@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-query-regression-budget",
+  "workload": {
+    "query_mode": "remove",
+    "books": 50000,
+    "seed": 20260824,
+    "cover_every": 0,
+    "page_size": 128,
+    "warmup_iterations": 10,
+    "measured_iterations": 40,
+    "scenarios": [
+      "remove_book_and_refresh"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 1.0
+  },
+  "budgets": {
+    "remove_book_and_refresh": {
+      "max_p95_ms": 100
+    }
+  }
+}

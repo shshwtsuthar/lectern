@@ -35,12 +35,14 @@ Before every commit containing a performance-sensitive change:
 4. Retain raw samples and verify the scenario's correctness checks, not only its timing.
 5. Record the command and outcome in the pull request.
 
-Storage and query changes currently require both versioned query suites:
+Storage and query changes currently require all registered deterministic storage suites:
 
 ```sh
 python3 benchmarks/performance_regression.py
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/query-page-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/remove-book-regression-v1.json
 ```
 
 Import, startup, scrolling, rendering, or memory changes must also run the applicable workload from
@@ -50,7 +52,7 @@ after raw results and add or improve deterministic coverage rather than claiming
 ## Merge gate
 
 Performance-sensitive pull requests are measured against their base revision on the same runner.
-The checked-in query suites use three base/candidate runs and compare the median run-level p95 so a
+The checked-in storage suites use three base/candidate runs and compare the median run-level p95 so a
 single noisy process does not decide a merge.
 Each comparable scenario must pass two independent controls:
 
