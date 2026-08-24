@@ -41,7 +41,9 @@ coalesces superseded searches and returns 128-summary windows; the first window 
 matching count, while later windows skip the repeated count. The desktop retains at most six result
 windows and at most one queued query request. A bounded worker pool loads and decodes cover
 thumbnails, a metadata worker serializes edits, and dedicated import and asset-maintenance workers
-perform filesystem and write-heavy work off the UI thread. Asset scans check referenced paths with
+perform filesystem and write-heavy work off the UI thread. The metadata worker also serializes
+confirmed single-book removal, which deletes library records and cached data while leaving source
+files untouched. Asset scans check referenced paths with
 metadata and openability checks, then persist only changed health states in one transaction;
 relinking validates publication structure without regenerating thumbnails. The UI retains at most
 256 cover textures and requests repainting only when background work completes or interaction

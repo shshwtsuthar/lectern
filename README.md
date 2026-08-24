@@ -15,6 +15,7 @@ immediately searchable, renders a cover grid, and edits their metadata.
 - Browse a virtualized grid backed by bounded result pages; cover I/O, image decoding, and database
   queries stay off the UI thread.
 - Edit metadata in place and refresh the search index as soon as it is saved.
+- Remove a book from the library without deleting any of its EPUB or PDF files.
 - Rescan referenced book files, filter missing or unreadable assets, and safely relink a missing
   EPUB or PDF without losing its logical-book metadata, cover, or asset identity.
 
@@ -44,7 +45,8 @@ LECTERN_DATA_DIR=/path/to/lectern-data cargo run --release
 ```
 
 The first import can be started with **Add books**, **Add folder**, or native drag-and-drop. Click a
-book card to open its metadata editor; `Ctrl-S` on Windows/Linux or `Cmd-S` on macOS saves changes.
+book card to edit its metadata or remove it from Lectern while keeping its original files;
+`Ctrl-S` on Windows/Linux or `Cmd-S` on macOS saves changes.
 
 ## Workspace
 

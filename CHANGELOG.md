@@ -9,6 +9,8 @@ follow [Semantic Versioning](https://semver.org/) once releases begin.
 
 ### Added
 
+- Confirmed single-book removal that clears library metadata, asset records, covers, and search
+  entries without deleting the user's EPUB or PDF source files.
 - A conservative performance-impact classifier and stable pull-request gate with a versioned suite
   registry, three-run paired base/candidate p95 comparisons, absolute budgets, and 90-day artifacts.
 - Bounded 128-book library result pages with a six-page desktop cache, one queued query request,

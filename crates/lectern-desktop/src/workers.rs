@@ -46,6 +46,7 @@ pub(crate) struct ImportRequest {
 enum MetadataRequest {
     Load(BookId),
     Save(Book),
+    Remove { id: BookId, title: String },
 }
 
 enum AssetMaintenanceRequest {
@@ -86,6 +87,11 @@ pub(crate) enum WorkerEvent {
     BookSaved {
         book: Book,
         result: Result<(), String>,
+    },
+    BookRemoved {
+        id: BookId,
+        title: String,
+        result: Result<bool, String>,
     },
     AssetHealthScanned(Result<AssetHealthReport, String>),
     AssetRelinked {
@@ -191,6 +197,12 @@ impl WorkerSet {
             .is_ok()
     }
 
+    pub(crate) fn remove_book(&self, id: BookId, title: String) -> bool {
+        self.metadata_sender
+            .send(MetadataRequest::Remove { id, title })
+            .is_ok()
+    }
+
     pub(crate) fn rescan_reference_assets(&self) -> bool {
         self.asset_maintenance_sender
             .try_send(AssetMaintenanceRequest::Scan)
@@ -262,6 +274,14 @@ fn metadata_worker(
             MetadataRequest::Save(book) => {
                 let result = database.save_book(&book).map_err(|error| error.to_string());
                 publish(events, context, WorkerEvent::BookSaved { book, result })
+            }
+            MetadataRequest::Remove { id, title } => {
+                let result = database.remove_book(id).map_err(|error| error.to_string());
+                publish(
+                    events,
+                    context,
+                    WorkerEvent::BookRemoved { id, title, result },
+                )
             }
         };
         if !published {

@@ -64,6 +64,20 @@ struct AssetMaintenanceUi {
     relinking_asset: Option<AssetId>,
 }
 
+#[derive(Clone)]
+struct BookRemovalConfirmation {
+    id: BookId,
+    title: String,
+    asset_count: usize,
+    discards_unsaved_changes: bool,
+}
+
+#[derive(Default)]
+struct BookRemovalUi {
+    confirmation: Option<BookRemovalConfirmation>,
+    removing: Option<BookId>,
+}
+
 impl BookEditor {
     fn new(book: Book) -> Self {
         Self {
@@ -121,6 +135,7 @@ pub(crate) struct LecternApp {
     import_summary: Option<ImportSummary>,
     show_import_summary: bool,
     asset_maintenance: AssetMaintenanceUi,
+    book_removal: BookRemovalUi,
     editor_loading: Option<BookId>,
     editor: Option<BookEditor>,
     benchmark: Option<DesktopBenchmark>,
@@ -158,6 +173,7 @@ impl LecternApp {
             import_summary: None,
             show_import_summary: false,
             asset_maintenance: AssetMaintenanceUi::default(),
+            book_removal: BookRemovalUi::default(),
             editor_loading: None,
             editor: None,
             benchmark,
@@ -273,6 +289,9 @@ impl LecternApp {
                     }
                 }
                 WorkerEvent::BookSaved { book, result } => self.book_saved(book, result),
+                WorkerEvent::BookRemoved { id, title, result } => {
+                    self.book_removed(id, &title, result);
+                }
                 WorkerEvent::AssetHealthScanned(result) => self.asset_health_scanned(result),
                 WorkerEvent::AssetRelinked {
                     book_id,
@@ -361,6 +380,39 @@ impl LecternApp {
                     && editor.original.id == book.id
                 {
                     editor.saving = false;
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn book_removed(&mut self, id: BookId, title: &str, result: Result<bool, String>) {
+        if self.book_removal.removing == Some(id) {
+            self.book_removal.removing = None;
+        }
+        match result {
+            Ok(true) => {
+                self.status = format!("Removed {title} from the library; book files were kept");
+                self.covers.remove(&id);
+                self.pending_covers.remove(&id);
+                self.missing_covers.remove(&id);
+                if self.selected == Some(id) {
+                    self.clear_selection();
+                }
+                self.refresh_library();
+            }
+            Ok(false) => {
+                "This book is no longer in the library".clone_into(&mut self.status);
+                if self.selected == Some(id) {
+                    self.clear_selection();
+                }
+                self.refresh_library();
+            }
+            Err(error) => {
+                self.status = format!("Could not remove book: {error}");
+                if let Some(editor) = &mut self.editor
+                    && editor.original.id == id
+                {
                     editor.error = Some(error);
                 }
             }
@@ -540,8 +592,9 @@ impl LecternApp {
         let mut add_books = false;
         let mut add_folder = false;
         let mut rescan_files = false;
-        let maintenance_busy =
-            self.asset_maintenance.scanning || self.asset_maintenance.relinking_asset.is_some();
+        let maintenance_busy = self.asset_maintenance.scanning
+            || self.asset_maintenance.relinking_asset.is_some()
+            || self.book_removal.removing.is_some();
         ui.horizontal(|ui| {
             ui.heading(RichText::new("Lectern").size(26.0).strong());
             ui.label(
@@ -632,7 +685,10 @@ impl LecternApp {
             "An import is already running".clone_into(&mut self.status);
             return;
         }
-        if self.asset_maintenance.scanning || self.asset_maintenance.relinking_asset.is_some() {
+        if self.asset_maintenance.scanning
+            || self.asset_maintenance.relinking_asset.is_some()
+            || self.book_removal.removing.is_some()
+        {
             "Library file maintenance is already running".clone_into(&mut self.status);
             return;
         }
@@ -650,6 +706,7 @@ impl LecternApp {
         if self.importing
             || self.asset_maintenance.scanning
             || self.asset_maintenance.relinking_asset.is_some()
+            || self.book_removal.removing.is_some()
         {
             "Library file maintenance is already running".clone_into(&mut self.status);
             return;
@@ -757,6 +814,7 @@ impl LecternApp {
     }
 
     fn select_book(&mut self, id: BookId) {
+        self.book_removal.confirmation = None;
         self.selected = Some(id);
         self.editor = None;
         if self.workers.load_book(id) {
@@ -768,6 +826,7 @@ impl LecternApp {
     }
 
     fn clear_selection(&mut self) {
+        self.book_removal.confirmation = None;
         self.selected = None;
         self.editor_loading = None;
         self.editor = None;
@@ -791,6 +850,11 @@ impl LecternApp {
         let mut reset = false;
         let mut save = false;
         let mut relink = None;
+        let mut remove = false;
+        let removal_busy = self.book_removal.removing.is_some();
+        let library_operation_busy = self.importing
+            || self.asset_maintenance.scanning
+            || self.asset_maintenance.relinking_asset.is_some();
         egui::Panel::right("metadata-editor")
             .default_size(370.0)
             .size_range(310.0..=520.0)
@@ -821,18 +885,27 @@ impl LecternApp {
                     ui.label(RichText::new("Metadata is unavailable.").color(MUTED));
                     return;
                 };
-                let actions = metadata_form(ui, editor, self.asset_maintenance.relinking_asset);
+                let actions = metadata_form(
+                    ui,
+                    editor,
+                    self.asset_maintenance.relinking_asset,
+                    removal_busy,
+                    library_operation_busy,
+                );
                 save = actions.0;
                 reset = actions.1;
                 relink = actions.2;
+                remove = actions.3;
             });
 
-        save |= ui.input_mut(|input| {
-            input.consume_shortcut(&egui::KeyboardShortcut::new(
-                egui::Modifiers::COMMAND,
-                egui::Key::S,
-            ))
-        });
+        save |= !removal_busy
+            && !library_operation_busy
+            && ui.input_mut(|input| {
+                input.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::COMMAND,
+                    egui::Key::S,
+                ))
+            });
         if close {
             self.clear_selection();
         } else if reset {
@@ -843,10 +916,90 @@ impl LecternApp {
             self.save_editor();
         } else if let Some((asset_id, format)) = relink {
             self.choose_asset_replacement(asset_id, format);
+        } else if remove {
+            self.request_book_removal();
+        }
+    }
+
+    fn request_book_removal(&mut self) {
+        let Some(editor) = &self.editor else {
+            return;
+        };
+        self.book_removal.confirmation = Some(BookRemovalConfirmation {
+            id: editor.original.id,
+            title: editor.original.title.clone(),
+            asset_count: editor.original.assets.len(),
+            discards_unsaved_changes: editor.changed(),
+        });
+    }
+
+    fn book_removal_confirmation_window(&mut self, context: &egui::Context) {
+        let Some(confirmation) = self.book_removal.confirmation.clone() else {
+            return;
+        };
+        let response =
+            egui::Modal::new(egui::Id::new("book-removal-confirmation")).show(context, |ui| {
+                ui.set_max_width(430.0);
+                ui.heading("Remove from library?");
+                ui.add_space(6.0);
+                ui.label(format!("Remove “{}” from Lectern?", confirmation.title));
+                ui.label(
+                    RichText::new(removal_file_message(confirmation.asset_count)).color(MUTED),
+                );
+                if confirmation.discards_unsaved_changes {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Unsaved metadata changes will be discarded.")
+                            .color(Color32::LIGHT_RED),
+                    );
+                }
+                ui.add_space(14.0);
+                let mut confirm = false;
+                let mut cancel = false;
+                ui.horizontal(|ui| {
+                    confirm = ui
+                        .button(RichText::new("Remove from library").color(Color32::LIGHT_RED))
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+                (confirm, cancel)
+            });
+        let should_close = response.should_close();
+        let (confirm, cancel) = response.inner;
+        if confirm {
+            self.start_book_removal(confirmation);
+        } else if cancel || should_close {
+            self.book_removal.confirmation = None;
+        }
+    }
+
+    fn start_book_removal(&mut self, confirmation: BookRemovalConfirmation) {
+        self.book_removal.confirmation = None;
+        if self.book_removal.removing.is_some() {
+            return;
+        }
+        if self
+            .workers
+            .remove_book(confirmation.id, confirmation.title)
+        {
+            self.book_removal.removing = Some(confirmation.id);
+            if let Some(editor) = &mut self.editor {
+                editor.error = None;
+            }
+            "Removing book from the library…".clone_into(&mut self.status);
+        } else {
+            "Metadata worker is unavailable".clone_into(&mut self.status);
         }
     }
 
     fn save_editor(&mut self) {
+        if self.book_removal.removing.is_some()
+            || self.importing
+            || self.asset_maintenance.scanning
+            || self.asset_maintenance.relinking_asset.is_some()
+        {
+            return;
+        }
         let Some(editor) = &mut self.editor else {
             return;
         };
@@ -1128,6 +1281,7 @@ impl eframe::App for LecternApp {
             .show(ui, |ui| self.library(ui));
         self.import_summary_window(ui.ctx());
         self.asset_health_report_window(ui.ctx());
+        self.book_removal_confirmation_window(ui.ctx());
 
         if files_hovering {
             let rect = ui.max_rect().shrink(18.0);
@@ -1239,10 +1393,13 @@ fn metadata_form(
     ui: &mut egui::Ui,
     editor: &mut BookEditor,
     relinking_asset: Option<AssetId>,
-) -> (bool, bool, Option<(AssetId, BookFormat)>) {
+    removal_busy: bool,
+    library_operation_busy: bool,
+) -> (bool, bool, Option<(AssetId, BookFormat)>, bool) {
     let mut save = false;
     let mut reset = false;
     let mut relink = None;
+    let mut remove = false;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -1314,22 +1471,83 @@ fn metadata_form(
             }
 
             ui.add_space(12.0);
-            let changed = editor.changed();
-            ui.horizontal(|ui| {
-                let button_text = if editor.saving { "Saving…" } else { "Save" };
-                save = ui
-                    .add_enabled(editor.can_save(), egui::Button::new(button_text))
-                    .on_hover_text("Save metadata (Ctrl/Cmd-S)")
-                    .clicked();
-                reset = ui
-                    .add_enabled(changed && !editor.saving, egui::Button::new("Reset"))
-                    .clicked();
-                if editor.saving {
-                    ui.spinner();
-                }
-            });
+            let editing_enabled = !removal_busy && !library_operation_busy;
+            (save, reset) = metadata_save_controls(ui, editor, editing_enabled);
+
+            ui.add_space(12.0);
+            ui.separator();
+            remove = book_removal_controls(
+                ui,
+                editor,
+                relinking_asset,
+                removal_busy,
+                library_operation_busy,
+            );
         });
-    (save, reset, relink)
+    (save, reset, relink, remove)
+}
+
+fn metadata_save_controls(
+    ui: &mut egui::Ui,
+    editor: &BookEditor,
+    editing_enabled: bool,
+) -> (bool, bool) {
+    let mut save = false;
+    let mut reset = false;
+    ui.horizontal(|ui| {
+        let button_text = if editor.saving { "Saving…" } else { "Save" };
+        save = ui
+            .add_enabled(
+                editor.can_save() && editing_enabled,
+                egui::Button::new(button_text),
+            )
+            .on_hover_text("Save metadata (Ctrl/Cmd-S)")
+            .clicked();
+        reset = ui
+            .add_enabled(
+                editor.changed() && !editor.saving && editing_enabled,
+                egui::Button::new("Reset"),
+            )
+            .clicked();
+        if editor.saving {
+            ui.spinner();
+        }
+    });
+    (save, reset)
+}
+
+fn book_removal_controls(
+    ui: &mut egui::Ui,
+    editor: &BookEditor,
+    relinking_asset: Option<AssetId>,
+    removal_busy: bool,
+    library_operation_busy: bool,
+) -> bool {
+    ui.add_space(8.0);
+    ui.label(RichText::new("Library").strong());
+    ui.label(
+        RichText::new("Remove this entry and its cached cover from Lectern. Book files are kept.")
+            .color(MUTED)
+            .size(12.0),
+    );
+    let enabled =
+        !editor.saving && relinking_asset.is_none() && !removal_busy && !library_operation_busy;
+    let button = if removal_busy {
+        egui::Button::new("Removing…")
+    } else {
+        egui::Button::new(RichText::new("Remove from library").color(Color32::LIGHT_RED))
+    };
+    ui.add_enabled(enabled, button)
+        .on_hover_text("Your EPUB and PDF files will not be deleted")
+        .clicked()
+}
+
+fn removal_file_message(asset_count: usize) -> String {
+    if asset_count == 1 {
+        "The original book file will not be deleted.".into()
+    } else {
+        format!("The {asset_count} original book files will not be deleted.")
+    }
 }
 
 fn optional_metadata(value: &str) -> Option<String> {
@@ -1348,7 +1566,7 @@ mod tests {
 
     use super::{
         BookEditor, CARD_GAP, CARD_WIDTH, QUERY_PAGE_SIZE, asset_health_status, column_count,
-        import_status, query_page_offset,
+        import_status, query_page_offset, removal_file_message,
     };
 
     #[test]
@@ -1399,6 +1617,18 @@ mod tests {
                 changed: 3,
             }),
             "Checked 10 referenced files · 2 missing · 1 unreadable"
+        );
+    }
+
+    #[test]
+    fn removal_confirmation_describes_preserved_source_files() {
+        assert_eq!(
+            removal_file_message(1),
+            "The original book file will not be deleted."
+        );
+        assert_eq!(
+            removal_file_message(2),
+            "The 2 original book files will not be deleted."
         );
     }
 
