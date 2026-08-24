@@ -20,6 +20,9 @@ use lectern_core::{
     AssetHealth, AssetId, AssetStorage, Book, BookAssetDraft, BookDraft, BookFormat,
     BookMetadataDraft, BookSummary, LibraryQuery, SortOrder,
 };
+use lectern_desktop::export::{
+    EXPORT_BUFFER_BYTES, ExportControl, ExportError, OverwritePolicy, export_file,
+};
 use lectern_import::{
     ImportProgress, ImportSummary, discover_publications, import_paths, validate_publication,
 };
@@ -44,6 +47,10 @@ const BENCHMARK_ADDED_AT_UNIX_SECONDS: i64 = 1_700_000_000;
 const REMOVAL_SOURCE_CONTENTS: &[u8] = b"Lectern removal benchmark source bytes\n";
 const DETACH_SOURCE_CONTENTS: &[u8] = b"Lectern detach benchmark source bytes\n";
 const ATTACHMENT_SOURCE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+const EXPORT_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+const EXPORT_SOURCE_MIB: u32 = 256;
+const EXPORT_SOURCE_BLOCK_BYTES: usize = 1024 * 1024;
+const EXPORT_COLLISION_BYTES: &[u8] = b"existing destination must remain unchanged";
 
 const USAGE: &str = "Lectern exploratory performance harness
 
@@ -56,6 +63,7 @@ Usage:
   lectern-benchmark detach --database PATH --output PATH [OPTIONS]
   lectern-benchmark attach --database PATH --output PATH [OPTIONS]
   lectern-benchmark replace --database PATH --output PATH [OPTIONS]
+  lectern-benchmark export --database PATH --output PATH [OPTIONS]
   lectern-benchmark reimport --database PATH --output PATH [OPTIONS]
   lectern-benchmark import --database PATH --corpus PATH --output PATH [OPTIONS]
 
@@ -84,6 +92,10 @@ Attach options:
 Replace options:
   --iterations N     Measured validate-replace-refresh iterations (default: 100)
   --warmup N         Warmup iterations (default: 10)
+
+Export options:
+  --iterations N     Measured 256 MiB copies (default: 100)
+  --warmup N         Warmup copies (default: 10)
 
 Re-import options:
   --iterations N     Measured known-path re-imports (default: 100)
@@ -125,6 +137,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         "detach" => run_detach(&QueryOptions::parse(&mut args)?),
         "attach" => run_attach(&QueryOptions::parse(&mut args)?),
         "replace" => run_replace(&QueryOptions::parse(&mut args)?),
+        "export" => run_export(&QueryOptions::parse(&mut args)?),
         "reimport" => run_reimport(&QueryOptions::parse(&mut args)?),
         "import" => run_import(&ImportOptions::parse(&mut args)?),
         _ => Err(format!(
@@ -1988,6 +2001,274 @@ struct ReimportCandidate {
     original: Book,
     original_cover: Vec<u8>,
     incoming: BookImport,
+}
+
+#[derive(Serialize)]
+struct ExportResult {
+    schema_version: u32,
+    kind: &'static str,
+    measured_at_unix_ms: u128,
+    database_path: String,
+    library_books: u64,
+    source_path: String,
+    source_bytes: u64,
+    copy_buffer_bytes: usize,
+    warmup_iterations: usize,
+    measured_iterations: usize,
+    baseline_rss_bytes: Option<u64>,
+    peak_rss_bytes: Option<u64>,
+    peak_rss_delta_bytes: Option<u64>,
+    verified_checks: Vec<&'static str>,
+    scenarios: Vec<ExportScenarioResult>,
+}
+
+#[derive(Serialize)]
+struct ExportScenarioResult {
+    name: &'static str,
+    successful_exports: usize,
+    latency_ms: LatencySummary,
+    samples_ns: Vec<u64>,
+    copy_latency_ms: LatencySummary,
+    copy_samples_ns: Vec<u64>,
+    throughput_mib_per_second: ThroughputSummary,
+}
+
+#[derive(Serialize)]
+struct ThroughputSummary {
+    min: f64,
+    p05: f64,
+    mean: f64,
+    p50: f64,
+    max: f64,
+}
+
+struct ExportMeasurements {
+    first_progress_samples: Vec<u64>,
+    copy_samples: Vec<u64>,
+    baseline_rss_bytes: Option<u64>,
+    peak_rss_bytes: Option<u64>,
+}
+
+fn run_export(options: &QueryOptions) -> Result<(), String> {
+    ensure_distinct_paths("database", &options.database, "output", &options.output)?;
+    let database = LibraryDatabase::open(&options.database).map_err(display_error)?;
+    let library_books = database.count().map_err(display_error)?;
+    drop(database);
+
+    let workload = options
+        .output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| "export output must have a parent directory".to_owned())?
+        .join("export-workload");
+    fs::create_dir(&workload).map_err(display_error)?;
+    let source = workload.join("representative-256-mib.epub");
+    write_export_source(&source)?;
+
+    let total_rounds = options.warmup + options.iterations;
+    let measurements = measure_exports(options, &workload, &source)?;
+    verify_export_failure_cases(&workload, &source)?;
+    let throughput_samples = measurements
+        .copy_samples
+        .iter()
+        .map(|sample| {
+            let seconds = Duration::from_nanos(*sample).as_secs_f64();
+            f64::from(EXPORT_SOURCE_MIB) / seconds
+        })
+        .collect::<Vec<_>>();
+    let peak_rss_delta_bytes = measurements
+        .baseline_rss_bytes
+        .zip(measurements.peak_rss_bytes)
+        .map(|(baseline, peak)| peak.saturating_sub(baseline));
+    let result = ExportResult {
+        schema_version: 1,
+        kind: "export",
+        measured_at_unix_ms: unix_time_ms()?,
+        database_path: options.database.display().to_string(),
+        library_books,
+        source_path: source.display().to_string(),
+        source_bytes: EXPORT_SOURCE_BYTES,
+        copy_buffer_bytes: EXPORT_BUFFER_BYTES,
+        warmup_iterations: options.warmup,
+        measured_iterations: options.iterations,
+        baseline_rss_bytes: measurements.baseline_rss_bytes,
+        peak_rss_bytes: measurements.peak_rss_bytes,
+        peak_rss_delta_bytes,
+        verified_checks: vec![
+            "exact_bytes",
+            "collision_preserved",
+            "missing_source_rejected",
+            "temporary_cleanup",
+        ],
+        scenarios: vec![ExportScenarioResult {
+            name: "export_large_file",
+            successful_exports: total_rounds,
+            latency_ms: summarize_latency(&measurements.first_progress_samples),
+            samples_ns: measurements.first_progress_samples,
+            copy_latency_ms: summarize_latency(&measurements.copy_samples),
+            copy_samples_ns: measurements.copy_samples,
+            throughput_mib_per_second: summarize_throughput(&throughput_samples),
+        }],
+    };
+    write_json(&options.output, &result)?;
+    println!(
+        "Exported {} MiB {} times: first-progress p95 {:.3} ms, throughput p05 {:.1} MiB/s",
+        EXPORT_SOURCE_BYTES / (1024 * 1024),
+        options.iterations,
+        result.scenarios[0].latency_ms.p95,
+        result.scenarios[0].throughput_mib_per_second.p05,
+    );
+    Ok(())
+}
+
+fn measure_exports(
+    options: &QueryOptions,
+    workload: &Path,
+    source: &Path,
+) -> Result<ExportMeasurements, String> {
+    let baseline_rss_bytes = current_rss_bytes();
+    let sampler = MemorySampler::start(Duration::from_millis(2))?;
+    let mut first_progress_samples = Vec::with_capacity(options.iterations);
+    let mut copy_samples = Vec::with_capacity(options.iterations);
+    let total_rounds = options.warmup + options.iterations;
+    for round in 0..total_rounds {
+        let destination = workload.join(format!("copy-{round:03}.epub"));
+        let started = Instant::now();
+        let mut first_progress = None;
+        let outcome = export_file(source, &destination, OverwritePolicy::Deny, |_| {
+            first_progress.get_or_insert_with(|| started.elapsed());
+            ExportControl::Continue
+        })
+        .map_err(display_error)?;
+        let elapsed = started.elapsed();
+        if outcome.copied_bytes != EXPORT_SOURCE_BYTES {
+            return Err(format!(
+                "export copied {} bytes; expected {EXPORT_SOURCE_BYTES}",
+                outcome.copied_bytes
+            ));
+        }
+        if !files_equal(source, &destination)? {
+            return Err(format!(
+                "export bytes differ from source: {}",
+                destination.display()
+            ));
+        }
+        fs::remove_file(&destination).map_err(display_error)?;
+        if round >= options.warmup {
+            first_progress_samples.push(duration_ns(
+                first_progress.ok_or_else(|| "export emitted no progress".to_owned())?,
+            )?);
+            copy_samples.push(duration_ns(elapsed)?);
+        }
+    }
+    let peak_rss_bytes = sampler.finish()?;
+    Ok(ExportMeasurements {
+        first_progress_samples,
+        copy_samples,
+        baseline_rss_bytes,
+        peak_rss_bytes,
+    })
+}
+
+fn verify_export_failure_cases(workload: &Path, source: &Path) -> Result<(), String> {
+    let collision = workload.join("collision.epub");
+    fs::write(&collision, EXPORT_COLLISION_BYTES).map_err(display_error)?;
+    let collision_preserved = matches!(
+        export_file(source, &collision, OverwritePolicy::Deny, |_| {
+            ExportControl::Continue
+        }),
+        Err(ExportError::DestinationExists(_))
+    ) && fs::read(&collision).map_err(display_error)?
+        == EXPORT_COLLISION_BYTES;
+    let missing_source = workload.join("source-was-removed.epub");
+    let missing_destination = workload.join("missing-source-copy.epub");
+    let missing_source_rejected = matches!(
+        export_file(
+            &missing_source,
+            &missing_destination,
+            OverwritePolicy::Deny,
+            |_| ExportControl::Continue,
+        ),
+        Err(ExportError::SourceUnavailable(_))
+    ) && !missing_destination.exists();
+    let temporary_cleanup_verified = temporary_exports(workload)? == 0;
+    if !collision_preserved || !missing_source_rejected || !temporary_cleanup_verified {
+        return Err("export correctness checks did not reconcile".into());
+    }
+    Ok(())
+}
+
+fn write_export_source(path: &Path) -> Result<(), String> {
+    let mut block = vec![0_u8; EXPORT_SOURCE_BLOCK_BYTES];
+    for (index, byte) in block.iter_mut().enumerate() {
+        let index = u64::try_from(index).expect("source block index fits u64");
+        *byte = splitmix64(DEFAULT_SEED ^ index).to_le_bytes()[0];
+    }
+    let file = File::create(path).map_err(display_error)?;
+    let mut writer = BufWriter::with_capacity(EXPORT_SOURCE_BLOCK_BYTES, file);
+    let blocks = EXPORT_SOURCE_BYTES
+        / u64::try_from(EXPORT_SOURCE_BLOCK_BYTES).expect("source block size fits u64");
+    for _ in 0..blocks {
+        writer.write_all(&block).map_err(display_error)?;
+    }
+    writer.flush().map_err(display_error)
+}
+
+fn files_equal(first: &Path, second: &Path) -> Result<bool, String> {
+    if fs::metadata(first).map_err(display_error)?.len()
+        != fs::metadata(second).map_err(display_error)?.len()
+    {
+        return Ok(false);
+    }
+    let mut first = File::open(first).map_err(display_error)?;
+    let mut second = File::open(second).map_err(display_error)?;
+    let mut first_buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut second_buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let first_read = first.read(&mut first_buffer).map_err(display_error)?;
+        let second_read = second.read(&mut second_buffer).map_err(display_error)?;
+        if first_read != second_read || first_buffer[..first_read] != second_buffer[..second_read] {
+            return Ok(false);
+        }
+        if first_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn temporary_exports(directory: &Path) -> Result<usize, String> {
+    fs::read_dir(directory)
+        .map_err(display_error)?
+        .try_fold(0_usize, |count, entry| {
+            let entry = entry.map_err(display_error)?;
+            Ok(count
+                + usize::from(
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".lectern-export-"),
+                ))
+        })
+}
+
+fn summarize_throughput(samples: &[f64]) -> ThroughputSummary {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    ThroughputSummary {
+        min: sorted[0],
+        p05: sorted[nearest_rank_index(sorted.len(), 5)],
+        mean: sorted.iter().sum::<f64>()
+            / f64::from(u32::try_from(sorted.len()).expect("sample count fits u32")),
+        p50: sorted[nearest_rank_index(sorted.len(), 50)],
+        max: *sorted.last().expect("non-empty throughput samples"),
+    }
+}
+
+fn nearest_rank_index(length: usize, percentile: usize) -> usize {
+    (percentile * length)
+        .div_ceil(100)
+        .saturating_sub(1)
+        .min(length - 1)
 }
 
 fn run_reimport(options: &QueryOptions) -> Result<(), String> {

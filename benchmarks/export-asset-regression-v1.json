@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-query-regression-budget",
+  "workload": {
+    "query_mode": "export",
+    "books": 50000,
+    "seed": 20260824,
+    "cover_every": 0,
+    "source_bytes": 268435456,
+    "copy_buffer_bytes": 262144,
+    "warmup_iterations": 1,
+    "measured_iterations": 10,
+    "scenarios": [
+      "export_large_file"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 1.0
+  },
+  "budgets": {
+    "export_large_file": {
+      "max_p95_ms": 50,
+      "min_p05_throughput_mib_per_second": 100,
+      "max_peak_rss_delta_bytes": 16777216
+    }
+  }
+}

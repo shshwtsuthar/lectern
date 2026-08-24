@@ -2,7 +2,7 @@
 
 This directory contains two complementary workflows:
 
-- `performance_regression.py` is a deterministic, versioned storage regression runner. It exercises
+- `performance_regression.py` is a deterministic, versioned regression runner. It exercises
   full-result queries and paged queries over both metadata-only and covered libraries, single-book
   removal, and validated format attachment followed by a first-page refresh each week in GitHub
   Actions, can be dispatched manually, and fails when a release latency budget is exceeded.
@@ -54,6 +54,12 @@ The replacement lifecycle workload lives in
 refreshes the first library page. It verifies metadata, cover, identity, both source files, and the
 50,000-book library count before cleaning up each candidate outside the measured interval.
 
+The publication-export workload lives in
+[`export-asset-regression-v1.json`](export-asset-regression-v1.json). It copies a deterministic
+256 MiB source through the production bounded-buffer engine, retains first-progress and full-copy
+samples, gates p05 throughput and peak RSS growth, and verifies exact bytes, collision safety,
+missing-source handling, and temporary-file cleanup.
+
 Performance-sensitive pull requests additionally run the base and candidate revisions three times
 each on the same runner. The gate compares the median of their run-level p95 values and fails a
 scenario when it exceeds both the versioned percentage limit and minimum material latency delta.
@@ -79,6 +85,8 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/detach-asset-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/replace-asset-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/export-asset-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/reimport-known-path-regression-v1.json
 ```

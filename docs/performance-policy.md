@@ -54,10 +54,14 @@ python3 benchmarks/performance_regression.py \
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/replace-asset-regression-v1.json
 python3 benchmarks/performance_regression.py \
+  --budget benchmarks/export-asset-regression-v1.json
+python3 benchmarks/performance_regression.py \
   --budget benchmarks/reimport-known-path-regression-v1.json
 ```
 
-Import, startup, scrolling, rendering, or memory changes must also run the applicable workload from
+The export suite is also mandatory for changes to copy buffers, publication, overwrite behavior,
+export scheduling, or export progress. Import, startup, scrolling, rendering, or memory changes
+must also run the applicable workload from
 the exploratory harness. When that workload is not yet stable enough to gate, report its before and
 after raw results and add or improve deterministic coverage rather than claiming an exemption.
 The compositor-backed desktop workload checks title, author, and recently-added sort-to-first-

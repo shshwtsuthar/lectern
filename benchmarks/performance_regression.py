@@ -93,6 +93,7 @@ def main(arguments: list[str]) -> int:
             "detach": "detaches.json",
             "attach": "attachments.json",
             "replace": "replacements.json",
+            "export": "exports.json",
             "reimport": "reimports.json",
         }
         query_output = output / result_names[mode]
@@ -139,6 +140,7 @@ def main(arguments: list[str]) -> int:
                     "detach": "detach",
                     "attach": "attach",
                     "replace": "replace",
+                    "export": "export",
                     "reimport": "reimport",
                 }[mode],
                 "--database",
@@ -161,6 +163,8 @@ def main(arguments: list[str]) -> int:
             decisions = evaluate_attach_result(query_result, budget)
         elif mode == "replace":
             decisions = evaluate_replace_result(query_result, budget)
+        elif mode == "export":
+            decisions = evaluate_export_result(query_result, budget)
         elif mode == "reimport":
             decisions = evaluate_reimport_result(query_result, budget)
         else:
@@ -218,11 +222,12 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "detach",
         "attach",
         "replace",
+        "export",
         "reimport",
     ):
         raise RegressionError(
             "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
-            "'remove', 'detach', 'attach', 'replace', or 'reimport'"
+            "'remove', 'detach', 'attach', 'replace', 'export', or 'reimport'"
         )
     if query_mode == "full":
         scenario_names = workload.get("full_library_scenarios")
@@ -262,6 +267,13 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 raise RegressionError(
                     "budget.workload.source_payload_bytes must be greater than zero"
                 )
+        if query_mode == "export":
+            positive_or_zero_field(workload, "source_bytes", "budget.workload")
+            positive_or_zero_field(workload, "copy_buffer_bytes", "budget.workload")
+            if workload["source_bytes"] == 0 or workload["copy_buffer_bytes"] == 0:
+                raise RegressionError(
+                    "budget.workload export sizes must be greater than zero"
+                )
         scenario_names = workload.get("scenarios")
         if not isinstance(scenario_names, list) or not all(
             isinstance(name, str) and name for name in scenario_names
@@ -294,6 +306,17 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(scenario_budget, dict):
             raise RegressionError(f"budget for {name!r} must be an object")
         positive_number_field(scenario_budget, "max_p95_ms", f"budget {name!r}")
+        if query_mode == "export":
+            positive_number_field(
+                scenario_budget,
+                "min_p05_throughput_mib_per_second",
+                f"budget {name!r}",
+            )
+            positive_or_zero_field(
+                scenario_budget,
+                "max_peak_rss_delta_bytes",
+                f"budget {name!r}",
+            )
         ratio_to = scenario_budget.get("max_p95_ratio_to")
         ratio = scenario_budget.get("max_p95_ratio")
         if (ratio_to is None) != (ratio is None):
@@ -764,6 +787,73 @@ def evaluate_replace_result(
     if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
         raise RegressionError("replace scenarios do not match the versioned budget")
     return evaluate_latency_budgets(by_name, budget)
+
+
+def evaluate_export_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "export result"
+    if positive_or_zero_field(result, "library_books", context) != workload["books"]:
+        raise RegressionError("export workload library count does not match the budget")
+    for field in ("source_bytes", "copy_buffer_bytes"):
+        if positive_or_zero_field(result, field, context) != workload[field]:
+            raise RegressionError(f"export {field} does not match the budget")
+    warmup = positive_or_zero_field(result, "warmup_iterations", context)
+    measured = positive_or_zero_field(result, "measured_iterations", context)
+    if warmup != workload["warmup_iterations"] or measured != workload["measured_iterations"]:
+        raise RegressionError("export iteration counts do not match the budget")
+    expected_checks = {
+        "exact_bytes",
+        "collision_preserved",
+        "missing_source_rejected",
+        "temporary_cleanup",
+    }
+    checks = result.get("verified_checks")
+    if not isinstance(checks, list) or set(checks) != expected_checks:
+        raise RegressionError("export correctness checks did not reconcile")
+    peak_delta = positive_or_zero_field(result, "peak_rss_delta_bytes", context)
+
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or len(scenarios) != 1:
+        raise RegressionError("export result must contain one scenario")
+    scenario = scenarios[0]
+    if not isinstance(scenario, dict) or scenario.get("name") != "export_large_file":
+        raise RegressionError("export scenario does not match the versioned workload")
+    if positive_or_zero_field(scenario, "successful_exports", "export scenario") != warmup + measured:
+        raise RegressionError("export operation count does not reconcile")
+    for field in ("samples_ns", "copy_samples_ns"):
+        samples = scenario.get(field)
+        if not isinstance(samples, list) or len(samples) != measured:
+            raise RegressionError(f"export scenario {field} count does not match the budget")
+        if any(isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0 for sample in samples):
+            raise RegressionError(f"export scenario {field} must contain positive integers")
+    latency = object_field(scenario, "latency_ms", "export scenario")
+    positive_number_field(latency, "p95", "export scenario latency")
+    throughput = object_field(scenario, "throughput_mib_per_second", "export scenario")
+    p05_throughput = positive_number_field(
+        throughput, "p05", "export scenario throughput"
+    )
+
+    decisions = evaluate_latency_budgets({"export_large_file": scenario}, budget)
+    decision = decisions[0]
+    scenario_budget = budget["budgets"]["export_large_file"]
+    minimum_throughput = float(
+        scenario_budget["min_p05_throughput_mib_per_second"]
+    )
+    maximum_peak_delta = scenario_budget["max_peak_rss_delta_bytes"]
+    decision |= {
+        "p05_throughput_mib_per_second": p05_throughput,
+        "min_p05_throughput_mib_per_second": minimum_throughput,
+        "peak_rss_delta_bytes": peak_delta,
+        "max_peak_rss_delta_bytes": maximum_peak_delta,
+    }
+    decision["passed"] = bool(
+        decision["passed"]
+        and p05_throughput >= minimum_throughput
+        and peak_delta <= maximum_peak_delta
+    )
+    return decisions
 
 
 def evaluate_latency_budgets(

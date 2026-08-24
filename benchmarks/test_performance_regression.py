@@ -335,6 +335,63 @@ def replace_result() -> dict:
     }
 
 
+def export_budget() -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "lectern-query-regression-budget",
+        "workload": {
+            "query_mode": "export",
+            "books": 50,
+            "seed": 7,
+            "cover_every": 0,
+            "source_bytes": 268_435_456,
+            "copy_buffer_bytes": 262_144,
+            "warmup_iterations": 1,
+            "measured_iterations": 3,
+            "scenarios": ["export_large_file"],
+        },
+        "comparison": {
+            "paired_runs": 3,
+            "max_p95_regression_percent": 10,
+            "minimum_p95_delta_ms": 1.0,
+        },
+        "budgets": {
+            "export_large_file": {
+                "max_p95_ms": 50,
+                "min_p05_throughput_mib_per_second": 100,
+                "max_peak_rss_delta_bytes": 16_777_216,
+            }
+        },
+    }
+
+
+def export_result() -> dict:
+    return {
+        "library_books": 50,
+        "source_bytes": 268_435_456,
+        "copy_buffer_bytes": 262_144,
+        "warmup_iterations": 1,
+        "measured_iterations": 3,
+        "peak_rss_delta_bytes": 2_000_000,
+        "verified_checks": [
+            "exact_bytes",
+            "collision_preserved",
+            "missing_source_rejected",
+            "temporary_cleanup",
+        ],
+        "scenarios": [
+            {
+                "name": "export_large_file",
+                "successful_exports": 4,
+                "latency_ms": {"p95": 2.0},
+                "samples_ns": [1_000_000, 2_000_000, 1_500_000],
+                "copy_samples_ns": [500_000_000, 510_000_000, 490_000_000],
+                "throughput_mib_per_second": {"p05": 501.0},
+            }
+        ],
+    }
+
+
 def reimport_result() -> dict:
     return {
         "library_books": 50,
@@ -428,6 +485,14 @@ class PerformanceRegressionTests(unittest.TestCase):
 
         self.assertEqual(checked_in["workload"]["query_mode"], "replace")
         self.assertEqual(checked_in["workload"]["source_payload_bytes"], 8_388_608)
+
+    def test_checked_in_export_budget_is_valid(self) -> None:
+        checked_in = REGRESSION.load_budget(
+            pathlib.Path(__file__).with_name("export-asset-regression-v1.json")
+        )
+
+        self.assertEqual(checked_in["workload"]["query_mode"], "export")
+        self.assertEqual(checked_in["workload"]["source_bytes"], 268_435_456)
 
     def test_load_budget_rejects_unpaired_ratio_fields(self) -> None:
         invalid = budget()
@@ -553,6 +618,20 @@ class PerformanceRegressionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(REGRESSION.RegressionError, "asset identity"):
             REGRESSION.evaluate_replace_result(invalid, replace_budget())
+
+    def test_evaluate_export_result_accepts_bounded_exact_copy(self) -> None:
+        decisions = REGRESSION.evaluate_export_result(export_result(), export_budget())
+
+        self.assertTrue(all(decision["passed"] for decision in decisions))
+
+    def test_evaluate_export_result_gates_throughput_and_memory(self) -> None:
+        invalid = export_result()
+        invalid["peak_rss_delta_bytes"] = 20_000_000
+        invalid["scenarios"][0]["throughput_mib_per_second"]["p05"] = 90.0
+
+        decisions = REGRESSION.evaluate_export_result(invalid, export_budget())
+
+        self.assertFalse(decisions[0]["passed"])
 
     def test_evaluate_reimport_result_requires_preserved_metadata(self) -> None:
         invalid = reimport_result()
