@@ -64,6 +64,9 @@ Maintain a small component-gallery executable from the first component onward. I
 supported theme, size, variant, content shape, and semantic state, and accompanies GPUI tests for
 activation, actions, focus, keyboard navigation, controlled state, and accessibility properties.
 
+The implementation workflow and definition of done are in the
+[Primer-to-GPUI porting guide](../porting-primer-to-gpui.md).
+
 ## Consequences
 
 - Lectern owns a small, coherent native UI API without taking responsibility for all of Primer.

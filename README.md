@@ -30,6 +30,12 @@ single-asset export without adding another parser or deleting externally referen
 rules, sequence, performance evidence, and exclusions are defined in
 [`docs/asset-management-scope.md`](docs/asset-management-scope.md).
 
+The target GPUI interface will use an internal, token-generated Primer design-system layer. It is a
+one-component-at-a-time application architecture rather than a general Primer port; see the
+[Primer-to-GPUI porting guide](docs/porting-primer-to-gpui.md) and
+[ADR 0004](docs/adr/0004-own-a-primer-inspired-gpui-ui-layer.md). The currently implemented desktop
+still uses egui/eframe.
+
 The first broad library-management slice is **Organisation**: normalized contributors and series,
 flat tags, safe multi-selection and bulk tagging, exact filters, fielded search, and saved searches.
 Its end-to-end workflow, data contracts, query grammar, budgets, and implementation sequence are
