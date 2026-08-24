@@ -295,6 +295,21 @@ pub struct BookSummary {
     pub has_file_issue: bool,
 }
 
+/// One bounded, ordered window of a library projection.
+///
+/// The complete result count remains available to virtualized presentations without requiring
+/// them to allocate every matching [`BookSummary`]. `offset` is the zero-based result position of
+/// the first returned summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LibraryPage {
+    /// Number of logical books that match the projection.
+    pub total: u64,
+    /// Zero-based result position of the first returned summary.
+    pub offset: u64,
+    /// Ordered summaries in this bounded result window.
+    pub books: Vec<BookSummary>,
+}
+
 /// Summary returned after checking the externally referenced assets in a library.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AssetHealthReport {

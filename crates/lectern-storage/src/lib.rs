@@ -14,7 +14,8 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 use lectern_core::{
     AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookAssetDraft,
-    BookDraft, BookFormat, BookId, BookMetadataDraft, BookSummary, LibraryQuery, SortOrder,
+    BookDraft, BookFormat, BookId, BookMetadataDraft, BookSummary, LibraryPage, LibraryQuery,
+    SortOrder,
 };
 use rusqlite::{
     Connection, OptionalExtension, Statement, Transaction, TransactionBehavior, params,
@@ -263,6 +264,9 @@ pub enum StorageError {
     /// The database returned an impossible negative row count.
     #[error("database returned invalid book count {0}")]
     InvalidCount(i64),
+    /// A requested library page began beyond `SQLite`'s signed integer range.
+    #[error("library page offset {0} exceeds SQLite's supported range")]
+    InvalidPageOffset(u64),
     /// A logical import contained no file representation.
     #[error("a logical book must contain at least one asset")]
     EmptyAssets,
@@ -452,67 +456,88 @@ impl LibraryDatabase {
     ///
     /// Returns an error when the indexed query cannot be prepared or executed.
     pub fn query(&self, query: &LibraryQuery) -> Result<Vec<BookSummary>> {
-        let search = build_fts_query(&query.search);
-        let mut bindings = Vec::<rusqlite::types::Value>::new();
-        let mut predicates = Vec::new();
-        let mut joins = Vec::new();
-
-        if let Some(search) = search {
-            bindings.push(search.into());
-            predicates.push(format!("books_fts MATCH ?{}", bindings.len()));
-            joins.push("JOIN books_fts ON books_fts.rowid = b.id".to_owned());
-        }
-
-        if let Some(format) = query.format {
-            bindings.push(format.as_str().to_owned().into());
-            joins.push(format!(
-                "JOIN book_assets filtered_assets \
-                 ON filtered_assets.book_id = b.id AND filtered_assets.format = ?{}",
-                bindings.len()
-            ));
-        }
-
-        if let Some(health) = query.asset_health {
-            bindings.push(health.as_str().to_owned().into());
-            joins.push(format!(
-                "JOIN (SELECT book_id FROM book_assets WHERE health = ?{} GROUP BY book_id) \
-                 health_assets ON health_assets.book_id = b.id",
-                bindings.len()
-            ));
-        }
-
-        let where_clause = if predicates.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", predicates.join(" AND "))
-        };
-        let order = match query.sort {
-            SortOrder::Title => "b.sort_title, b.id",
-            SortOrder::Author => "b.sort_authors, b.sort_title, b.id",
-            SortOrder::RecentlyAdded => "b.added_at DESC, b.id DESC",
-        };
+        let plan = LibraryQueryPlan::new(query);
         let sql = format!(
             "SELECT b.id, b.title, b.authors, b.series, \
              EXISTS(SELECT 1 FROM book_covers c WHERE c.book_id = b.id), \
              EXISTS(SELECT 1 FROM book_assets a \
                     WHERE a.book_id = b.id AND a.health IN ('missing', 'unreadable')) \
              FROM books b {} {where_clause} ORDER BY {order}",
-            joins.join(" ")
+            plan.joins,
+            where_clause = plan.where_clause,
+            order = plan.order,
         );
 
         let mut statement = self.connection.prepare_cached(&sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(bindings), |row| {
-            Ok(BookSummary {
-                id: BookId::new(row.get(0)?),
-                title: row.get(1)?,
-                authors: row.get(2)?,
-                series: row.get(3)?,
-                has_cover: row.get(4)?,
-                has_file_issue: row.get(5)?,
-            })
-        })?;
+        let rows = statement.query_map(rusqlite::params_from_iter(plan.bindings), book_summary)?;
 
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Returns one bounded, ordered window of the logical books matching `query`.
+    ///
+    /// The total count and summaries are read inside the same deferred transaction so a library
+    /// mutation in another connection cannot produce a mismatched grid size and page. The caller
+    /// supplies a zero-based `offset` and a bounded `limit`; a zero limit returns the total with
+    /// no summaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the offset cannot be represented by `SQLite` or either query cannot be
+    /// prepared or executed.
+    pub fn query_page(
+        &mut self,
+        query: &LibraryQuery,
+        offset: u64,
+        limit: u32,
+    ) -> Result<LibraryPage> {
+        let page_offset = offset;
+        let offset = i64::try_from(offset).map_err(|_| StorageError::InvalidPageOffset(offset))?;
+        let plan = LibraryQueryPlan::new(query);
+        let transaction = self.connection.transaction()?;
+
+        let total = {
+            let count_sql = format!(
+                "SELECT count(*) FROM books b {} {}",
+                plan.joins, plan.where_clause
+            );
+            let mut statement = transaction.prepare_cached(&count_sql)?;
+            let count: i64 = statement
+                .query_row(rusqlite::params_from_iter(plan.bindings.iter()), |row| {
+                    row.get(0)
+                })?;
+            u64::try_from(count).map_err(|_| StorageError::InvalidCount(count))?
+        };
+
+        let books = query_window_with_plan(&transaction, &plan, offset, limit)?;
+
+        transaction.commit()?;
+        Ok(LibraryPage {
+            total,
+            offset: page_offset,
+            books,
+        })
+    }
+
+    /// Returns a bounded ordered window of a library projection without recounting its matches.
+    ///
+    /// Use [`Self::query_page`] to establish a projection's total before requesting subsequent
+    /// windows. This keeps scrolling proportional to the displayed data instead of repeating a
+    /// full count for every page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the offset cannot be represented by `SQLite` or the indexed query
+    /// cannot be prepared or executed.
+    pub fn query_window(
+        &self,
+        query: &LibraryQuery,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<BookSummary>> {
+        let offset = i64::try_from(offset).map_err(|_| StorageError::InvalidPageOffset(offset))?;
+        let plan = LibraryQueryPlan::new(query);
+        query_window_with_plan(&self.connection, &plan, offset, limit)
     }
 
     /// Loads complete editable metadata and every asset for one logical book.
@@ -1195,6 +1220,103 @@ fn inspect_reference_asset(path: &Path) -> AssetHealth {
     }
 }
 
+struct LibraryQueryPlan {
+    bindings: Vec<rusqlite::types::Value>,
+    joins: String,
+    where_clause: String,
+    order: &'static str,
+}
+
+impl LibraryQueryPlan {
+    fn new(query: &LibraryQuery) -> Self {
+        let search = build_fts_query(&query.search);
+        let mut bindings = Vec::new();
+        let mut predicates = Vec::new();
+        let mut joins = Vec::new();
+
+        if let Some(search) = search {
+            bindings.push(search.into());
+            predicates.push(format!("books_fts MATCH ?{}", bindings.len()));
+            joins.push("JOIN books_fts ON books_fts.rowid = b.id".to_owned());
+        }
+
+        if let Some(format) = query.format {
+            bindings.push(format.as_str().to_owned().into());
+            joins.push(format!(
+                "JOIN book_assets filtered_assets \
+                 ON filtered_assets.book_id = b.id AND filtered_assets.format = ?{}",
+                bindings.len()
+            ));
+        }
+
+        if let Some(health) = query.asset_health {
+            bindings.push(health.as_str().to_owned().into());
+            joins.push(format!(
+                "JOIN (SELECT book_id FROM book_assets WHERE health = ?{} GROUP BY book_id) \
+                 health_assets ON health_assets.book_id = b.id",
+                bindings.len()
+            ));
+        }
+
+        let where_clause = if predicates.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", predicates.join(" AND "))
+        };
+        let order = match query.sort {
+            SortOrder::Title => "b.sort_title, b.id",
+            SortOrder::Author => "b.sort_authors, b.sort_title, b.id",
+            SortOrder::RecentlyAdded => "b.added_at DESC, b.id DESC",
+        };
+        Self {
+            bindings,
+            joins: joins.join(" "),
+            where_clause,
+            order,
+        }
+    }
+}
+
+fn book_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<BookSummary> {
+    Ok(BookSummary {
+        id: BookId::new(row.get(0)?),
+        title: row.get(1)?,
+        authors: row.get(2)?,
+        series: row.get(3)?,
+        has_cover: row.get(4)?,
+        has_file_issue: row.get(5)?,
+    })
+}
+
+fn query_window_with_plan(
+    connection: &Connection,
+    plan: &LibraryQueryPlan,
+    offset: i64,
+    limit: u32,
+) -> Result<Vec<BookSummary>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT b.id, b.title, b.authors, b.series, \
+         EXISTS(SELECT 1 FROM book_covers c WHERE c.book_id = b.id), \
+         EXISTS(SELECT 1 FROM book_assets a \
+                WHERE a.book_id = b.id AND a.health IN ('missing', 'unreadable')) \
+         FROM books b {} {} ORDER BY {} LIMIT ?{} OFFSET ?{}",
+        plan.joins,
+        plan.where_clause,
+        plan.order,
+        plan.bindings.len() + 1,
+        plan.bindings.len() + 2,
+    );
+    let mut bindings = plan.bindings.clone();
+    bindings.push(i64::from(limit).into());
+    bindings.push(offset.into());
+    let mut statement = connection.prepare_cached(&sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(bindings), book_summary)?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
 fn build_fts_query(input: &str) -> Option<String> {
     let terms = input
         .split_whitespace()
@@ -1218,7 +1340,7 @@ mod tests {
 
     use lectern_core::{
         AssetHealth, AssetHealthReport, AssetStorage, Book, BookAssetDraft, BookFormat, BookId,
-        BookMetadataDraft, LibraryQuery,
+        BookMetadataDraft, LibraryQuery, SortOrder,
     };
     use rusqlite::Connection;
 
@@ -1436,6 +1558,88 @@ mod tests {
         assert_eq!(book.assets.len(), 2);
         assert_eq!(book.assets[0].format, BookFormat::Epub);
         assert_eq!(book.assets[1].format, BookFormat::Pdf);
+    }
+
+    #[test]
+    fn paged_queries_preserve_full_projection_order_and_count() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        database
+            .import_books(&[
+                record("/books/dune.epub", "Dune", "Frank Herbert"),
+                record("/books/dune-messiah.epub", "Dune Messiah", "Frank Herbert"),
+                record_with_format(
+                    "/books/foundation.pdf",
+                    "Foundation",
+                    "Isaac Asimov",
+                    BookFormat::Pdf,
+                ),
+                record(
+                    "/books/game.epub",
+                    "A Game of Thrones",
+                    "George R. R. Martin",
+                ),
+                record("/books/hobbit.epub", "The Hobbit", "J. R. R. Tolkien"),
+            ])
+            .expect("import books");
+
+        let queries = [
+            LibraryQuery::default(),
+            LibraryQuery {
+                sort: SortOrder::Author,
+                ..LibraryQuery::default()
+            },
+            LibraryQuery {
+                sort: SortOrder::RecentlyAdded,
+                ..LibraryQuery::default()
+            },
+            LibraryQuery {
+                search: "Dun".into(),
+                ..LibraryQuery::default()
+            },
+            LibraryQuery {
+                format: Some(BookFormat::Pdf),
+                ..LibraryQuery::default()
+            },
+            LibraryQuery {
+                asset_health: Some(AssetHealth::Unknown),
+                ..LibraryQuery::default()
+            },
+        ];
+
+        for query in queries {
+            let full = database.query(&query).expect("full query");
+            assert_eq!(
+                database.query_window(&query, 2, 2).expect("windowed query"),
+                full.iter().skip(2).take(2).cloned().collect::<Vec<_>>()
+            );
+            let mut offset = 0;
+            let mut paged = Vec::new();
+            loop {
+                let page = database.query_page(&query, offset, 2).expect("paged query");
+                assert_eq!(
+                    page.total,
+                    u64::try_from(full.len()).expect("count fits u64")
+                );
+                assert_eq!(page.offset, offset);
+                offset += u64::try_from(page.books.len()).expect("page length fits u64");
+                let complete = page.books.len() < 2;
+                paged.extend(page.books);
+                if complete {
+                    break;
+                }
+            }
+            assert_eq!(paged, full);
+        }
+
+        let empty = database
+            .query_page(&LibraryQuery::default(), 0, 0)
+            .expect("zero-sized page");
+        assert_eq!(empty.total, 5);
+        assert!(empty.books.is_empty());
+        assert!(matches!(
+            database.query_page(&LibraryQuery::default(), u64::MAX, 1),
+            Err(StorageError::InvalidPageOffset(u64::MAX))
+        ));
     }
 
     #[test]
