@@ -1,6 +1,7 @@
 [package]
 name = "lectern-benchmark"
 description = "Exploratory performance harness for Lectern"
+default-run = "lectern-benchmark"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -41,6 +41,10 @@
     {
       "name": "reimport-known-path-v1",
       "budget": "benchmarks/reimport-known-path-regression-v1.json"
+    },
+    {
+      "name": "organisation-migration-v1",
+      "budget": "benchmarks/organisation-migration-regression-v1.json"
     }
   ]
 }

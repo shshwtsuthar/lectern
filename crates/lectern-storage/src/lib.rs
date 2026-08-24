@@ -1,5 +1,7 @@
 //! `SQLite` persistence adapter for Lectern.
 
+mod organisation;
+
 use std::{
     ffi::OsString,
     fs::File,
@@ -25,7 +27,7 @@ use thiserror::Error;
 #[cfg(not(any(unix, windows)))]
 compile_error!("Lectern's lossless path codec currently supports Unix and Windows targets");
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA: &str = r"
 CREATE TABLE books (
@@ -429,6 +431,9 @@ pub enum StorageError {
     /// A schema operation produced an invalid library.
     #[error("library integrity check failed: {0}")]
     Integrity(String),
+    /// User-entered or imported curation metadata violated the shared domain contract.
+    #[error("invalid curation metadata: {0}")]
+    InvalidCuration(String),
 }
 
 /// Result type returned by storage operations.
@@ -739,28 +744,33 @@ impl LibraryDatabase {
     /// # Errors
     ///
     /// Returns an error when the update fails or the book no longer exists.
-    pub fn save_book(&self, book: &Book) -> Result<()> {
-        let changed = self
+    pub fn save_book(&mut self, book: &Book) -> Result<()> {
+        let transaction = self
             .connection
-            .prepare_cached(
-                "UPDATE books SET title = ?1, sort_title = ?2, authors = ?3, sort_authors = ?4, \
-                 series = ?5, publisher = ?6, language = ?7, description = ?8, \
-                 modified_at = unixepoch() WHERE id = ?9",
-            )?
-            .execute(params![
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE books SET title = ?1, sort_title = ?2, \
+             publisher = ?3, language = ?4, description = ?5, \
+             modified_at = unixepoch() WHERE id = ?6",
+            params![
                 book.title.trim(),
                 sortable(&book.title),
-                book.authors.trim(),
-                sortable(&book.authors),
-                optional_text(book.series.as_deref()),
                 optional_text(book.publisher.as_deref()),
                 optional_text(book.language.as_deref()),
                 optional_text(book.description.as_deref()),
                 book.id.value(),
-            ])?;
+            ],
+        )?;
         if changed == 0 {
             return Err(StorageError::BookNotFound(book.id));
         }
+        organisation::replace_flattened_organisation(
+            &transaction,
+            book.id.value(),
+            &book.authors,
+            book.series.as_deref(),
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1135,7 +1145,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
     let observed = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match observed {
         SCHEMA_VERSION => return Ok(()),
-        0..=4 => {}
+        0..=5 => {}
         unsupported => return Err(StorageError::UnsupportedSchema(unsupported)),
     }
 
@@ -1160,21 +1170,29 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
     let changed = match version {
         0 => {
             transaction.execute_batch(SCHEMA)?;
+            organisation::migrate_v5_to_v6(&transaction)?;
             true
         }
         1 | 2 => {
             transaction.execute_batch(MIGRATE_1_OR_2_TO_3)?;
             transaction.execute_batch(MIGRATE_3_TO_4)?;
             transaction.execute_batch(MIGRATE_4_TO_5)?;
+            organisation::migrate_v5_to_v6(&transaction)?;
             true
         }
         3 => {
             transaction.execute_batch(MIGRATE_3_TO_4)?;
             transaction.execute_batch(MIGRATE_4_TO_5)?;
+            organisation::migrate_v5_to_v6(&transaction)?;
             true
         }
         4 => {
             transaction.execute_batch(MIGRATE_4_TO_5)?;
+            organisation::migrate_v5_to_v6(&transaction)?;
+            true
+        }
+        5 => {
+            organisation::migrate_v5_to_v6(&transaction)?;
             true
         }
         SCHEMA_VERSION => false,
@@ -1232,6 +1250,8 @@ fn validate_schema(transaction: &Transaction<'_>) -> Result<()> {
             "schema migration left stale book summary state".into(),
         ));
     }
+
+    organisation::validate_organisation_schema(transaction)?;
 
     transaction.execute(
         "INSERT INTO books_fts(books_fts, rank) VALUES ('integrity-check', 1)",
@@ -1334,7 +1354,10 @@ impl<'connection> ImportStatements<'connection> {
                      storage_mode = excluded.storage_mode, \
                      path_encoding = excluded.path_encoding, \
                      path = excluded.path, \
-                     modified_at = unixepoch()",
+                     modified_at = unixepoch() \
+                 WHERE book_assets.storage_mode IS NOT excluded.storage_mode \
+                    OR book_assets.path_encoding IS NOT excluded.path_encoding \
+                    OR book_assets.path IS NOT excluded.path",
             )?,
             upsert_cover: transaction.prepare(
                 "INSERT INTO book_covers(book_id, jpeg) VALUES (?1, ?2) \
@@ -1369,22 +1392,30 @@ fn upsert_book<'a>(
         }
     }
 
-    let id = match owner {
-        Some(id) => id,
-        None => {
-            statements.insert_book.execute(params![
-                metadata.title.trim(),
-                sortable(metadata.title),
-                metadata.authors.trim(),
-                sortable(metadata.authors),
-                optional_text(metadata.series),
-                optional_text(metadata.publisher),
-                optional_text(metadata.language),
-                optional_text(metadata.description),
-            ])?;
-            transaction.last_insert_rowid()
-        }
+    let id = if let Some(id) = owner {
+        id
+    } else {
+        statements.insert_book.execute(params![
+            metadata.title.trim(),
+            sortable(metadata.title),
+            metadata.authors.trim(),
+            sortable(metadata.authors),
+            optional_text(metadata.series),
+            optional_text(metadata.publisher),
+            optional_text(metadata.language),
+            optional_text(metadata.description),
+        ])?;
+        transaction.last_insert_rowid()
     };
+
+    if owner.is_none() {
+        organisation::replace_flattened_organisation(
+            transaction,
+            id,
+            metadata.authors,
+            metadata.series,
+        )?;
+    }
 
     for asset in assets {
         statements.upsert_asset.execute(params![
@@ -3213,7 +3244,7 @@ END;
 
     #[test]
     fn saving_missing_book_is_reported() {
-        let database = LibraryDatabase::open_in_memory().expect("open library");
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
         let book = Book {
             id: BookId::new(404),
             title: "Missing".into(),
