@@ -1,7 +1,12 @@
 use std::{
     io::Cursor,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
@@ -9,6 +14,9 @@ use eframe::egui;
 use image::{ImageReader, Limits};
 use lectern_core::{
     AssetHealthReport, AssetId, Book, BookFormat, BookId, BookSummary, LibraryQuery,
+};
+use lectern_desktop::export::{
+    ExportControl, ExportError, ExportOutcome, ExportProgress, OverwritePolicy, export_file,
 };
 use lectern_import::{ImportProgress, ImportSummary, import_paths, validate_publication};
 use lectern_storage::LibraryDatabase;
@@ -19,6 +27,8 @@ const MIN_COVER_WORKERS: usize = 2;
 const MAX_COVER_WORKERS: usize = 4;
 const MAX_STORED_COVER_DIMENSION: u32 = 1_024;
 const MAX_STORED_COVER_ALLOCATION: u64 = 16 * 1024 * 1024;
+const EXPORT_PROGRESS_BYTES: u64 = 16 * 1024 * 1024;
+const EXPORT_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) struct QueryRequest {
     pub(crate) generation: u64,
@@ -41,6 +51,14 @@ pub(crate) enum QueryQueueResult {
 
 pub(crate) struct ImportRequest {
     pub(crate) roots: Vec<PathBuf>,
+}
+
+pub(crate) struct ExportRequest {
+    pub(crate) asset_id: AssetId,
+    pub(crate) source: PathBuf,
+    pub(crate) destination: PathBuf,
+    pub(crate) overwrite: OverwritePolicy,
+    pub(crate) cancelled: Arc<AtomicBool>,
 }
 
 enum MetadataRequest {
@@ -128,6 +146,17 @@ pub(crate) enum WorkerEvent {
         replacement_path: PathBuf,
         result: Result<(), String>,
     },
+    ExportProgress {
+        asset_id: AssetId,
+        destination: PathBuf,
+        progress: ExportProgress,
+    },
+    ExportFinished {
+        asset_id: AssetId,
+        source: PathBuf,
+        destination: PathBuf,
+        result: Result<ExportOutcome, ExportError>,
+    },
     Error(String),
 }
 
@@ -137,6 +166,7 @@ pub(crate) struct WorkerSet {
     import_sender: Sender<ImportRequest>,
     metadata_sender: Sender<MetadataRequest>,
     asset_maintenance_sender: Sender<AssetMaintenanceRequest>,
+    export_sender: Sender<ExportRequest>,
     event_receiver: Receiver<WorkerEvent>,
 }
 
@@ -147,6 +177,7 @@ impl WorkerSet {
         let (import_sender, import_receiver) = bounded(1);
         let (metadata_sender, metadata_receiver) = unbounded();
         let (asset_maintenance_sender, asset_maintenance_receiver) = bounded(1);
+        let (export_sender, export_receiver) = bounded(1);
         let (event_sender, event_receiver) = unbounded();
 
         spawn_query_worker(
@@ -183,9 +214,10 @@ impl WorkerSet {
         spawn_asset_maintenance_worker(
             database_path.to_path_buf(),
             asset_maintenance_receiver,
-            event_sender,
+            event_sender.clone(),
             context.clone(),
         );
+        spawn_export_worker(export_receiver, event_sender, context.clone());
 
         Self {
             query_sender,
@@ -193,6 +225,7 @@ impl WorkerSet {
             import_sender,
             metadata_sender,
             asset_maintenance_sender,
+            export_sender,
             event_receiver,
         }
     }
@@ -293,9 +326,102 @@ impl WorkerSet {
             .is_ok()
     }
 
+    pub(crate) fn export(&self, request: ExportRequest) -> bool {
+        self.export_sender.try_send(request).is_ok()
+    }
+
     pub(crate) fn next_event(&self) -> Option<WorkerEvent> {
         self.event_receiver.try_recv().ok()
     }
+}
+
+fn spawn_export_worker(
+    receiver: Receiver<ExportRequest>,
+    events: Sender<WorkerEvent>,
+    context: egui::Context,
+) {
+    let failure_events = events.clone();
+    let failure_context = context.clone();
+    let result = thread::Builder::new()
+        .name("lectern-export".into())
+        .spawn(move || export_worker(&receiver, &events, &context));
+    if let Err(error) = result {
+        publish(
+            &failure_events,
+            &failure_context,
+            WorkerEvent::Error(format!("Could not start export worker: {error}")),
+        );
+    }
+}
+
+fn export_worker(
+    receiver: &Receiver<ExportRequest>,
+    events: &Sender<WorkerEvent>,
+    context: &egui::Context,
+) {
+    while let Ok(request) = receiver.recv() {
+        let result = if request.cancelled.load(Ordering::Relaxed) {
+            Err(ExportError::Cancelled)
+        } else {
+            let mut last_progress_bytes = 0;
+            let mut last_progress_at = Instant::now();
+            export_file(
+                &request.source,
+                &request.destination,
+                request.overwrite,
+                |progress| {
+                    let now = Instant::now();
+                    let should_publish = should_publish_export_progress(
+                        progress,
+                        last_progress_bytes,
+                        now.duration_since(last_progress_at),
+                    );
+                    let progress_connected = !should_publish
+                        || publish(
+                            events,
+                            context,
+                            WorkerEvent::ExportProgress {
+                                asset_id: request.asset_id,
+                                destination: request.destination.clone(),
+                                progress,
+                            },
+                        );
+                    if should_publish {
+                        last_progress_bytes = progress.copied_bytes;
+                        last_progress_at = now;
+                    }
+                    if !progress_connected || request.cancelled.load(Ordering::Relaxed) {
+                        ExportControl::Cancel
+                    } else {
+                        ExportControl::Continue
+                    }
+                },
+            )
+        };
+        if !publish(
+            events,
+            context,
+            WorkerEvent::ExportFinished {
+                asset_id: request.asset_id,
+                source: request.source,
+                destination: request.destination,
+                result,
+            },
+        ) {
+            break;
+        }
+    }
+}
+
+fn should_publish_export_progress(
+    progress: ExportProgress,
+    last_progress_bytes: u64,
+    elapsed: Duration,
+) -> bool {
+    last_progress_bytes == 0
+        || progress.copied_bytes == progress.total_bytes
+        || progress.copied_bytes.saturating_sub(last_progress_bytes) >= EXPORT_PROGRESS_BYTES
+        || elapsed >= EXPORT_PROGRESS_INTERVAL
 }
 
 fn spawn_metadata_worker(
@@ -676,4 +802,123 @@ fn publish(events: &Sender<WorkerEvent>, context: &egui::Context, event: WorkerE
     }
     context.request_repaint();
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
+        time::Duration,
+    };
+
+    use crossbeam_channel::unbounded;
+    use eframe::egui;
+    use lectern_core::AssetId;
+    use lectern_desktop::export::{ExportProgress, OverwritePolicy};
+
+    use super::{
+        EXPORT_PROGRESS_BYTES, ExportRequest, WorkerEvent, export_worker,
+        should_publish_export_progress,
+    };
+
+    static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "lectern-export-worker-test-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create worker test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).expect("remove worker test directory");
+        }
+    }
+
+    #[test]
+    fn export_progress_is_prompt_then_throttled_by_bytes_or_time() {
+        let first = ExportProgress {
+            copied_bytes: 256 * 1024,
+            total_bytes: 256 * 1024 * 1024,
+        };
+        assert!(should_publish_export_progress(first, 0, Duration::ZERO));
+        assert!(!should_publish_export_progress(
+            first,
+            first.copied_bytes,
+            Duration::from_millis(10),
+        ));
+        assert!(should_publish_export_progress(
+            ExportProgress {
+                copied_bytes: first.copied_bytes + EXPORT_PROGRESS_BYTES,
+                total_bytes: first.total_bytes,
+            },
+            first.copied_bytes,
+            Duration::from_millis(10),
+        ));
+        assert!(should_publish_export_progress(
+            ExportProgress {
+                copied_bytes: first.copied_bytes + 1,
+                total_bytes: first.total_bytes,
+            },
+            first.copied_bytes,
+            Duration::from_millis(50),
+        ));
+        assert!(should_publish_export_progress(
+            ExportProgress {
+                copied_bytes: first.total_bytes,
+                total_bytes: first.total_bytes,
+            },
+            first.copied_bytes,
+            Duration::ZERO,
+        ));
+    }
+
+    #[test]
+    fn export_worker_reports_progress_and_exact_completion() {
+        let directory = TestDirectory::new();
+        let source = directory.0.join("source.epub");
+        let destination = directory.0.join("copy.epub");
+        let bytes = vec![19_u8; 2 * 1024 * 1024];
+        fs::write(&source, &bytes).expect("write source");
+        let (requests, request_receiver) = unbounded();
+        let (events, event_receiver) = unbounded();
+        requests
+            .send(ExportRequest {
+                asset_id: AssetId::new(7),
+                source,
+                destination: destination.clone(),
+                overwrite: OverwritePolicy::Deny,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            })
+            .expect("queue export");
+        drop(requests);
+
+        export_worker(&request_receiver, &events, &egui::Context::default());
+
+        let published = event_receiver.try_iter().collect::<Vec<_>>();
+        assert!(published.iter().any(|event| matches!(
+            event,
+            WorkerEvent::ExportProgress { progress, .. } if progress.copied_bytes > 0
+        )));
+        assert!(published.iter().any(|event| matches!(
+            event,
+            WorkerEvent::ExportFinished { result: Ok(outcome), .. }
+                if outcome.copied_bytes
+                    == u64::try_from(bytes.len()).expect("test byte length fits u64")
+        )));
+        assert_eq!(fs::read(destination).expect("read export"), bytes);
+    }
 }

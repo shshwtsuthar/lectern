@@ -1,14 +1,19 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use directories::ProjectDirs;
 use eframe::egui::{self, Align, Color32, FontId, RichText, Sense, Stroke, StrokeKind, Vec2};
 use lectern_core::{
-    AssetHealth, AssetHealthReport, AssetId, Book, BookFormat, BookId, BookSummary, LibraryQuery,
-    SortOrder,
+    AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookFormat, BookId, BookSummary,
+    LibraryQuery, SortOrder,
 };
+use lectern_desktop::export::{ExportError, ExportProgress, OverwritePolicy};
 use lectern_import::{ImportProgress, ImportSummary};
 use lectern_storage::LibraryDatabase;
 
@@ -16,7 +21,8 @@ use crate::{
     benchmark::{BenchmarkFrame, DesktopBenchmark},
     platform::{NoopAssetPlatform, PlatformAction, PlatformWorker, SystemAssetPlatform},
     workers::{
-        DecodedCover, ImportRequest, QueryQueueResult, QueryRequest, WorkerEvent, WorkerSet,
+        DecodedCover, ExportRequest, ImportRequest, QueryQueueResult, QueryRequest, WorkerEvent,
+        WorkerSet,
     },
 };
 
@@ -53,6 +59,7 @@ struct MetadataActions {
     reveal: Option<(AssetId, PathBuf)>,
     relink: Option<(AssetId, BookFormat)>,
     replace: Option<AssetReplaceSelection>,
+    export: Option<(AssetId, BookFormat, PathBuf)>,
     detach: Option<AssetDetachConfirmation>,
     attach: Option<BookFormat>,
     remove: bool,
@@ -115,12 +122,34 @@ struct AssetReplaceConfirmation {
     replacement_path: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssetExportSelection {
+    asset_id: AssetId,
+    format: BookFormat,
+    source: PathBuf,
+    destination: PathBuf,
+}
+
+#[derive(Default)]
+struct ExportUi {
+    active: Option<ActiveExport>,
+    overwrite_confirmation: Option<AssetExportSelection>,
+}
+
+struct ActiveExport {
+    selection: AssetExportSelection,
+    progress: ExportProgress,
+    cancelled: Arc<AtomicBool>,
+    cancelling: bool,
+}
+
 #[derive(Clone, Copy)]
 struct MetadataOperationState {
     relinking_asset: Option<AssetId>,
     replacing_asset: Option<AssetId>,
     detaching_asset: Option<AssetId>,
     platform_busy: Option<(AssetId, PlatformAction)>,
+    exporting_asset: Option<AssetId>,
     attaching_format: Option<BookFormat>,
     removal_busy: bool,
     library_operation_busy: bool,
@@ -199,6 +228,7 @@ pub(crate) struct LecternApp {
     asset_maintenance: AssetMaintenanceUi,
     platform_worker: PlatformWorker,
     platform_busy: Option<(AssetId, PlatformAction)>,
+    export_ui: ExportUi,
     book_removal: BookRemovalUi,
     editor_loading: Option<BookId>,
     editor: Option<BookEditor>,
@@ -244,6 +274,7 @@ impl LecternApp {
             asset_maintenance: AssetMaintenanceUi::default(),
             platform_worker,
             platform_busy: None,
+            export_ui: ExportUi::default(),
             book_removal: BookRemovalUi::default(),
             editor_loading: None,
             editor: None,
@@ -383,6 +414,17 @@ impl LecternApp {
                     replacement_path,
                     result,
                 } => self.asset_replaced(book_id, asset_id, replacement_path, result),
+                WorkerEvent::ExportProgress {
+                    asset_id,
+                    destination,
+                    progress,
+                } => self.export_progress(asset_id, &destination, progress),
+                WorkerEvent::ExportFinished {
+                    asset_id,
+                    source,
+                    destination,
+                    result,
+                } => self.export_finished(asset_id, source, destination, result),
                 WorkerEvent::QueryFinished { .. }
                 | WorkerEvent::QueryDiscarded { .. }
                 | WorkerEvent::BookLoaded { .. } => {}
@@ -419,6 +461,73 @@ impl LecternApp {
         }
         self.retry_initial_page_if_needed();
         self.evict_covers();
+    }
+
+    fn export_progress(
+        &mut self,
+        asset_id: AssetId,
+        destination: &PathBuf,
+        progress: ExportProgress,
+    ) {
+        let Some(active) = &mut self.export_ui.active else {
+            return;
+        };
+        if active.selection.asset_id != asset_id
+            || active.selection.destination.as_path() != destination
+        {
+            return;
+        }
+        active.progress = progress;
+        self.status = format_export_progress(progress, active.cancelling);
+    }
+
+    fn export_finished(
+        &mut self,
+        asset_id: AssetId,
+        source: PathBuf,
+        destination: PathBuf,
+        result: Result<lectern_desktop::export::ExportOutcome, ExportError>,
+    ) {
+        let Some(active) = self.export_ui.active.take() else {
+            return;
+        };
+        if active.selection.asset_id != asset_id || active.selection.destination != destination {
+            self.export_ui.active = Some(active);
+            return;
+        }
+        match result {
+            Ok(outcome) => {
+                self.status = format!(
+                    "Exported {} bytes to {}",
+                    outcome.copied_bytes,
+                    destination.display()
+                );
+            }
+            Err(ExportError::DestinationExists(_)) => {
+                self.status = "Export destination already exists; confirmation required".into();
+                self.export_ui.overwrite_confirmation = Some(AssetExportSelection {
+                    asset_id,
+                    format: active.selection.format,
+                    source,
+                    destination,
+                });
+            }
+            Err(ExportError::Cancelled) => {
+                "Export cancelled; no partial copy was kept".clone_into(&mut self.status);
+            }
+            Err(error) => {
+                self.status = format!("Could not export book file: {error}");
+                if let Some(editor) = &mut self.editor
+                    && editor
+                        .original
+                        .assets
+                        .iter()
+                        .any(|asset| asset.id == asset_id)
+                {
+                    editor.error = Some(error.to_string());
+                }
+            }
+        }
     }
 
     fn retry_initial_page_if_needed(&mut self) {
@@ -1055,6 +1164,7 @@ impl LecternApp {
         self.book_removal.confirmation = None;
         self.asset_maintenance.detach_confirmation = None;
         self.asset_maintenance.replace_confirmation = None;
+        self.export_ui.overwrite_confirmation = None;
         self.selected = Some(id);
         self.editor = None;
         if self.workers.load_book(id) {
@@ -1069,6 +1179,7 @@ impl LecternApp {
         self.book_removal.confirmation = None;
         self.asset_maintenance.detach_confirmation = None;
         self.asset_maintenance.replace_confirmation = None;
+        self.export_ui.overwrite_confirmation = None;
         self.selected = None;
         self.editor_loading = None;
         self.editor = None;
@@ -1095,6 +1206,7 @@ impl LecternApp {
         let mut reveal = None;
         let mut relink = None;
         let mut replace = None;
+        let mut export = None;
         let mut detach = None;
         let mut attach = None;
         let mut remove = false;
@@ -1138,6 +1250,11 @@ impl LecternApp {
                         replacing_asset: self.asset_maintenance.replacing_asset,
                         detaching_asset: self.asset_maintenance.detaching_asset,
                         platform_busy: self.platform_busy,
+                        exporting_asset: self
+                            .export_ui
+                            .active
+                            .as_ref()
+                            .map(|active| active.selection.asset_id),
                         attaching_format: self.asset_maintenance.attaching_format,
                         removal_busy,
                         library_operation_busy,
@@ -1149,19 +1266,13 @@ impl LecternApp {
                 reveal = actions.reveal;
                 relink = actions.relink;
                 replace = actions.replace;
+                export = actions.export;
                 detach = actions.detach;
                 attach = actions.attach;
                 remove = actions.remove;
             });
 
-        save |= !removal_busy
-            && !library_operation_busy
-            && ui.input_mut(|input| {
-                input.consume_shortcut(&egui::KeyboardShortcut::new(
-                    egui::Modifiers::COMMAND,
-                    egui::Key::S,
-                ))
-            });
+        save |= metadata_save_shortcut(ui, removal_busy, library_operation_busy);
         if close {
             self.clear_selection();
         } else if reset {
@@ -1178,6 +1289,8 @@ impl LecternApp {
             self.choose_asset_relink(asset_id, format);
         } else if let Some(selection) = replace {
             self.choose_asset_replacement(selection);
+        } else if let Some((asset_id, format, source)) = export {
+            self.choose_asset_export(asset_id, format, source);
         } else if let Some(confirmation) = detach {
             self.asset_maintenance.detach_confirmation = Some(confirmation);
         } else if let Some(format) = attach {
@@ -1479,6 +1592,129 @@ impl LecternApp {
         });
     }
 
+    fn choose_asset_export(&mut self, asset_id: AssetId, format: BookFormat, source: PathBuf) {
+        if self.export_ui.active.is_some() {
+            return;
+        }
+        let suggested_name = source.file_name().map_or_else(
+            || format!("book.{}", format_extension(format)),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let title = format!("Export {format} copy");
+        let Some(destination) = rfd::FileDialog::new()
+            .set_title(&title)
+            .set_file_name(suggested_name)
+            .add_filter(format.to_string(), &[format_extension(format)])
+            .save_file()
+        else {
+            return;
+        };
+        let selection = AssetExportSelection {
+            asset_id,
+            format,
+            source,
+            destination,
+        };
+        match selection.destination.try_exists() {
+            Ok(true) => self.export_ui.overwrite_confirmation = Some(selection),
+            Ok(false) => self.start_asset_export(selection, OverwritePolicy::Deny),
+            Err(error) => self.status = format!("Could not inspect export destination: {error}"),
+        }
+    }
+
+    fn start_asset_export(&mut self, selection: AssetExportSelection, overwrite: OverwritePolicy) {
+        self.export_ui.overwrite_confirmation = None;
+        if self.export_ui.active.is_some() {
+            return;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        if self.workers.export(ExportRequest {
+            asset_id: selection.asset_id,
+            source: selection.source.clone(),
+            destination: selection.destination.clone(),
+            overwrite,
+            cancelled: Arc::clone(&cancelled),
+        }) {
+            if let Some(editor) = &mut self.editor
+                && editor
+                    .original
+                    .assets
+                    .iter()
+                    .any(|asset| asset.id == selection.asset_id)
+            {
+                editor.error = None;
+            }
+            self.status = format!("Starting export to {}…", selection.destination.display());
+            self.export_ui.active = Some(ActiveExport {
+                selection,
+                progress: ExportProgress {
+                    copied_bytes: 0,
+                    total_bytes: 0,
+                },
+                cancelled,
+                cancelling: false,
+            });
+        } else {
+            "Export worker is unavailable".clone_into(&mut self.status);
+        }
+    }
+
+    fn cancel_export(&mut self) {
+        let Some(active) = &mut self.export_ui.active else {
+            return;
+        };
+        active.cancelled.store(true, Ordering::Relaxed);
+        active.cancelling = true;
+        "Cancelling export…".clone_into(&mut self.status);
+    }
+
+    fn export_overwrite_confirmation_window(&mut self, context: &egui::Context) {
+        let Some(selection) = self.export_ui.overwrite_confirmation.clone() else {
+            return;
+        };
+        let response =
+            egui::Modal::new(egui::Id::new("export-overwrite-confirmation")).show(context, |ui| {
+                ui.set_max_width(500.0);
+                ui.heading(format!("Replace existing {} export?", selection.format));
+                ui.add_space(6.0);
+                ui.label("Source file:");
+                ui.label(
+                    RichText::new(selection.source.display().to_string())
+                        .monospace()
+                        .color(MUTED),
+                );
+                ui.add_space(4.0);
+                ui.label("The destination already exists:");
+                ui.label(
+                    RichText::new(selection.destination.display().to_string())
+                        .monospace()
+                        .color(MUTED),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Only this destination copy will be replaced. The library reference and source file will not change.",
+                    )
+                    .color(MUTED),
+                );
+                ui.add_space(14.0);
+                let mut replace = false;
+                let mut cancel = false;
+                ui.horizontal(|ui| {
+                    replace = ui.button("Replace destination").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+                (replace, cancel)
+            });
+        let should_close = response.should_close();
+        let (replace, cancel) = response.inner;
+        if replace {
+            self.start_asset_export(selection, OverwritePolicy::Allow);
+        } else if cancel || should_close {
+            self.export_ui.overwrite_confirmation = None;
+        }
+    }
+
     fn choose_format_attachment(&mut self, format: BookFormat) {
         if self.importing || self.asset_maintenance.busy() || self.book_removal.removing.is_some() {
             return;
@@ -1691,12 +1927,33 @@ impl LecternApp {
         }
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui) {
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let export = self
+            .export_ui
+            .active
+            .as_ref()
+            .map(|active| (active.progress, active.cancelling));
+        let mut cancel_export = false;
         ui.horizontal_centered(|ui| {
-            if self.importing {
+            if self.importing || export.is_some() {
                 ui.spinner();
             }
             ui.label(RichText::new(&self.status).color(MUTED).size(12.0));
+            if let Some((progress, cancelling)) = export {
+                let fraction = if progress.total_bytes == 0 {
+                    0.0
+                } else {
+                    export_fraction(progress)
+                };
+                ui.add(
+                    egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                        .desired_width(120.0)
+                        .show_percentage(),
+                );
+                cancel_export = ui
+                    .add_enabled(!cancelling, egui::Button::new("Cancel export"))
+                    .clicked();
+            }
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
                     RichText::new(self.database_path.display().to_string())
@@ -1705,6 +1962,9 @@ impl LecternApp {
                 );
             });
         });
+        if cancel_export {
+            self.cancel_export();
+        }
     }
 }
 
@@ -1749,6 +2009,7 @@ impl eframe::App for LecternApp {
         self.asset_health_report_window(ui.ctx());
         self.asset_detach_confirmation_window(ui.ctx());
         self.asset_replace_confirmation_window(ui.ctx());
+        self.export_overwrite_confirmation_window(ui.ctx());
         self.book_removal_confirmation_window(ui.ctx());
 
         if files_hovering {
@@ -1850,6 +2111,27 @@ fn import_status(progress: ImportProgress) -> String {
     )
 }
 
+fn format_export_progress(progress: ExportProgress, cancelling: bool) -> String {
+    if cancelling {
+        return "Cancelling export…".to_owned();
+    }
+    format!(
+        "Exporting {} of {} MiB…",
+        progress.copied_bytes / (1024 * 1024),
+        progress.total_bytes / (1024 * 1024)
+    )
+}
+
+fn export_fraction(progress: ExportProgress) -> f32 {
+    let thousandths = progress
+        .copied_bytes
+        .saturating_mul(1_000)
+        .checked_div(progress.total_bytes)
+        .unwrap_or_default()
+        .min(1_000);
+    f32::from(u16::try_from(thousandths).expect("export fraction is bounded")) / 1_000.0
+}
+
 fn asset_health_status(report: AssetHealthReport) -> String {
     format!(
         "Checked {} referenced files · {} missing · {} unreadable",
@@ -1864,6 +2146,21 @@ fn metadata_text_field(ui: &mut egui::Ui, label: &str, value: &mut String, enabl
         enabled,
         egui::TextEdit::singleline(value).desired_width(f32::INFINITY),
     );
+}
+
+fn metadata_save_shortcut(
+    ui: &mut egui::Ui,
+    removal_busy: bool,
+    library_operation_busy: bool,
+) -> bool {
+    !removal_busy
+        && !library_operation_busy
+        && ui.input_mut(|input| {
+            input.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::S,
+            ))
+        })
 }
 
 fn metadata_form(
@@ -1955,8 +2252,8 @@ fn asset_rows(
                     .color(health_color)
                     .size(12.0),
             );
-            let platform_enabled = state.platform_busy.is_none()
-                && asset.storage == lectern_core::AssetStorage::Reference;
+            let platform_enabled =
+                state.platform_busy.is_none() && asset.storage == AssetStorage::Reference;
             let open_text = if state.platform_busy == Some((asset.id, PlatformAction::Open)) {
                 "Opening…"
             } else {
@@ -1973,6 +2270,8 @@ fn asset_rows(
                 "Detaching…"
             } else if state.replacing_asset == Some(asset.id) {
                 "Replacing…"
+            } else if state.exporting_asset == Some(asset.id) {
+                "Exporting…"
             } else {
                 "File actions"
             };
@@ -1997,7 +2296,22 @@ fn asset_rows(
                             actions.reveal = Some((asset.id, asset.path.clone()));
                             ui.close();
                         }
-                        if asset.storage == lectern_core::AssetStorage::Reference
+                        let export = ui
+                            .add_enabled(
+                                asset.storage == AssetStorage::Reference
+                                    && state.exporting_asset.is_none(),
+                                egui::Button::new("Export a copy…"),
+                            )
+                            .on_disabled_hover_text(if asset.storage == AssetStorage::Managed {
+                                "Managed-file export is not available yet"
+                            } else {
+                                "Another export is already running"
+                            });
+                        if export.clicked() {
+                            actions.export = Some((asset.id, asset.format, asset.path.clone()));
+                            ui.close();
+                        }
+                        if asset.storage == AssetStorage::Reference
                             && asset.health.has_issue()
                             && ui
                                 .add_enabled(
@@ -2012,7 +2326,7 @@ fn asset_rows(
                             actions.relink = Some((asset.id, asset.format));
                             ui.close();
                         }
-                        if asset.storage == lectern_core::AssetStorage::Reference
+                        if asset.storage == AssetStorage::Reference
                             && ui
                                 .add_enabled(
                                     action_enabled
@@ -2200,11 +2514,13 @@ mod tests {
     use lectern_core::{
         AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId,
     };
+    use lectern_desktop::export::ExportProgress;
     use lectern_import::ImportProgress;
 
     use super::{
         BookEditor, CARD_GAP, CARD_WIDTH, COVER_SIZE, QUERY_PAGE_SIZE, asset_health_status,
-        column_count, cover_image, import_status, query_page_offset, removal_file_message,
+        column_count, cover_image, export_fraction, format_export_progress, import_status,
+        query_page_offset, removal_file_message,
     };
 
     #[test]
@@ -2256,6 +2572,21 @@ mod tests {
             }),
             "Importing 4/10 · 3 imported · 1 failed"
         );
+    }
+
+    #[test]
+    fn export_progress_is_bounded_and_human_readable() {
+        let halfway = ExportProgress {
+            copied_bytes: 128 * 1024 * 1024,
+            total_bytes: 256 * 1024 * 1024,
+        };
+
+        assert_eq!(export_fraction(halfway), 0.5);
+        assert_eq!(
+            format_export_progress(halfway, false),
+            "Exporting 128 of 256 MiB…"
+        );
+        assert_eq!(format_export_progress(halfway, true), "Cancelling export…");
     }
 
     #[test]
