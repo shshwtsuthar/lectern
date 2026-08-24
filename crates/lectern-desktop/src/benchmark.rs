@@ -33,6 +33,7 @@ const SORT_SCENARIOS: [SortOrder; 3] = [
 ];
 const SORT_TO_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
 const ASSET_ACTION_TO_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
+const EDITOR_OPEN_TO_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
 const ASSET_ACTIONS: [PlatformAction; 2] = [PlatformAction::Open, PlatformAction::Reveal];
 
 pub(crate) struct BenchmarkFrame {
@@ -53,6 +54,8 @@ struct BenchmarkConfig {
     scroll_pixels_per_second: f32,
     sort_iterations: usize,
     asset_action_iterations: usize,
+    editor_warmup_iterations: usize,
+    editor_iterations: usize,
 }
 
 impl BenchmarkConfig {
@@ -71,6 +74,11 @@ impl BenchmarkConfig {
                 "LECTERN_BENCHMARK_ASSET_ACTION_ITERATIONS",
                 0,
             )?,
+            editor_warmup_iterations: usize_from_env(
+                "LECTERN_BENCHMARK_EDITOR_WARMUP_ITERATIONS",
+                0,
+            )?,
+            editor_iterations: usize_from_env("LECTERN_BENCHMARK_EDITOR_ITERATIONS", 0)?,
         };
         if config.scroll.is_zero() && !config.scroll_warmup.is_zero() {
             return Err(
@@ -89,6 +97,12 @@ impl BenchmarkConfig {
         if config.scroll_pixels_per_second <= 0.0 {
             return Err(
                 "LECTERN_BENCHMARK_SCROLL_PIXELS_PER_SECOND must be greater than zero".into(),
+            );
+        }
+        if config.editor_iterations == 0 && config.editor_warmup_iterations > 0 {
+            return Err(
+                "LECTERN_BENCHMARK_EDITOR_WARMUP_ITERATIONS must be zero when editor interactions are disabled"
+                    .into(),
             );
         }
         Ok(config)
@@ -110,6 +124,10 @@ enum Phase {
         completed: usize,
         pending: Option<PendingAssetAction>,
     },
+    Editor {
+        completed: usize,
+        pending: Option<PendingEditor>,
+    },
     Scroll {
         started: Instant,
     },
@@ -128,6 +146,12 @@ struct PendingAssetAction {
     paint_frames_remaining: u8,
 }
 
+struct PendingEditor {
+    book_id: lectern_core::BookId,
+    started: Instant,
+    paint_frames_remaining: Option<u8>,
+}
+
 pub(crate) struct DesktopBenchmark {
     output_path: PathBuf,
     config: BenchmarkConfig,
@@ -142,12 +166,15 @@ pub(crate) struct DesktopBenchmark {
     library_books: u64,
     initial_page_books: usize,
     initial_page_books_with_covers: usize,
+    editor_book_id: Option<lectern_core::BookId>,
     frame_intervals_ns: Vec<u64>,
     egui_frame_intervals_ns: Vec<u64>,
     cpu_frame_times_ns: Vec<u64>,
     sort_to_paint_samples_ns: [Vec<u64>; SORT_SCENARIOS.len()],
     sort_first_book_ids: [Option<i64>; SORT_SCENARIOS.len()],
     asset_action_to_paint_samples_ns: [Vec<u64>; ASSET_ACTIONS.len()],
+    editor_open_to_paint_samples_ns: Vec<u64>,
+    close_editor_requested: bool,
     validation_failure: Option<String>,
     memory: Option<PhaseMemorySampler>,
 }
@@ -175,12 +202,15 @@ impl DesktopBenchmark {
             library_books: 0,
             initial_page_books: 0,
             initial_page_books_with_covers: 0,
+            editor_book_id: None,
             frame_intervals_ns: Vec::new(),
             egui_frame_intervals_ns: Vec::new(),
             cpu_frame_times_ns: Vec::new(),
             sort_to_paint_samples_ns: array::from_fn(|_| Vec::new()),
             sort_first_book_ids: [None; SORT_SCENARIOS.len()],
             asset_action_to_paint_samples_ns: array::from_fn(|_| Vec::new()),
+            editor_open_to_paint_samples_ns: Vec::new(),
+            close_editor_requested: false,
             validation_failure: None,
             memory: Some(memory),
         }))
@@ -198,6 +228,7 @@ impl DesktopBenchmark {
                 self.initial_page_books = books.len();
                 self.initial_page_books_with_covers =
                     books.iter().filter(|book| book.has_cover).count();
+                self.editor_book_id = books.first().map(|book| book.id);
                 self.main_entry_to_query_installed_ns = elapsed_ns(self.main_entry.elapsed());
                 *paint_frames_remaining = Some(1);
             }
@@ -276,6 +307,53 @@ impl DesktopBenchmark {
         self.validation_failure = Some("no-op platform action could not be queued".to_owned());
     }
 
+    pub(crate) fn next_editor_request(&mut self) -> Option<lectern_core::BookId> {
+        let Phase::Editor { completed, pending } = &mut self.phase else {
+            return None;
+        };
+        let total = self.config.editor_warmup_iterations + self.config.editor_iterations;
+        if pending.is_some() || *completed >= total {
+            return None;
+        }
+        let Some(book_id) = self.editor_book_id else {
+            self.validation_failure = Some("editor benchmark has no populated book target".into());
+            return None;
+        };
+        *pending = Some(PendingEditor {
+            book_id,
+            started: Instant::now(),
+            paint_frames_remaining: None,
+        });
+        Some(book_id)
+    }
+
+    pub(crate) fn editor_installed(&mut self, book_id: lectern_core::BookId) {
+        let Phase::Editor {
+            pending: Some(pending),
+            ..
+        } = &mut self.phase
+        else {
+            return;
+        };
+        if pending.book_id != book_id {
+            self.validation_failure = Some(format!(
+                "editor benchmark loaded book {} instead of {}",
+                book_id.value(),
+                pending.book_id.value(),
+            ));
+            return;
+        }
+        pending.paint_frames_remaining = Some(1);
+    }
+
+    pub(crate) fn editor_dispatch_failed(&mut self) {
+        self.validation_failure = Some("metadata editor request could not be queued".to_owned());
+    }
+
+    pub(crate) fn take_editor_close_request(&mut self) -> bool {
+        std::mem::take(&mut self.close_editor_requested)
+    }
+
     pub(crate) fn frame_started(&mut self, cpu_usage_seconds: Option<f32>, unstable_dt: f32) {
         let now = Instant::now();
         let interval = self
@@ -318,9 +396,11 @@ impl DesktopBenchmark {
         let mut begin_idle = false;
         let mut begin_sort = false;
         let mut begin_asset_actions = false;
+        let mut begin_editor = false;
         let mut begin_scroll = false;
         let mut sort_finished = false;
         let mut asset_actions_finished = false;
+        let mut editor_finished = false;
         let mut finish = false;
         let mut failure = None;
         let mut observed_scroll_duration = None;
@@ -352,6 +432,9 @@ impl DesktopBenchmark {
             Phase::AssetActions { .. } if timed_out => {
                 failure = Some("desktop benchmark timed out during asset actions".to_owned());
             }
+            Phase::Editor { .. } if timed_out => {
+                failure = Some("desktop benchmark timed out during editor interactions".to_owned());
+            }
             Phase::Scroll { started } if timed_out => {
                 observed_scroll_duration = Some(now.duration_since(*started));
                 failure = Some("desktop benchmark timed out during scrolling".to_owned());
@@ -361,6 +444,8 @@ impl DesktopBenchmark {
                     begin_sort = true;
                 } else if self.config.asset_action_iterations > 0 {
                     begin_asset_actions = true;
+                } else if self.config.editor_iterations > 0 {
+                    begin_editor = true;
                 } else if self.config.scroll.is_zero() {
                     self.idle_end_rss_bytes = current_rss_bytes();
                     observed_scroll_duration = Some(Duration::ZERO);
@@ -411,7 +496,37 @@ impl DesktopBenchmark {
                 pending.paint_frames_remaining -= 1;
                 context.request_repaint();
             }
-            Phase::Sort {
+            Phase::Editor { completed, pending }
+                if pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.paint_frames_remaining == Some(0)) =>
+            {
+                let completed_editor = pending.take().expect("completed editor is present");
+                if *completed >= self.config.editor_warmup_iterations {
+                    if let Some(latency) = elapsed_ns(now.duration_since(completed_editor.started))
+                    {
+                        self.editor_open_to_paint_samples_ns.push(latency);
+                    } else {
+                        failure = Some(
+                            "editor-open-to-paint latency exceeded the supported range".to_owned(),
+                        );
+                    }
+                }
+                *completed += 1;
+                self.close_editor_requested = true;
+                editor_finished = *completed
+                    >= self.config.editor_warmup_iterations + self.config.editor_iterations;
+                context.request_repaint();
+            }
+            Phase::Editor {
+                pending:
+                    Some(PendingEditor {
+                        paint_frames_remaining: Some(remaining),
+                        ..
+                    }),
+                ..
+            }
+            | Phase::Sort {
                 pending:
                     Some(PendingSort {
                         paint_frames_remaining: Some(remaining),
@@ -425,7 +540,8 @@ impl DesktopBenchmark {
             Phase::Startup { .. }
             | Phase::Idle { .. }
             | Phase::Sort { .. }
-            | Phase::AssetActions { .. } => {
+            | Phase::AssetActions { .. }
+            | Phase::Editor { .. } => {
                 context.request_repaint_after(MEMORY_SAMPLE_INTERVAL);
             }
             Phase::Scroll { started } if now.duration_since(*started) >= self.config.scroll => {
@@ -460,6 +576,8 @@ impl DesktopBenchmark {
         } else if sort_finished {
             if self.config.asset_action_iterations > 0 {
                 begin_asset_actions = true;
+            } else if self.config.editor_iterations > 0 {
+                begin_editor = true;
             } else if self.config.scroll.is_zero() {
                 observed_scroll_duration = Some(Duration::ZERO);
                 finish = true;
@@ -482,6 +600,30 @@ impl DesktopBenchmark {
             };
             context.request_repaint();
         } else if asset_actions_finished {
+            if self.config.editor_iterations > 0 {
+                begin_editor = true;
+            } else if self.config.scroll.is_zero() {
+                observed_scroll_duration = Some(Duration::ZERO);
+                finish = true;
+            } else {
+                begin_scroll = true;
+            }
+        }
+
+        if begin_editor {
+            if self.idle_end_rss_bytes.is_none() {
+                self.idle_end_rss_bytes = current_rss_bytes();
+                if let Some(memory) = &self.memory {
+                    memory.record_sample(IDLE_PHASE, self.idle_end_rss_bytes);
+                    memory.set_phase(SORT_PHASE);
+                }
+            }
+            self.phase = Phase::Editor {
+                completed: 0,
+                pending: None,
+            };
+            context.request_repaint();
+        } else if editor_finished {
             if self.config.scroll.is_zero() {
                 observed_scroll_duration = Some(Duration::ZERO);
                 finish = true;
@@ -529,7 +671,7 @@ impl DesktopBenchmark {
             .ok_or_else(|| "memory sampler was already consumed".to_owned())?
             .finish()?;
         let result = DesktopBenchmarkResult {
-            schema_version: 3,
+            schema_version: 4,
             kind: "desktop",
             status: if failure.is_some() {
                 "failed"
@@ -573,6 +715,12 @@ impl DesktopBenchmark {
             asset_actions: AssetActionsResult::new(
                 self.config.asset_action_iterations,
                 &self.asset_action_to_paint_samples_ns,
+            ),
+            editor_interactions: EditorInteractionsResult::new(
+                self.config.editor_warmup_iterations,
+                self.config.editor_iterations,
+                self.editor_book_id,
+                &self.editor_open_to_paint_samples_ns,
             ),
             scrolling: ScrollingResult::new(
                 self.config,
@@ -623,6 +771,27 @@ impl DesktopBenchmark {
                 ASSET_ACTION_TO_PAINT_P95_BUDGET_NS,
             )
         })
+        .or_else(|| {
+            if self.config.editor_iterations == 0 {
+                return None;
+            }
+            if self.editor_open_to_paint_samples_ns.len() != self.config.editor_iterations {
+                return Some(format!(
+                    "editor open retained {} samples; expected {}",
+                    self.editor_open_to_paint_samples_ns.len(),
+                    self.config.editor_iterations,
+                ));
+            }
+            let summary = summarize_samples(&self.editor_open_to_paint_samples_ns)
+                .expect("non-empty editor interaction samples");
+            (summary.p95_ns > EDITOR_OPEN_TO_PAINT_P95_BUDGET_NS).then(|| {
+                format!(
+                    "editor open p95 was {:.3} ms, above the {:.3} ms budget",
+                    milliseconds(summary.p95_ns),
+                    milliseconds(EDITOR_OPEN_TO_PAINT_P95_BUDGET_NS),
+                )
+            })
+        })
     }
 }
 
@@ -649,8 +818,8 @@ fn interaction_budget_failure<const N: usize>(
             return Some(format!(
                 "{kind} {} p95 was {:.3} ms, above the {:.3} ms budget",
                 name(index),
-                summary.p95_ns as f64 / 1_000_000.0,
-                p95_budget_ns as f64 / 1_000_000.0,
+                milliseconds(summary.p95_ns),
+                milliseconds(p95_budget_ns),
             ));
         }
     }
@@ -712,6 +881,32 @@ impl<'a> AssetActionsResult<'a> {
                     passed,
                 }
             }),
+        }
+    }
+}
+
+impl<'a> EditorInteractionsResult<'a> {
+    fn new(
+        warmup_iterations: usize,
+        measured_iterations: usize,
+        book_id: Option<lectern_core::BookId>,
+        samples: &'a [u64],
+    ) -> Self {
+        let latency = summarize_samples(samples);
+        let passed = measured_iterations == 0
+            || (samples.len() == measured_iterations
+                && latency
+                    .as_ref()
+                    .is_some_and(|summary| summary.p95_ns <= EDITOR_OPEN_TO_PAINT_P95_BUDGET_NS));
+        Self {
+            endpoint: "metadata load requested through the first fully rendered book-details frame",
+            warmup_iterations,
+            measured_iterations,
+            max_p95_ns: EDITOR_OPEN_TO_PAINT_P95_BUDGET_NS,
+            book_id: book_id.map(lectern_core::BookId::value),
+            latency,
+            samples_ns: samples,
+            passed,
         }
     }
 }
@@ -805,6 +1000,7 @@ struct DesktopBenchmarkResult<'a> {
     idle: IdleResult,
     sort_interactions: SortInteractionsResult<'a>,
     asset_actions: AssetActionsResult<'a>,
+    editor_interactions: EditorInteractionsResult<'a>,
     scrolling: ScrollingResult<'a>,
     memory: MemoryResult,
     final_frame: FinalFrameResult,
@@ -827,6 +1023,8 @@ struct ConfigurationResult {
     scroll_pixels_per_second: f32,
     sort_iterations: usize,
     asset_action_iterations: usize,
+    editor_warmup_iterations: usize,
+    editor_iterations: usize,
 }
 
 impl From<BenchmarkConfig> for ConfigurationResult {
@@ -839,6 +1037,8 @@ impl From<BenchmarkConfig> for ConfigurationResult {
             scroll_pixels_per_second: config.scroll_pixels_per_second,
             sort_iterations: config.sort_iterations,
             asset_action_iterations: config.asset_action_iterations,
+            editor_warmup_iterations: config.editor_warmup_iterations,
+            editor_iterations: config.editor_iterations,
         }
     }
 }
@@ -891,6 +1091,18 @@ struct AssetActionsResult<'a> {
 #[derive(Serialize)]
 struct AssetActionScenario<'a> {
     name: &'static str,
+    latency: Option<SampleSummary>,
+    samples_ns: &'a [u64],
+    passed: bool,
+}
+
+#[derive(Serialize)]
+struct EditorInteractionsResult<'a> {
+    endpoint: &'static str,
+    warmup_iterations: usize,
+    measured_iterations: usize,
+    max_p95_ns: u64,
+    book_id: Option<i64>,
     latency: Option<SampleSummary>,
     samples_ns: &'a [u64],
     passed: bool,
@@ -1094,6 +1306,10 @@ fn seconds_f32_ns(seconds: f32) -> Option<u64> {
     elapsed_ns(Duration::from_secs_f32(seconds))
 }
 
+fn milliseconds(nanoseconds: u64) -> f64 {
+    Duration::from_nanos(nanoseconds).as_secs_f64() * 1_000.0
+}
+
 fn elapsed_ns(duration: Duration) -> Option<u64> {
     u64::try_from(duration.as_nanos()).ok()
 }
@@ -1196,6 +1412,8 @@ mod tests {
             scroll_pixels_per_second: 1_500.0,
             sort_iterations: 40,
             asset_action_iterations: 40,
+            editor_warmup_iterations: 10,
+            editor_iterations: 40,
         };
         let result = ScrollingResult::new(
             config,

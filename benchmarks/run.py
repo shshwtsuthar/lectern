@@ -99,6 +99,8 @@ def parse_arguments(arguments: list[str]) -> argparse.Namespace:
     parser.add_argument("--scroll-pixels-per-second", type=positive_float, default=1_500.0)
     parser.add_argument("--sort-iterations", type=non_negative_int, default=40)
     parser.add_argument("--asset-action-iterations", type=non_negative_int, default=40)
+    parser.add_argument("--editor-warmup-iterations", type=non_negative_int, default=10)
+    parser.add_argument("--editor-iterations", type=non_negative_int, default=40)
     parser.add_argument("--timeout-seconds", type=positive_float, default=180.0)
     parser.add_argument("--minimum-free-gib", type=positive_float, default=40.0)
     parser.add_argument("--maximum-corpus-gib", type=positive_float, default=20.0)
@@ -124,6 +126,8 @@ def parse_arguments(arguments: list[str]) -> argparse.Namespace:
         parsed.scroll_warmup_seconds = 0.2
         parsed.sort_iterations = min(parsed.sort_iterations, 3)
         parsed.asset_action_iterations = min(parsed.asset_action_iterations, 3)
+        parsed.editor_warmup_iterations = min(parsed.editor_warmup_iterations, 1)
+        parsed.editor_iterations = min(parsed.editor_iterations, 3)
         parsed.timeout_seconds = max(parsed.timeout_seconds, 15.0)
     return parsed
 
@@ -252,10 +256,12 @@ def main(arguments: list[str]) -> int:
                 scroll_pixels_per_second=options.scroll_pixels_per_second,
                 sort_iterations=0,
                 asset_action_iterations=0,
+                editor_warmup_iterations=0,
+                editor_iterations=0,
                 timeout_seconds=options.timeout_seconds,
             )
             startup_results.append(
-                read_completed_desktop_result(result_path, options.books, 0, 0)
+                read_completed_desktop_result(result_path, options.books, 0, 0, 0, 0)
             )
 
         scroll_path = output / "scrolling.json"
@@ -270,6 +276,8 @@ def main(arguments: list[str]) -> int:
             scroll_pixels_per_second=options.scroll_pixels_per_second,
             sort_iterations=options.sort_iterations,
             asset_action_iterations=options.asset_action_iterations,
+            editor_warmup_iterations=options.editor_warmup_iterations,
+            editor_iterations=options.editor_iterations,
             timeout_seconds=options.timeout_seconds,
         )
         scroll_result = read_completed_desktop_result(
@@ -277,6 +285,8 @@ def main(arguments: list[str]) -> int:
             options.books,
             options.sort_iterations,
             options.asset_action_iterations,
+            options.editor_warmup_iterations,
+            options.editor_iterations,
         )
 
     recorder.run(
@@ -366,6 +376,8 @@ def run_desktop(
     scroll_pixels_per_second: float,
     sort_iterations: int,
     asset_action_iterations: int,
+    editor_warmup_iterations: int,
+    editor_iterations: int,
     timeout_seconds: float,
 ) -> None:
     environment = os.environ.copy()
@@ -379,6 +391,8 @@ def run_desktop(
             "LECTERN_BENCHMARK_SCROLL_PIXELS_PER_SECOND": str(scroll_pixels_per_second),
             "LECTERN_BENCHMARK_SORT_ITERATIONS": str(sort_iterations),
             "LECTERN_BENCHMARK_ASSET_ACTION_ITERATIONS": str(asset_action_iterations),
+            "LECTERN_BENCHMARK_EDITOR_WARMUP_ITERATIONS": str(editor_warmup_iterations),
+            "LECTERN_BENCHMARK_EDITOR_ITERATIONS": str(editor_iterations),
             "LECTERN_BENCHMARK_TIMEOUT_SECONDS": str(timeout_seconds),
             "WGPU_BACKEND": environment.get("WGPU_BACKEND", "vulkan"),
         }
@@ -395,6 +409,8 @@ def read_completed_desktop_result(
     expected_books: int,
     expected_sort_iterations: int,
     expected_asset_action_iterations: int,
+    expected_editor_warmup_iterations: int,
+    expected_editor_iterations: int,
 ) -> dict[str, Any]:
     result = read_json(path)
     if result.get("status") != "completed":
@@ -404,6 +420,8 @@ def read_completed_desktop_result(
         expected_books,
         expected_sort_iterations,
         expected_asset_action_iterations,
+        expected_editor_warmup_iterations,
+        expected_editor_iterations,
     )
     return result
 
@@ -431,6 +449,8 @@ def validate_desktop_result(
     expected_books: int,
     expected_sort_iterations: int = 0,
     expected_asset_action_iterations: int = 0,
+    expected_editor_warmup_iterations: int = 0,
+    expected_editor_iterations: int = 0,
 ) -> None:
     library = object_field(result, "library", "desktop result")
     books = count_field(library, "books", "desktop library")
@@ -446,7 +466,11 @@ def validate_desktop_result(
     )
     if startup_ns == 0:
         raise RuntimeError("desktop startup endpoint must be greater than zero")
-    if expected_sort_iterations == 0 and expected_asset_action_iterations == 0:
+    if (
+        expected_sort_iterations == 0
+        and expected_asset_action_iterations == 0
+        and expected_editor_iterations == 0
+    ):
         return
     interactions = object_field(result, "sort_interactions", "desktop result")
     iterations = count_field(
@@ -482,7 +506,10 @@ def validate_desktop_result(
             raise RuntimeError(
                 f"desktop sort {name} samples must be positive integers"
             )
-        if count_field(scenario, "first_book_id", f"desktop sort {name}") == 0:
+        if (
+            expected_sort_iterations > 0
+            and count_field(scenario, "first_book_id", f"desktop sort {name}") == 0
+        ):
             raise RuntimeError(f"desktop sort {name} first book must be nonzero")
         if scenario.get("passed") is not True:
             raise RuntimeError(f"desktop sort {name} exceeded its p95 budget")
@@ -526,6 +553,39 @@ def validate_desktop_result(
             )
         if scenario.get("passed") is not True:
             raise RuntimeError(f"desktop asset action {name} exceeded its p95 budget")
+
+    editor = object_field(result, "editor_interactions", "desktop result")
+    editor_warmups = count_field(
+        editor, "warmup_iterations", "desktop editor interactions"
+    )
+    if editor_warmups != expected_editor_warmup_iterations:
+        raise RuntimeError(
+            "desktop editor warmup mismatch: "
+            f"got {editor_warmups}, expected {expected_editor_warmup_iterations}"
+        )
+    editor_iterations = count_field(
+        editor, "measured_iterations", "desktop editor interactions"
+    )
+    if editor_iterations != expected_editor_iterations:
+        raise RuntimeError(
+            "desktop editor iteration mismatch: "
+            f"got {editor_iterations}, expected {expected_editor_iterations}"
+        )
+    samples = editor.get("samples_ns")
+    if not isinstance(samples, list) or len(samples) != expected_editor_iterations:
+        raise RuntimeError("desktop editor retained an invalid sample count")
+    if any(
+        isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+        for sample in samples
+    ):
+        raise RuntimeError("desktop editor samples must be positive integers")
+    if (
+        expected_editor_iterations > 0
+        and count_field(editor, "book_id", "desktop editor interactions") == 0
+    ):
+        raise RuntimeError("desktop editor target book must be nonzero")
+    if editor.get("passed") is not True:
+        raise RuntimeError("desktop editor interactions exceeded their p95 budget")
 
 
 def validate_query_result(

@@ -382,7 +382,13 @@ impl LecternApp {
                 WorkerEvent::BookLoaded { id, result } if self.selected == Some(id) => {
                     self.editor_loading = None;
                     match result {
-                        Ok(Some(book)) => self.editor = Some(BookEditor::new(book)),
+                        Ok(Some(book)) => {
+                            let book_id = book.id;
+                            self.editor = Some(BookEditor::new(book));
+                            if let Some(benchmark) = &mut self.benchmark {
+                                benchmark.editor_installed(book_id);
+                            }
+                        }
                         Ok(None) => {
                             "This book is no longer in the library".clone_into(&mut self.status);
                             self.clear_selection();
@@ -608,6 +614,28 @@ impl LecternApp {
             );
             if !queued && let Some(benchmark) = &mut self.benchmark {
                 benchmark.asset_action_dispatch_failed();
+            }
+        }
+    }
+
+    fn apply_benchmark_editor_request(&mut self) {
+        let close_editor = self
+            .benchmark
+            .as_mut()
+            .is_some_and(DesktopBenchmark::take_editor_close_request);
+        if close_editor {
+            self.clear_selection();
+        }
+        let book_id = self
+            .benchmark
+            .as_mut()
+            .and_then(DesktopBenchmark::next_editor_request);
+        if let Some(book_id) = book_id {
+            self.select_book(book_id);
+            if self.editor_loading != Some(book_id)
+                && let Some(benchmark) = &mut self.benchmark
+            {
+                benchmark.editor_dispatch_failed();
             }
         }
     }
@@ -1981,6 +2009,7 @@ impl eframe::App for LecternApp {
         self.poll_workers(ui.ctx());
         self.apply_benchmark_sort_request();
         self.apply_benchmark_asset_action_request();
+        self.apply_benchmark_editor_request();
         self.accept_dropped_files(ui);
         let files_hovering = ui.input(|input| !input.raw.hovered_files.is_empty());
 
