@@ -49,6 +49,7 @@ struct MetadataActions {
     save: bool,
     reset: bool,
     relink: Option<(AssetId, BookFormat)>,
+    detach: Option<AssetDetachConfirmation>,
     attach: Option<BookFormat>,
     remove: bool,
 }
@@ -72,12 +73,25 @@ struct AssetMaintenanceUi {
     show_report: bool,
     attaching_format: Option<BookFormat>,
     relinking_asset: Option<AssetId>,
+    detaching_asset: Option<AssetId>,
+    detach_confirmation: Option<AssetDetachConfirmation>,
 }
 
 impl AssetMaintenanceUi {
     fn busy(&self) -> bool {
-        self.scanning || self.attaching_format.is_some() || self.relinking_asset.is_some()
+        self.scanning
+            || self.attaching_format.is_some()
+            || self.relinking_asset.is_some()
+            || self.detaching_asset.is_some()
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssetDetachConfirmation {
+    book_id: BookId,
+    asset_id: AssetId,
+    format: BookFormat,
+    path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -314,6 +328,9 @@ impl LecternApp {
                     format,
                     result,
                 } => self.asset_attached(book_id, format, result),
+                WorkerEvent::AssetDetached { asset_id, result } => {
+                    self.asset_detached(asset_id, result);
+                }
                 WorkerEvent::AssetRelinked {
                     book_id,
                     asset_id,
@@ -505,6 +522,39 @@ impl LecternApp {
                 self.status = format!("Could not relink book file: {error}");
                 if let Some(editor) = &mut self.editor
                     && editor.original.id == book_id
+                {
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn asset_detached(&mut self, asset_id: AssetId, result: Result<BookId, String>) {
+        if self.asset_maintenance.detaching_asset == Some(asset_id) {
+            self.asset_maintenance.detaching_asset = None;
+        }
+        match result {
+            Ok(book_id) => {
+                "Detached file from book; the file was kept on disk".clone_into(&mut self.status);
+                if let Some(editor) = &mut self.editor
+                    && editor.original.id == book_id
+                {
+                    editor.original.assets.retain(|asset| asset.id != asset_id);
+                    editor.error = None;
+                }
+                self.refresh_library();
+                if self.selected == Some(book_id) {
+                    self.reload_selected_book_after_asset_change();
+                }
+            }
+            Err(error) => {
+                self.status = format!("Could not detach book file: {error}");
+                if let Some(editor) = &mut self.editor
+                    && editor
+                        .original
+                        .assets
+                        .iter()
+                        .any(|asset| asset.id == asset_id)
                 {
                     editor.error = Some(error);
                 }
@@ -870,6 +920,7 @@ impl LecternApp {
 
     fn select_book(&mut self, id: BookId) {
         self.book_removal.confirmation = None;
+        self.asset_maintenance.detach_confirmation = None;
         self.selected = Some(id);
         self.editor = None;
         if self.workers.load_book(id) {
@@ -882,6 +933,7 @@ impl LecternApp {
 
     fn clear_selection(&mut self) {
         self.book_removal.confirmation = None;
+        self.asset_maintenance.detach_confirmation = None;
         self.selected = None;
         self.editor_loading = None;
         self.editor = None;
@@ -905,6 +957,7 @@ impl LecternApp {
         let mut reset = false;
         let mut save = false;
         let mut relink = None;
+        let mut detach = None;
         let mut attach = None;
         let mut remove = false;
         let removal_busy = self.book_removal.removing.is_some();
@@ -943,6 +996,7 @@ impl LecternApp {
                     ui,
                     editor,
                     self.asset_maintenance.relinking_asset,
+                    self.asset_maintenance.detaching_asset,
                     self.asset_maintenance.attaching_format,
                     removal_busy,
                     library_operation_busy,
@@ -950,6 +1004,7 @@ impl LecternApp {
                 save = actions.save;
                 reset = actions.reset;
                 relink = actions.relink;
+                detach = actions.detach;
                 attach = actions.attach;
                 remove = actions.remove;
             });
@@ -972,6 +1027,8 @@ impl LecternApp {
             self.save_editor();
         } else if let Some((asset_id, format)) = relink {
             self.choose_asset_replacement(asset_id, format);
+        } else if let Some(confirmation) = detach {
+            self.asset_maintenance.detach_confirmation = Some(confirmation);
         } else if let Some(format) = attach {
             self.choose_format_attachment(format);
         } else if remove {
@@ -1028,6 +1085,68 @@ impl LecternApp {
             self.start_book_removal(confirmation);
         } else if cancel || should_close {
             self.book_removal.confirmation = None;
+        }
+    }
+
+    fn asset_detach_confirmation_window(&mut self, context: &egui::Context) {
+        let Some(confirmation) = self.asset_maintenance.detach_confirmation.clone() else {
+            return;
+        };
+        let response =
+            egui::Modal::new(egui::Id::new("asset-detach-confirmation")).show(context, |ui| {
+                ui.set_max_width(470.0);
+                ui.heading(format!("Detach {} file?", confirmation.format));
+                ui.add_space(6.0);
+                ui.label("Detach this file from the book?");
+                ui.label(
+                    RichText::new(confirmation.path.display().to_string())
+                        .monospace()
+                        .color(MUTED),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "The file will remain on disk. Lectern will only remove this relationship.",
+                    )
+                    .color(MUTED),
+                );
+                ui.add_space(14.0);
+                let mut confirm = false;
+                let mut cancel = false;
+                ui.horizontal(|ui| {
+                    confirm = ui
+                        .button(RichText::new("Detach from book").color(Color32::LIGHT_RED))
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+                (confirm, cancel)
+            });
+        let should_close = response.should_close();
+        let (confirm, cancel) = response.inner;
+        if confirm {
+            self.start_asset_detach(&confirmation);
+        } else if cancel || should_close {
+            self.asset_maintenance.detach_confirmation = None;
+        }
+    }
+
+    fn start_asset_detach(&mut self, confirmation: &AssetDetachConfirmation) {
+        self.asset_maintenance.detach_confirmation = None;
+        if self.importing
+            || self.asset_maintenance.busy()
+            || self.book_removal.removing.is_some()
+            || self.selected != Some(confirmation.book_id)
+        {
+            return;
+        }
+        if self.workers.detach_asset(confirmation.asset_id) {
+            self.asset_maintenance.detaching_asset = Some(confirmation.asset_id);
+            if let Some(editor) = &mut self.editor {
+                editor.error = None;
+            }
+            self.status = format!("Detaching {} file…", confirmation.format);
+        } else {
+            "Library maintenance worker is unavailable".clone_into(&mut self.status);
         }
     }
 
@@ -1367,6 +1486,7 @@ impl eframe::App for LecternApp {
             .show(ui, |ui| self.library(ui));
         self.import_summary_window(ui.ctx());
         self.asset_health_report_window(ui.ctx());
+        self.asset_detach_confirmation_window(ui.ctx());
         self.book_removal_confirmation_window(ui.ctx());
 
         if files_hovering {
@@ -1488,6 +1608,7 @@ fn metadata_form(
     ui: &mut egui::Ui,
     editor: &mut BookEditor,
     relinking_asset: Option<AssetId>,
+    detaching_asset: Option<AssetId>,
     attaching_format: Option<BookFormat>,
     removal_busy: bool,
     library_operation_busy: bool,
@@ -1517,56 +1638,14 @@ fn metadata_form(
 
             ui.add_space(8.0);
             ui.label(RichText::new("Files").strong());
-            for asset in &editor.original.assets {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("{} · {}", asset.format, asset.storage))
-                            .color(MUTED)
-                            .size(12.0),
-                    );
-                    let health_color = match asset.health {
-                        AssetHealth::Available => Color32::LIGHT_GREEN,
-                        AssetHealth::Missing | AssetHealth::Unreadable => Color32::LIGHT_RED,
-                        AssetHealth::Unknown => MUTED,
-                    };
-                    ui.label(
-                        RichText::new(asset.health.to_string())
-                            .color(health_color)
-                            .size(12.0),
-                    );
-                    if asset.storage == lectern_core::AssetStorage::Reference
-                        && asset.health.has_issue()
-                    {
-                        let button = if relinking_asset == Some(asset.id) {
-                            egui::Button::new("Relinking…")
-                        } else {
-                            egui::Button::new("Relink…")
-                        };
-                        if ui
-                            .add_enabled(
-                                relinking_asset.is_none()
-                                    && !library_operation_busy
-                                    && !removal_busy,
-                                button,
-                            )
-                            .clicked()
-                        {
-                            actions.relink = Some((asset.id, asset.format));
-                        }
-                    }
-                });
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(asset.path.display().to_string())
-                            .monospace()
-                            .color(MUTED)
-                            .size(11.0),
-                    )
-                    .wrap()
-                    .selectable(true),
-                );
-                ui.add_space(4.0);
-            }
+            asset_rows(
+                ui,
+                &editor.original,
+                relinking_asset,
+                detaching_asset,
+                !editor.saving && !library_operation_busy && !removal_busy,
+                &mut actions,
+            );
             actions.attach = format_attachment_controls(
                 ui,
                 editor,
@@ -1593,6 +1672,80 @@ fn metadata_form(
             );
         });
     actions
+}
+
+fn asset_rows(
+    ui: &mut egui::Ui,
+    book: &Book,
+    relinking_asset: Option<AssetId>,
+    detaching_asset: Option<AssetId>,
+    action_enabled: bool,
+    actions: &mut MetadataActions,
+) {
+    for asset in &book.assets {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{} · {}", asset.format, asset.storage))
+                    .color(MUTED)
+                    .size(12.0),
+            );
+            let health_color = match asset.health {
+                AssetHealth::Available => Color32::LIGHT_GREEN,
+                AssetHealth::Missing | AssetHealth::Unreadable => Color32::LIGHT_RED,
+                AssetHealth::Unknown => MUTED,
+            };
+            ui.label(
+                RichText::new(asset.health.to_string())
+                    .color(health_color)
+                    .size(12.0),
+            );
+            let menu_text = if detaching_asset == Some(asset.id) {
+                "Detaching…"
+            } else {
+                "File actions"
+            };
+            ui.add_enabled_ui(
+                action_enabled && relinking_asset.is_none() && detaching_asset.is_none(),
+                |ui| {
+                    ui.menu_button(menu_text, |ui| {
+                        if asset.storage == lectern_core::AssetStorage::Reference
+                            && asset.health.has_issue()
+                            && ui.button("Relink").clicked()
+                        {
+                            actions.relink = Some((asset.id, asset.format));
+                            ui.close();
+                        }
+                        let detach = ui
+                            .add_enabled(
+                                book.assets.len() > 1,
+                                egui::Button::new("Detach from book"),
+                            )
+                            .on_disabled_hover_text("A logical book must retain at least one file");
+                        if detach.clicked() {
+                            actions.detach = Some(AssetDetachConfirmation {
+                                book_id: book.id,
+                                asset_id: asset.id,
+                                format: asset.format,
+                                path: asset.path.clone(),
+                            });
+                            ui.close();
+                        }
+                    });
+                },
+            );
+        });
+        ui.add(
+            egui::Label::new(
+                RichText::new(asset.path.display().to_string())
+                    .monospace()
+                    .color(MUTED)
+                    .size(11.0),
+            )
+            .wrap()
+            .selectable(true),
+        );
+        ui.add_space(4.0);
+    }
 }
 
 fn format_attachment_controls(

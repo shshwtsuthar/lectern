@@ -56,6 +56,9 @@ enum AssetMaintenanceRequest {
         format: BookFormat,
         path: PathBuf,
     },
+    Detach {
+        asset_id: AssetId,
+    },
     Relink {
         book_id: BookId,
         asset_id: AssetId,
@@ -103,6 +106,10 @@ pub(crate) enum WorkerEvent {
         book_id: BookId,
         format: BookFormat,
         result: Result<(), String>,
+    },
+    AssetDetached {
+        asset_id: AssetId,
+        result: Result<BookId, String>,
     },
     AssetRelinked {
         book_id: BookId,
@@ -231,6 +238,12 @@ impl WorkerSet {
                 format,
                 path,
             })
+            .is_ok()
+    }
+
+    pub(crate) fn detach_asset(&self, asset_id: AssetId) -> bool {
+        self.asset_maintenance_sender
+            .try_send(AssetMaintenanceRequest::Detach { asset_id })
             .is_ok()
     }
 
@@ -383,6 +396,16 @@ fn asset_maintenance_worker(
                     },
                 )
             }
+            AssetMaintenanceRequest::Detach { asset_id } => publish(
+                events,
+                context,
+                WorkerEvent::AssetDetached {
+                    asset_id,
+                    result: database
+                        .detach_asset(asset_id)
+                        .map_err(|error| error.to_string()),
+                },
+            ),
             AssetMaintenanceRequest::Relink {
                 book_id,
                 asset_id,
