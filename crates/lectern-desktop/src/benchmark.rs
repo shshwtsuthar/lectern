@@ -95,8 +95,9 @@ pub(crate) struct DesktopBenchmark {
     observed_scroll_duration_ns: Option<u64>,
     ready_rss_bytes: Option<u64>,
     idle_end_rss_bytes: Option<u64>,
-    library_books: usize,
-    books_with_covers: usize,
+    library_books: u64,
+    initial_page_books: usize,
+    initial_page_books_with_covers: usize,
     frame_intervals_ns: Vec<u64>,
     egui_frame_intervals_ns: Vec<u64>,
     cpu_frame_times_ns: Vec<u64>,
@@ -124,7 +125,8 @@ impl DesktopBenchmark {
             ready_rss_bytes: None,
             idle_end_rss_bytes: None,
             library_books: 0,
-            books_with_covers: 0,
+            initial_page_books: 0,
+            initial_page_books_with_covers: 0,
             frame_intervals_ns: Vec::new(),
             egui_frame_intervals_ns: Vec::new(),
             cpu_frame_times_ns: Vec::new(),
@@ -132,18 +134,19 @@ impl DesktopBenchmark {
         }))
     }
 
-    pub(crate) fn library_installed(&mut self, books: &[BookSummary]) {
+    pub(crate) fn library_installed(&mut self, total: u64, books: &[BookSummary]) {
         let Phase::Startup {
             paint_frames_remaining,
         } = &mut self.phase
         else {
             return;
         };
-        if books.is_empty() || paint_frames_remaining.is_some() {
+        if total == 0 || books.is_empty() || paint_frames_remaining.is_some() {
             return;
         }
-        self.library_books = books.len();
-        self.books_with_covers = books.iter().filter(|book| book.has_cover).count();
+        self.library_books = total;
+        self.initial_page_books = books.len();
+        self.initial_page_books_with_covers = books.iter().filter(|book| book.has_cover).count();
         self.main_entry_to_query_installed_ns = elapsed_ns(self.main_entry.elapsed());
         *paint_frames_remaining = Some(1);
     }
@@ -295,7 +298,8 @@ impl DesktopBenchmark {
             configuration: ConfigurationResult::from(self.config),
             library: LibraryResult {
                 books: self.library_books,
-                books_with_covers: self.books_with_covers,
+                initial_page_books: self.initial_page_books,
+                initial_page_books_with_covers: self.initial_page_books_with_covers,
             },
             startup: self
                 .main_entry_to_populated_library_ns
@@ -433,8 +437,9 @@ impl From<BenchmarkConfig> for ConfigurationResult {
 
 #[derive(Serialize)]
 struct LibraryResult {
-    books: usize,
-    books_with_covers: usize,
+    books: u64,
+    initial_page_books: usize,
+    initial_page_books_with_covers: usize,
 }
 
 #[derive(Serialize)]

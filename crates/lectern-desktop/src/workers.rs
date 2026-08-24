@@ -14,6 +14,7 @@ use lectern_import::{ImportProgress, ImportSummary, import_paths, validate_publi
 use lectern_storage::LibraryDatabase;
 
 const COVER_QUEUE_CAPACITY: usize = 128;
+const QUERY_QUEUE_CAPACITY: usize = 1;
 const MIN_COVER_WORKERS: usize = 2;
 const MAX_COVER_WORKERS: usize = 4;
 const MAX_STORED_COVER_DIMENSION: u32 = 1_024;
@@ -22,6 +23,20 @@ const MAX_STORED_COVER_ALLOCATION: u64 = 16 * 1024 * 1024;
 pub(crate) struct QueryRequest {
     pub(crate) generation: u64,
     pub(crate) query: LibraryQuery,
+    pub(crate) offset: u64,
+    pub(crate) limit: u32,
+    pub(crate) include_total: bool,
+}
+
+pub(crate) struct QueryResult {
+    pub(crate) total: Option<u64>,
+    pub(crate) books: Vec<BookSummary>,
+}
+
+pub(crate) enum QueryQueueResult {
+    Queued,
+    Full,
+    Disconnected,
 }
 
 pub(crate) struct ImportRequest {
@@ -51,7 +66,12 @@ pub(crate) struct DecodedCover {
 pub(crate) enum WorkerEvent {
     QueryFinished {
         generation: u64,
-        result: Result<Vec<BookSummary>, String>,
+        offset: u64,
+        result: Result<QueryResult, String>,
+    },
+    QueryDiscarded {
+        generation: u64,
+        offset: u64,
     },
     CoverFinished {
         id: BookId,
@@ -87,7 +107,7 @@ pub(crate) struct WorkerSet {
 
 impl WorkerSet {
     pub(crate) fn spawn(database_path: &Path, context: &egui::Context) -> Self {
-        let (query_sender, query_receiver) = unbounded();
+        let (query_sender, query_receiver) = bounded(QUERY_QUEUE_CAPACITY);
         let (cover_sender, cover_receiver) = bounded(COVER_QUEUE_CAPACITY);
         let (import_sender, import_receiver) = bounded(1);
         let (metadata_sender, metadata_receiver) = unbounded();
@@ -142,8 +162,12 @@ impl WorkerSet {
         }
     }
 
-    pub(crate) fn query(&self, request: QueryRequest) -> bool {
-        self.query_sender.send(request).is_ok()
+    pub(crate) fn query(&self, request: QueryRequest) -> QueryQueueResult {
+        match self.query_sender.try_send(request) {
+            Ok(()) => QueryQueueResult::Queued,
+            Err(TrySendError::Full(_)) => QueryQueueResult::Full,
+            Err(TrySendError::Disconnected(_)) => QueryQueueResult::Disconnected,
+        }
     }
 
     pub(crate) fn load_cover(&self, id: BookId) -> bool {
@@ -384,7 +408,7 @@ fn query_worker(
     events: &Sender<WorkerEvent>,
     context: &egui::Context,
 ) {
-    let database = match LibraryDatabase::open(database_path) {
+    let mut database = match LibraryDatabase::open(database_path) {
         Ok(database) => database,
         Err(error) => {
             publish(events, context, WorkerEvent::Error(error.to_string()));
@@ -394,16 +418,39 @@ fn query_worker(
 
     while let Ok(mut request) = receiver.recv() {
         while let Ok(newer) = receiver.try_recv() {
+            if newer.generation == request.generation
+                && !publish(
+                    events,
+                    context,
+                    WorkerEvent::QueryDiscarded {
+                        generation: request.generation,
+                        offset: request.offset,
+                    },
+                )
+            {
+                return;
+            }
             request = newer;
         }
-        let result = database
-            .query(&request.query)
-            .map_err(|error| error.to_string());
+        let result = if request.include_total {
+            database
+                .query_page(&request.query, request.offset, request.limit)
+                .map(|page| QueryResult {
+                    total: Some(page.total),
+                    books: page.books,
+                })
+        } else {
+            database
+                .query_window(&request.query, request.offset, request.limit)
+                .map(|books| QueryResult { total: None, books })
+        }
+        .map_err(|error| error.to_string());
         if !publish(
             events,
             context,
             WorkerEvent::QueryFinished {
                 generation: request.generation,
+                offset: request.offset,
                 result,
             },
         ) {

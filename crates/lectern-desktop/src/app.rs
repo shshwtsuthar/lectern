@@ -14,7 +14,9 @@ use lectern_storage::LibraryDatabase;
 
 use crate::{
     benchmark::{BenchmarkFrame, DesktopBenchmark},
-    workers::{DecodedCover, ImportRequest, QueryRequest, WorkerEvent, WorkerSet},
+    workers::{
+        DecodedCover, ImportRequest, QueryQueueResult, QueryRequest, WorkerEvent, WorkerSet,
+    },
 };
 
 const BACKGROUND: Color32 = Color32::from_rgb(18, 20, 24);
@@ -29,9 +31,16 @@ const CARD_HEIGHT: f32 = 286.0;
 const CARD_GAP: f32 = 14.0;
 const COVER_SIZE: Vec2 = Vec2::new(142.0, 206.0);
 const MAX_CACHED_COVERS: usize = 256;
+const QUERY_PAGE_SIZE: usize = 128;
+const MAX_CACHED_QUERY_PAGES: usize = 6;
 
 struct CachedCover {
     texture: egui::TextureHandle,
+    last_used: u64,
+}
+
+struct CachedPage {
+    books: Vec<BookSummary>,
     last_used: u64,
 }
 
@@ -98,7 +107,9 @@ pub(crate) struct LecternApp {
     query: LibraryQuery,
     query_generation: u64,
     query_pending: bool,
-    books: Vec<BookSummary>,
+    library_total: Option<usize>,
+    pages: HashMap<usize, CachedPage>,
+    pending_pages: HashSet<usize>,
     selected: Option<BookId>,
     pending_covers: HashSet<BookId>,
     missing_covers: HashSet<BookId>,
@@ -133,7 +144,9 @@ impl LecternApp {
             query: LibraryQuery::default(),
             query_generation: 0,
             query_pending: false,
-            books: Vec::new(),
+            library_total: None,
+            pages: HashMap::new(),
+            pending_pages: HashSet::new(),
             selected: None,
             pending_covers: HashSet::new(),
             missing_covers: HashSet::new(),
@@ -155,40 +168,60 @@ impl LecternApp {
 
     fn refresh_library(&mut self) {
         self.query_generation = self.query_generation.wrapping_add(1);
-        self.query_pending = self.workers.query(QueryRequest {
+        self.query_pending = false;
+        self.library_total = None;
+        self.pages.clear();
+        self.pending_pages.clear();
+        self.request_page(0);
+    }
+
+    fn request_page(&mut self, offset: usize) {
+        if self.pages.contains_key(&offset) || self.pending_pages.contains(&offset) {
+            return;
+        }
+        let include_total = self.library_total.is_none();
+        let page_offset = offset;
+        let Ok(offset) = u64::try_from(offset) else {
+            "Library result offset exceeds this platform's supported range"
+                .clone_into(&mut self.status);
+            return;
+        };
+        let request = QueryRequest {
             generation: self.query_generation,
             query: self.query.clone(),
-        });
-        if !self.query_pending {
-            "Library query worker is unavailable".clone_into(&mut self.status);
+            offset,
+            limit: u32::try_from(QUERY_PAGE_SIZE).expect("page size fits u32"),
+            include_total,
+        };
+        match self.workers.query(request) {
+            QueryQueueResult::Queued => {
+                self.pending_pages.insert(page_offset);
+                self.query_pending |= include_total;
+            }
+            QueryQueueResult::Full => {
+                self.query_pending |= include_total;
+            }
+            QueryQueueResult::Disconnected if include_total => {
+                "Library query worker is unavailable".clone_into(&mut self.status);
+            }
+            QueryQueueResult::Disconnected => {}
         }
     }
 
     fn poll_workers(&mut self, context: &egui::Context) {
         while let Some(event) = self.workers.next_event() {
             match event {
-                WorkerEvent::QueryFinished { generation, result }
+                WorkerEvent::QueryFinished {
+                    generation,
+                    offset,
+                    result,
+                } if generation == self.query_generation => {
+                    self.query_finished(offset, result);
+                }
+                WorkerEvent::QueryDiscarded { generation, offset }
                     if generation == self.query_generation =>
                 {
-                    self.query_pending = false;
-                    match result {
-                        Ok(books) => {
-                            let recovered = self.status.starts_with("Library query failed:");
-                            self.books = books;
-                            if let Some(benchmark) = &mut self.benchmark {
-                                benchmark.library_installed(&self.books);
-                            }
-                            if self.selected.is_some_and(|selected| {
-                                !self.books.iter().any(|book| book.id == selected)
-                            }) {
-                                self.clear_selection();
-                            }
-                            if recovered {
-                                "Library ready".clone_into(&mut self.status);
-                            }
-                        }
-                        Err(error) => self.status = format!("Library query failed: {error}"),
-                    }
+                    self.query_discarded(offset);
                 }
                 WorkerEvent::CoverFinished { id, result } => {
                     self.pending_covers.remove(&id);
@@ -246,11 +279,71 @@ impl LecternApp {
                     asset_id,
                     result,
                 } => self.asset_relinked(book_id, asset_id, result),
-                WorkerEvent::QueryFinished { .. } | WorkerEvent::BookLoaded { .. } => {}
+                WorkerEvent::QueryFinished { .. }
+                | WorkerEvent::QueryDiscarded { .. }
+                | WorkerEvent::BookLoaded { .. } => {}
                 WorkerEvent::Error(error) => self.status = format!("Background worker: {error}"),
             }
         }
+        self.retry_initial_page_if_needed();
         self.evict_covers();
+    }
+
+    fn retry_initial_page_if_needed(&mut self) {
+        if self.query_pending && self.library_total.is_none() && self.pending_pages.is_empty() {
+            self.request_page(0);
+        }
+    }
+
+    fn query_finished(&mut self, offset: u64, result: Result<crate::workers::QueryResult, String>) {
+        let Ok(offset) = usize::try_from(offset) else {
+            "Library result offset exceeds this platform's supported range"
+                .clone_into(&mut self.status);
+            return;
+        };
+        self.pending_pages.remove(&offset);
+        match result {
+            Ok(result) => {
+                let recovered = self.status.starts_with("Library query failed:");
+                if let Some(total) = result.total {
+                    let Ok(total_as_usize) = usize::try_from(total) else {
+                        "Library is too large for this platform".clone_into(&mut self.status);
+                        self.pages.clear();
+                        self.library_total = None;
+                        self.query_pending = false;
+                        return;
+                    };
+                    self.library_total = Some(total_as_usize);
+                    if let Some(benchmark) = &mut self.benchmark {
+                        benchmark.library_installed(total, &result.books);
+                    }
+                }
+                self.pages.insert(
+                    offset,
+                    CachedPage {
+                        books: result.books,
+                        last_used: self.frame_number,
+                    },
+                );
+                self.evict_pages();
+                if recovered {
+                    "Library ready".clone_into(&mut self.status);
+                }
+                self.query_pending =
+                    self.library_total.is_none() || self.pending_pages.contains(&0);
+            }
+            Err(error) => {
+                self.query_pending = false;
+                self.status = format!("Library query failed: {error}");
+            }
+        }
+    }
+
+    fn query_discarded(&mut self, offset: u64) {
+        if let Ok(offset) = usize::try_from(offset) {
+            self.pending_pages.remove(&offset);
+        }
+        self.query_pending = self.library_total.is_none() || self.pending_pages.contains(&0);
     }
 
     fn book_saved(&mut self, book: Book, result: Result<(), String>) {
@@ -343,6 +436,38 @@ impl LecternApp {
         }
     }
 
+    fn evict_pages(&mut self) {
+        if self.pages.len() <= MAX_CACHED_QUERY_PAGES {
+            return;
+        }
+        let excess = self.pages.len() - MAX_CACHED_QUERY_PAGES;
+        let mut oldest = self
+            .pages
+            .iter()
+            .map(|(offset, page)| (*offset, page.last_used))
+            .collect::<Vec<_>>();
+        oldest.sort_unstable_by_key(|(_, last_used)| *last_used);
+        for (offset, _) in oldest.into_iter().take(excess) {
+            self.pages.remove(&offset);
+        }
+    }
+
+    fn book_at(&mut self, index: usize) -> Option<BookSummary> {
+        let offset = query_page_offset(index);
+        if let Some(page) = self.pages.get_mut(&offset) {
+            page.last_used = self.frame_number;
+            return page.books.get(index - offset).cloned();
+        }
+        self.request_page(offset);
+        None
+    }
+
+    fn request_visible_range(&mut self, start: usize, end: usize) {
+        for index in start..end.min(self.library_total.unwrap_or_default()) {
+            self.request_page(query_page_offset(index));
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let (add_books, add_folder, rescan_files) = self.toolbar_actions(ui);
         if add_books
@@ -420,7 +545,7 @@ impl LecternApp {
         ui.horizontal(|ui| {
             ui.heading(RichText::new("Lectern").size(26.0).strong());
             ui.label(
-                RichText::new(format!("{} books", self.books.len()))
+                RichText::new(format!("{} books", self.library_total.unwrap_or_default()))
                     .color(MUTED)
                     .size(13.0),
             );
@@ -772,7 +897,7 @@ impl LecternApp {
     }
 
     fn library(&mut self, ui: &mut egui::Ui) {
-        if self.query_pending && self.books.is_empty() {
+        if self.query_pending && self.library_total.is_none() {
             centered_message(
                 ui,
                 "Opening your library…",
@@ -781,7 +906,8 @@ impl LecternApp {
             );
             return;
         }
-        if self.books.is_empty() {
+        let book_count = self.library_total.unwrap_or_default();
+        if book_count == 0 {
             if self.query.search.trim().is_empty() {
                 centered_message(
                     ui,
@@ -801,7 +927,7 @@ impl LecternApp {
         }
 
         let columns = column_count(ui.available_width());
-        let row_count = self.books.len().div_ceil(columns);
+        let row_count = book_count.div_ceil(columns);
         let mut scroll_area = egui::ScrollArea::vertical()
             .id_salt("library-grid")
             .auto_shrink([false, false]);
@@ -813,18 +939,28 @@ impl LecternApp {
             scroll_area = scroll_area.vertical_scroll_offset(offset);
         }
         scroll_area.show_rows(ui, CARD_HEIGHT, row_count, |ui, visible_rows| {
+            self.request_visible_range(
+                visible_rows.start.saturating_mul(columns),
+                visible_rows.end.saturating_mul(columns),
+            );
             for row in visible_rows {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = CARD_GAP;
                     for column in 0..columns {
                         let index = row * columns + column;
-                        let Some(book) = self.books.get(index).cloned() else {
+                        if index >= book_count {
                             break;
-                        };
+                        }
                         ui.allocate_ui_with_layout(
                             Vec2::new(CARD_WIDTH, CARD_HEIGHT),
                             egui::Layout::top_down(Align::Center),
-                            |ui| self.book_card(ui, &book),
+                            |ui| {
+                                if let Some(book) = self.book_at(index) {
+                                    self.book_card(ui, &book);
+                                } else {
+                                    Self::loading_book_card(ui);
+                                }
+                            },
                         );
                     }
                 });
@@ -884,6 +1020,23 @@ impl LecternApp {
                 StrokeKind::Inside,
             );
         }
+    }
+
+    fn loading_book_card(ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(CARD)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(10)
+            .inner_margin(10)
+            .show(ui, |ui| {
+                ui.set_min_size(Vec2::new(CARD_WIDTH - 22.0, CARD_HEIGHT - 22.0));
+                ui.add_space((CARD_HEIGHT - COVER_SIZE.y) * 0.5);
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Loading book…").color(MUTED).size(12.0));
+                });
+            });
     }
 
     fn cover(&mut self, ui: &mut egui::Ui, book: &BookSummary) {
@@ -1042,6 +1195,10 @@ fn column_count(available_width: f32) -> usize {
     columns
 }
 
+const fn query_page_offset(index: usize) -> usize {
+    index / QUERY_PAGE_SIZE * QUERY_PAGE_SIZE
+}
+
 fn centered_message(ui: &mut egui::Ui, title: &str, detail: &str, spinner: bool) {
     ui.centered_and_justified(|ui| {
         ui.vertical_centered(|ui| {
@@ -1190,7 +1347,8 @@ mod tests {
     use lectern_import::ImportProgress;
 
     use super::{
-        BookEditor, CARD_GAP, CARD_WIDTH, asset_health_status, column_count, import_status,
+        BookEditor, CARD_GAP, CARD_WIDTH, QUERY_PAGE_SIZE, asset_health_status, column_count,
+        import_status, query_page_offset,
     };
 
     #[test]
@@ -1203,6 +1361,14 @@ mod tests {
     fn grid_adds_only_complete_columns() {
         assert_eq!(column_count(CARD_WIDTH * 2.0 + CARD_GAP - 1.0), 1);
         assert_eq!(column_count(CARD_WIDTH * 2.0 + CARD_GAP), 2);
+    }
+
+    #[test]
+    fn query_pages_align_result_indices_to_fixed_windows() {
+        assert_eq!(query_page_offset(0), 0);
+        assert_eq!(query_page_offset(QUERY_PAGE_SIZE - 1), 0);
+        assert_eq!(query_page_offset(QUERY_PAGE_SIZE), QUERY_PAGE_SIZE);
+        assert_eq!(query_page_offset(QUERY_PAGE_SIZE + 17), QUERY_PAGE_SIZE);
     }
 
     #[test]
