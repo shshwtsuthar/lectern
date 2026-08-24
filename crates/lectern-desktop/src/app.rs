@@ -355,7 +355,7 @@ impl LecternApp {
                     };
                     self.library_total = Some(total_as_usize);
                     if let Some(benchmark) = &mut self.benchmark {
-                        benchmark.library_installed(total, &result.books);
+                        benchmark.library_installed(total, &result.books, self.query.sort);
                     }
                 }
                 self.pages.insert(
@@ -376,6 +376,18 @@ impl LecternApp {
                 self.query_pending = false;
                 self.status = format!("Library query failed: {error}");
             }
+        }
+    }
+
+    fn apply_benchmark_sort_request(&mut self) {
+        let sort = self
+            .benchmark
+            .as_mut()
+            .and_then(DesktopBenchmark::next_sort_request);
+        if let Some(sort) = sort {
+            debug_assert_ne!(self.query.sort, sort);
+            self.query.sort = sort;
+            self.refresh_library();
         }
     }
 
@@ -1325,6 +1337,7 @@ impl eframe::App for LecternApp {
             benchmark.frame_started(frame.info().cpu_usage, unstable_dt);
         }
         self.poll_workers(ui.ctx());
+        self.apply_benchmark_sort_request();
         self.accept_dropped_files(ui);
         let files_hovering = ui.input(|input| !input.raw.hovered_files.is_empty());
 

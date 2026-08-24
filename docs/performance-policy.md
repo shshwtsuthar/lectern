@@ -54,6 +54,8 @@ python3 benchmarks/performance_regression.py \
 Import, startup, scrolling, rendering, or memory changes must also run the applicable workload from
 the exploratory harness. When that workload is not yet stable enough to gate, report its before and
 after raw results and add or improve deterministic coverage rather than claiming an exemption.
+The compositor-backed desktop workload checks title, author, and recently-added sort-to-first-
+painted-frame p95 against a 50 ms product budget while retaining all interaction samples.
 
 ## Merge gate
 

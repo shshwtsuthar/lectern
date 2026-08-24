@@ -97,6 +97,8 @@ than duplicating their commands in workflow YAML. Repository administrators must
 - Fresh desktop processes for populated-library startup measurements.
 - A deterministic sustained cover-grid scroll with wall-frame, egui interval, and CPU-frame
   samples after a warmup window.
+- Forty round-robin title, author, and recently-added refreshes, measuring each request through the
+  first presented sorted frame against a 50 ms p95 product budget.
 - A byte-pinned 10,000-file corpus containing 7,000 EPUB and 3,000 PDF files for production-path
   discovery, parsing, cover generation, and persistence.
 
@@ -118,9 +120,10 @@ benchmarks/import-corpus-v1/prepare.sh
 python3 benchmarks/run.py
 ```
 
-Use `python3 benchmarks/run.py --help` to change library size, repetitions, scroll duration,
-corpus path, output directory, or disk guards. `--smoke` bounds the library and UI settings for a
-quick end-to-end check but still uses the selected corpus unless `--skip-import` is supplied.
+Use `python3 benchmarks/run.py --help` to change library size, repetitions, sort iterations, scroll
+duration, corpus path, output directory, or disk guards. `--smoke` bounds the library and UI
+settings for a quick end-to-end check but still uses the selected corpus unless `--skip-import` is
+supplied.
 
 The runner refuses an existing output directory. By default it also:
 
@@ -142,7 +145,7 @@ Each run is written below `target/benchmarks/runs/` unless `--output-dir` is pro
 | `commands.json` | Commands, elapsed time, exit status, and timeout state |
 | `seed.json` | Fixture counts, seed, cover dimensions/bytes, elapsed time, and database size |
 | `startup-*.json` | Per-process startup and phase RSS measurements |
-| `scrolling.json` | Startup, idle, scrolling, frame samples, display scale, cover state, and phase RSS |
+| `scrolling.json` | Startup, idle, sort-to-paint, scrolling, frame samples, display scale, cover state, and phase RSS |
 | `queries.json` | Raw query latency samples and p50/p95/p99 summaries |
 | `import.json` | Corpus inspection, progress, throughput, failures, database size, and peak RSS |
 
@@ -159,13 +162,18 @@ inspected. These generated artifacts are ignored by Git.
 - Frame interval is the monotonic time between delivered app frame starts after scrolling warmup.
   `egui_unstable_dt` and the previous frame's eframe CPU time are retained separately. These are
   application timings, not GPU presentation timestamps.
-- Startup, post-population idle-window, scrolling, and import memory are Linux process RSS. RSS is
-  sampled every 20 ms and excludes dedicated GPU memory.
+- Sort-to-first-painted-frame begins immediately before the benchmark applies the same query change
+  as a sort selection and ends on the app frame after the matching first page was installed. This
+  ensures one populated frame has been presented. Each sort retains 40 samples and must remain at
+  or below 50 ms p95.
+- Startup, post-population idle-window, sorting, scrolling, and import memory are Linux process RSS.
+  RSS is sampled every 20 ms and excludes dedicated GPU memory.
 - Percentiles use the nearest-rank method and every underlying sample remains in JSON.
 
-The runner performs count and reconciliation checks—such as seeded books, UI books, query sample
-counts, discovered imports, failures, and stored imports—but treats latency, frame time, and memory
-as observations rather than pass/fail gates.
+The runner performs count and reconciliation checks—such as seeded books, stable first results per
+sort, UI books, query sample counts, discovered imports, failures, and stored imports. The scripted
+sort interaction has a checked 50 ms p95 budget; the other exploratory latency, frame-time, and
+memory measurements remain observations rather than pass/fail gates.
 
 ## Comparing runs
 

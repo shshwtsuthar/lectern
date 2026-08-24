@@ -62,6 +62,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(options.books, 1000)
         self.assertEqual(options.query_iterations, 5)
         self.assertEqual(options.startup_runs, 1)
+        self.assertEqual(options.sort_iterations, 3)
 
     def test_command_timeout_is_recorded_before_failing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -92,12 +93,17 @@ class RunnerTests(unittest.TestCase):
             scroll_seconds=15.0,
             scroll_warmup_seconds=1.0,
             scroll_pixels_per_second=1_500.0,
+            sort_iterations=40,
             timeout_seconds=20.0,
         )
 
         self.assertEqual(
             calls[0][1]["timeout_seconds"],
             20.0 + RUN.DESKTOP_TIMEOUT_GRACE_SECONDS,
+        )
+        self.assertEqual(
+            calls[0][1]["environment"]["LECTERN_BENCHMARK_SORT_ITERATIONS"],
+            "40",
         )
 
     def test_integrity_validators_accept_reconciled_counts(self) -> None:
@@ -110,6 +116,28 @@ class RunnerTests(unittest.TestCase):
                 "startup": {"main_entry_to_populated_library_ns": 42},
             },
             50_000,
+        )
+        RUN.validate_desktop_result(
+            {
+                "library": {"books": 50_000},
+                "startup": {"main_entry_to_populated_library_ns": 42},
+                "sort_interactions": {
+                    "iterations_per_sort": 2,
+                    "scenarios": [
+                        {
+                            "name": name,
+                            "first_book_id": index + 1,
+                            "samples_ns": [16_000_000, 17_000_000],
+                            "passed": True,
+                        }
+                        for index, name in enumerate(
+                            ("title", "author", "recently_added")
+                        )
+                    ],
+                },
+            },
+            50_000,
+            2,
         )
         RUN.validate_query_result(
             {

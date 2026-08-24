@@ -14,15 +14,22 @@ use std::{
 };
 
 use eframe::egui;
-use lectern_core::BookSummary;
+use lectern_core::{BookSummary, SortOrder};
 use serde::Serialize;
 
 const OUTPUT_ENV: &str = "LECTERN_BENCHMARK_OUTPUT";
 const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(20);
 const STARTUP_PHASE: usize = 0;
 const IDLE_PHASE: usize = 1;
-const SCROLL_PHASE: usize = 2;
-const PHASE_COUNT: usize = 3;
+const SORT_PHASE: usize = 2;
+const SCROLL_PHASE: usize = 3;
+const PHASE_COUNT: usize = 4;
+const SORT_SCENARIOS: [SortOrder; 3] = [
+    SortOrder::Author,
+    SortOrder::RecentlyAdded,
+    SortOrder::Title,
+];
+const SORT_TO_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
 
 pub(crate) struct BenchmarkFrame {
     pub(crate) viewport_width: f32,
@@ -40,6 +47,7 @@ struct BenchmarkConfig {
     scroll_warmup: Duration,
     timeout: Duration,
     scroll_pixels_per_second: f32,
+    sort_iterations: usize,
 }
 
 impl BenchmarkConfig {
@@ -53,6 +61,7 @@ impl BenchmarkConfig {
                 "LECTERN_BENCHMARK_SCROLL_PIXELS_PER_SECOND",
                 1_500.0,
             )?,
+            sort_iterations: usize_from_env("LECTERN_BENCHMARK_SORT_ITERATIONS", 0)?,
         };
         if config.scroll.is_zero() && !config.scroll_warmup.is_zero() {
             return Err(
@@ -78,10 +87,26 @@ impl BenchmarkConfig {
 }
 
 enum Phase {
-    Startup { paint_frames_remaining: Option<u8> },
-    Idle { started: Instant },
-    Scroll { started: Instant },
+    Startup {
+        paint_frames_remaining: Option<u8>,
+    },
+    Idle {
+        started: Instant,
+    },
+    Sort {
+        completed: usize,
+        pending: Option<PendingSort>,
+    },
+    Scroll {
+        started: Instant,
+    },
     Finished,
+}
+
+struct PendingSort {
+    sort: SortOrder,
+    started: Instant,
+    paint_frames_remaining: Option<u8>,
 }
 
 pub(crate) struct DesktopBenchmark {
@@ -101,6 +126,9 @@ pub(crate) struct DesktopBenchmark {
     frame_intervals_ns: Vec<u64>,
     egui_frame_intervals_ns: Vec<u64>,
     cpu_frame_times_ns: Vec<u64>,
+    sort_to_paint_samples_ns: [Vec<u64>; SORT_SCENARIOS.len()],
+    sort_first_book_ids: [Option<i64>; SORT_SCENARIOS.len()],
+    validation_failure: Option<String>,
     memory: Option<PhaseMemorySampler>,
 }
 
@@ -130,25 +158,79 @@ impl DesktopBenchmark {
             frame_intervals_ns: Vec::new(),
             egui_frame_intervals_ns: Vec::new(),
             cpu_frame_times_ns: Vec::new(),
+            sort_to_paint_samples_ns: array::from_fn(|_| Vec::new()),
+            sort_first_book_ids: [None; SORT_SCENARIOS.len()],
+            validation_failure: None,
             memory: Some(memory),
         }))
     }
 
-    pub(crate) fn library_installed(&mut self, total: u64, books: &[BookSummary]) {
-        let Phase::Startup {
-            paint_frames_remaining,
-        } = &mut self.phase
-        else {
-            return;
-        };
-        if total == 0 || books.is_empty() || paint_frames_remaining.is_some() {
-            return;
+    pub(crate) fn library_installed(&mut self, total: u64, books: &[BookSummary], sort: SortOrder) {
+        match &mut self.phase {
+            Phase::Startup {
+                paint_frames_remaining,
+            } => {
+                if total == 0 || books.is_empty() || paint_frames_remaining.is_some() {
+                    return;
+                }
+                self.library_books = total;
+                self.initial_page_books = books.len();
+                self.initial_page_books_with_covers =
+                    books.iter().filter(|book| book.has_cover).count();
+                self.main_entry_to_query_installed_ns = elapsed_ns(self.main_entry.elapsed());
+                *paint_frames_remaining = Some(1);
+            }
+            Phase::Sort {
+                pending: Some(pending),
+                ..
+            } if pending.paint_frames_remaining.is_none() && pending.sort == sort => {
+                if total != self.library_books || books.len() != self.initial_page_books {
+                    self.validation_failure = Some(format!(
+                        "sort {} returned {total} books and a {}-book page; expected {} and {}",
+                        sort_name(sort),
+                        books.len(),
+                        self.library_books,
+                        self.initial_page_books,
+                    ));
+                    return;
+                }
+                let Some(first_book_id) = books.first().map(|book| book.id.value()) else {
+                    self.validation_failure =
+                        Some(format!("sort {} returned an empty page", sort_name(sort)));
+                    return;
+                };
+                let index = sort_index(sort);
+                match self.sort_first_book_ids[index] {
+                    Some(expected) if expected != first_book_id => {
+                        self.validation_failure = Some(format!(
+                            "sort {} changed its first book from {expected} to {first_book_id}",
+                            sort_name(sort),
+                        ));
+                        return;
+                    }
+                    None => self.sort_first_book_ids[index] = Some(first_book_id),
+                    Some(_) => {}
+                }
+                pending.paint_frames_remaining = Some(1);
+            }
+            _ => {}
         }
-        self.library_books = total;
-        self.initial_page_books = books.len();
-        self.initial_page_books_with_covers = books.iter().filter(|book| book.has_cover).count();
-        self.main_entry_to_query_installed_ns = elapsed_ns(self.main_entry.elapsed());
-        *paint_frames_remaining = Some(1);
+    }
+
+    pub(crate) fn next_sort_request(&mut self) -> Option<SortOrder> {
+        let Phase::Sort { completed, pending } = &mut self.phase else {
+            return None;
+        };
+        if pending.is_some() || *completed >= self.config.sort_iterations * SORT_SCENARIOS.len() {
+            return None;
+        }
+        let sort = sort_for_interaction(*completed);
+        *pending = Some(PendingSort {
+            sort,
+            started: Instant::now(),
+            paint_frames_remaining: None,
+        });
+        Some(sort)
     }
 
     pub(crate) fn frame_started(&mut self, cpu_usage_seconds: Option<f32>, unstable_dt: f32) {
@@ -191,11 +273,17 @@ impl DesktopBenchmark {
     pub(crate) fn frame_finished(&mut self, context: &egui::Context, frame: &BenchmarkFrame) {
         let now = Instant::now();
         let mut begin_idle = false;
+        let mut begin_sort = false;
         let mut begin_scroll = false;
+        let mut sort_finished = false;
         let mut finish = false;
         let mut failure = None;
         let mut observed_scroll_duration = None;
         let timed_out = now.duration_since(self.main_entry) >= self.config.timeout;
+
+        if let Some(error) = self.validation_failure.take() {
+            failure = Some(error);
+        }
 
         match &mut self.phase {
             Phase::Startup { .. } if timed_out => {
@@ -213,12 +301,17 @@ impl DesktopBenchmark {
             Phase::Idle { .. } if timed_out => {
                 failure = Some("desktop benchmark timed out during the idle window".to_owned());
             }
+            Phase::Sort { .. } if timed_out => {
+                failure = Some("desktop benchmark timed out during sort interactions".to_owned());
+            }
             Phase::Scroll { started } if timed_out => {
                 observed_scroll_duration = Some(now.duration_since(*started));
                 failure = Some("desktop benchmark timed out during scrolling".to_owned());
             }
             Phase::Idle { started } if now.duration_since(*started) >= self.config.idle => {
-                if self.config.scroll.is_zero() {
+                if self.config.sort_iterations > 0 {
+                    begin_sort = true;
+                } else if self.config.scroll.is_zero() {
                     self.idle_end_rss_bytes = current_rss_bytes();
                     observed_scroll_duration = Some(Duration::ZERO);
                     finish = true;
@@ -226,7 +319,34 @@ impl DesktopBenchmark {
                     begin_scroll = true;
                 }
             }
-            Phase::Startup { .. } | Phase::Idle { .. } => {
+            Phase::Sort { completed, pending }
+                if pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.paint_frames_remaining == Some(0)) =>
+            {
+                let completed_sort = pending.take().expect("completed sort is present");
+                let index = sort_index(completed_sort.sort);
+                if let Some(latency) = elapsed_ns(now.duration_since(completed_sort.started)) {
+                    self.sort_to_paint_samples_ns[index].push(latency);
+                } else {
+                    failure = Some("sort-to-paint latency exceeded the supported range".to_owned());
+                }
+                *completed += 1;
+                sort_finished = *completed >= self.config.sort_iterations * SORT_SCENARIOS.len();
+                context.request_repaint();
+            }
+            Phase::Sort {
+                pending:
+                    Some(PendingSort {
+                        paint_frames_remaining: Some(remaining),
+                        ..
+                    }),
+                ..
+            } if *remaining > 0 => {
+                *remaining -= 1;
+                context.request_repaint();
+            }
+            Phase::Startup { .. } | Phase::Idle { .. } | Phase::Sort { .. } => {
                 context.request_repaint_after(MEMORY_SAMPLE_INTERVAL);
             }
             Phase::Scroll { started } if now.duration_since(*started) >= self.config.scroll => {
@@ -247,10 +367,34 @@ impl DesktopBenchmark {
             }
             self.phase = Phase::Idle { started: now };
             context.request_repaint_after(MEMORY_SAMPLE_INTERVAL);
-        } else if begin_scroll {
+        } else if begin_sort {
             self.idle_end_rss_bytes = current_rss_bytes();
             if let Some(memory) = &self.memory {
                 memory.record_sample(IDLE_PHASE, self.idle_end_rss_bytes);
+                memory.set_phase(SORT_PHASE);
+            }
+            self.phase = Phase::Sort {
+                completed: 0,
+                pending: None,
+            };
+            context.request_repaint();
+        } else if sort_finished {
+            if self.config.scroll.is_zero() {
+                observed_scroll_duration = Some(Duration::ZERO);
+                finish = true;
+            } else {
+                begin_scroll = true;
+            }
+        }
+
+        if begin_scroll {
+            if self.idle_end_rss_bytes.is_none() {
+                self.idle_end_rss_bytes = current_rss_bytes();
+                if let Some(memory) = &self.memory {
+                    memory.record_sample(IDLE_PHASE, self.idle_end_rss_bytes);
+                }
+            }
+            if let Some(memory) = &self.memory {
                 memory.set_phase(SCROLL_PHASE);
             }
             self.phase = Phase::Scroll { started: now };
@@ -258,7 +402,13 @@ impl DesktopBenchmark {
         } else if finish || failure.is_some() {
             self.observed_scroll_duration_ns = observed_scroll_duration.and_then(elapsed_ns);
             self.phase = Phase::Finished;
-            if let Err(error) = self.write_result(failure.as_deref(), frame) {
+            let budget_failure = failure
+                .is_none()
+                .then(|| self.sort_budget_failure())
+                .flatten();
+            if let Err(error) =
+                self.write_result(failure.as_deref().or(budget_failure.as_deref()), frame)
+            {
                 eprintln!("Could not write desktop benchmark result: {error}");
             }
             context.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -276,7 +426,7 @@ impl DesktopBenchmark {
             .ok_or_else(|| "memory sampler was already consumed".to_owned())?
             .finish()?;
         let result = DesktopBenchmarkResult {
-            schema_version: 1,
+            schema_version: 2,
             kind: "desktop",
             status: if failure.is_some() {
                 "failed"
@@ -312,6 +462,11 @@ impl DesktopBenchmark {
                 duration_ns: elapsed_ns(self.config.idle),
                 end_rss_bytes: self.idle_end_rss_bytes,
             },
+            sort_interactions: SortInteractionsResult::new(
+                self.config.sort_iterations,
+                &self.sort_to_paint_samples_ns,
+                self.sort_first_book_ids,
+            ),
             scrolling: ScrollingResult::new(
                 self.config,
                 self.observed_scroll_duration_ns,
@@ -329,6 +484,7 @@ impl DesktopBenchmark {
                 process_baseline_rss_bytes: memory.baseline_bytes,
                 startup_peak_rss_bytes: memory.peaks[STARTUP_PHASE],
                 idle_peak_rss_bytes: memory.peaks[IDLE_PHASE],
+                sort_peak_rss_bytes: memory.peaks[SORT_PHASE],
                 scrolling_peak_rss_bytes: memory.peaks[SCROLL_PHASE],
             },
             final_frame: FinalFrameResult {
@@ -342,12 +498,87 @@ impl DesktopBenchmark {
         };
         write_json(&self.output_path, &result)
     }
+
+    fn sort_budget_failure(&self) -> Option<String> {
+        if self.config.sort_iterations == 0 {
+            return None;
+        }
+        for (index, samples) in self.sort_to_paint_samples_ns.iter().enumerate() {
+            if samples.len() != self.config.sort_iterations {
+                return Some(format!(
+                    "sort {} retained {} samples; expected {}",
+                    sort_name(SORT_SCENARIOS[index]),
+                    samples.len(),
+                    self.config.sort_iterations,
+                ));
+            }
+            let summary = summarize_samples(samples).expect("non-empty sort samples");
+            if summary.p95_ns > SORT_TO_PAINT_P95_BUDGET_NS {
+                return Some(format!(
+                    "sort {} p95 was {:.3} ms, above the {:.3} ms budget",
+                    sort_name(SORT_SCENARIOS[index]),
+                    summary.p95_ns as f64 / 1_000_000.0,
+                    SORT_TO_PAINT_P95_BUDGET_NS as f64 / 1_000_000.0,
+                ));
+            }
+        }
+        None
+    }
 }
 
 struct ScrollingSamples<'a> {
     frame_intervals: &'a [u64],
     egui_unstable_dt: &'a [u64],
     cpu_frame_times: &'a [u64],
+}
+
+impl<'a> SortInteractionsResult<'a> {
+    fn new(
+        iterations_per_sort: usize,
+        samples: &'a [Vec<u64>; SORT_SCENARIOS.len()],
+        first_book_ids: [Option<i64>; SORT_SCENARIOS.len()],
+    ) -> Self {
+        Self {
+            endpoint: "query refresh requested through the next app frame after the sorted page was installed, ensuring one populated frame was presented",
+            iterations_per_sort,
+            max_p95_ns: SORT_TO_PAINT_P95_BUDGET_NS,
+            scenarios: array::from_fn(|index| {
+                let latency = summarize_samples(&samples[index]);
+                let passed = iterations_per_sort == 0
+                    || (samples[index].len() == iterations_per_sort
+                        && latency
+                            .as_ref()
+                            .is_some_and(|summary| summary.p95_ns <= SORT_TO_PAINT_P95_BUDGET_NS));
+                SortInteractionScenario {
+                    name: sort_name(SORT_SCENARIOS[index]),
+                    first_book_id: first_book_ids[index],
+                    latency,
+                    samples_ns: &samples[index],
+                    passed,
+                }
+            }),
+        }
+    }
+}
+
+fn sort_for_interaction(completed: usize) -> SortOrder {
+    SORT_SCENARIOS[completed % SORT_SCENARIOS.len()]
+}
+
+const fn sort_index(sort: SortOrder) -> usize {
+    match sort {
+        SortOrder::Author => 0,
+        SortOrder::RecentlyAdded => 1,
+        SortOrder::Title => 2,
+    }
+}
+
+const fn sort_name(sort: SortOrder) -> &'static str {
+    match sort {
+        SortOrder::Author => "author",
+        SortOrder::RecentlyAdded => "recently_added",
+        SortOrder::Title => "title",
+    }
 }
 
 impl<'a> ScrollingResult<'a> {
@@ -401,6 +632,7 @@ struct DesktopBenchmarkResult<'a> {
     library: LibraryResult,
     startup: Option<StartupResult>,
     idle: IdleResult,
+    sort_interactions: SortInteractionsResult<'a>,
     scrolling: ScrollingResult<'a>,
     memory: MemoryResult,
     final_frame: FinalFrameResult,
@@ -421,6 +653,7 @@ struct ConfigurationResult {
     scroll_warmup_ns: Option<u64>,
     timeout_ns: Option<u64>,
     scroll_pixels_per_second: f32,
+    sort_iterations: usize,
 }
 
 impl From<BenchmarkConfig> for ConfigurationResult {
@@ -431,6 +664,7 @@ impl From<BenchmarkConfig> for ConfigurationResult {
             scroll_warmup_ns: elapsed_ns(config.scroll_warmup),
             timeout_ns: elapsed_ns(config.timeout),
             scroll_pixels_per_second: config.scroll_pixels_per_second,
+            sort_iterations: config.sort_iterations,
         }
     }
 }
@@ -453,6 +687,23 @@ struct StartupResult {
 struct IdleResult {
     duration_ns: Option<u64>,
     end_rss_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct SortInteractionsResult<'a> {
+    endpoint: &'static str,
+    iterations_per_sort: usize,
+    max_p95_ns: u64,
+    scenarios: [SortInteractionScenario<'a>; SORT_SCENARIOS.len()],
+}
+
+#[derive(Serialize)]
+struct SortInteractionScenario<'a> {
+    name: &'static str,
+    first_book_id: Option<i64>,
+    latency: Option<SampleSummary>,
+    samples_ns: &'a [u64],
+    passed: bool,
 }
 
 #[derive(Serialize)]
@@ -493,6 +744,7 @@ struct MemoryResult {
     process_baseline_rss_bytes: Option<u64>,
     startup_peak_rss_bytes: Option<u64>,
     idle_peak_rss_bytes: Option<u64>,
+    sort_peak_rss_bytes: Option<u64>,
     scrolling_peak_rss_bytes: Option<u64>,
 }
 
@@ -636,6 +888,18 @@ fn number_from_env(name: &str, default: f32) -> Result<f32, String> {
     Ok(parsed)
 }
 
+fn usize_from_env(name: &str, default: usize) -> Result<usize, String> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(default);
+    };
+    let value = value
+        .into_string()
+        .map_err(|value| format!("{name} is not valid UTF-8: {}", value.display()))?;
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("{name} expects a non-negative integer, got '{value}'"))
+}
+
 fn seconds_f32_ns(seconds: f32) -> Option<u64> {
     elapsed_ns(Duration::from_secs_f32(seconds))
 }
@@ -700,8 +964,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BenchmarkConfig, ScrollingResult, ScrollingSamples, nearest_rank, summarize_samples,
+        BenchmarkConfig, ScrollingResult, ScrollingSamples, nearest_rank, sort_for_interaction,
+        summarize_samples,
     };
+    use lectern_core::SortOrder;
 
     #[test]
     fn summarizes_frame_samples_with_nearest_rank_percentiles() {
@@ -723,6 +989,14 @@ mod tests {
     }
 
     #[test]
+    fn sort_interactions_cycle_without_repeating_the_current_order() {
+        assert_eq!(sort_for_interaction(0), SortOrder::Author);
+        assert_eq!(sort_for_interaction(1), SortOrder::RecentlyAdded);
+        assert_eq!(sort_for_interaction(2), SortOrder::Title);
+        assert_eq!(sort_for_interaction(3), SortOrder::Author);
+    }
+
+    #[test]
     fn scrolling_reports_configured_and_observed_windows() {
         let config = BenchmarkConfig {
             idle: Duration::from_secs(3),
@@ -730,6 +1004,7 @@ mod tests {
             scroll_warmup: Duration::from_secs(2),
             timeout: Duration::from_secs(30),
             scroll_pixels_per_second: 1_500.0,
+            sort_iterations: 40,
         };
         let result = ScrollingResult::new(
             config,
