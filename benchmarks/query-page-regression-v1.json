@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-query-regression-budget",
+  "workload": {
+    "query_mode": "page",
+    "books": 50000,
+    "seed": 20260824,
+    "cover_every": 0,
+    "page_size": 128,
+    "warmup_iterations": 10,
+    "measured_iterations": 40,
+    "full_count_scenarios": [
+      "first_page_title",
+      "deep_page_title"
+    ]
+  },
+  "budgets": {
+    "first_page_title": {
+      "max_p95_ms": 50
+    },
+    "deep_page_title": {
+      "max_p95_ms": 50
+    },
+    "first_page_search_filter": {
+      "max_p95_ms": 50
+    }
+  }
+}

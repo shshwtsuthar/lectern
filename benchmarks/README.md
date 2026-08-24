@@ -2,31 +2,36 @@
 
 This directory contains two complementary workflows:
 
-- `performance_regression.py` is a deterministic, versioned query regression suite. It runs each
-  week in GitHub Actions, can be dispatched manually, and fails when a release-query latency budget
-  is exceeded.
+- `performance_regression.py` is a deterministic, versioned query regression runner. It exercises
+  both full-result and paged-query workloads each week in GitHub Actions, can be dispatched
+  manually, and fails when a release-query latency budget is exceeded.
 - `run.py` is an opt-in exploratory study for large libraries. It exercises the production SQLite
   query path, EPUB/PDF importer, and native egui cover grid. Its raw JSON is intentionally
   non-gating because the workload requires a prepared corpus and a graphical desktop session.
 
 ## Query regression suite
 
-The regression workload seeds a 50,000-book SQLite library with deterministic metadata, runs 10
+Each regression workload seeds a 50,000-book SQLite library with deterministic metadata, runs 10
 warmup iterations followed by 40 measured iterations of every versioned query scenario, and checks
 both result integrity and p95 latency. It records all raw samples, the database, toolchain/host
 metadata, commands, and a compact pass/fail report.
 
-The workload and its limits live in
-[`query-regression-v1.json`](query-regression-v1.json). The budget is intentionally tied to the
-workload version: adding, removing, or materially changing a scenario requires an explicit review
-of the configuration rather than silently dropping it from the performance suite. The asset-health
-filter also has a relative budget against the full title sort, which catches a disproportionate
-regression even if a runner becomes slower overall.
+The full-result workload and its limits live in
+[`query-regression-v1.json`](query-regression-v1.json). The bounded-window workload lives in
+[`query-page-regression-v1.json`](query-page-regression-v1.json): its first page includes the
+matching count, its deep title page checks late-window access, and its filtered page exercises FTS
+with the format join. The budget is intentionally tied to the workload version: adding, removing,
+or materially changing a scenario requires an explicit review of the configuration rather than
+silently dropping it from the performance suite. The full-result asset-health filter also has a
+relative budget against the full title sort, which catches a disproportionate regression even if a
+runner becomes slower overall.
 
 Run it locally from the repository root:
 
 ```bash
 python3 benchmarks/performance_regression.py
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/query-page-regression-v1.json
 ```
 
 Use `--output-dir PATH` to choose a new artifact directory, or `--budget PATH` to evaluate a

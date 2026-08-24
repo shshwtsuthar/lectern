@@ -24,6 +24,7 @@ use serde::Serialize;
 const DEFAULT_BOOKS: usize = 50_000;
 const DEFAULT_ITERATIONS: usize = 100;
 const DEFAULT_WARMUP: usize = 10;
+const QUERY_PAGE_SIZE: u32 = 128;
 const SEED_BATCH_SIZE: usize = 500;
 const DEFAULT_SEED: u64 = 20_260_824;
 const MAX_RECORDED_FAILURES: usize = 200;
@@ -36,6 +37,7 @@ const USAGE: &str = "Lectern exploratory performance harness
 Usage:
   lectern-benchmark seed --database PATH --output PATH [OPTIONS]
   lectern-benchmark query --database PATH --output PATH [OPTIONS]
+  lectern-benchmark query-page --database PATH --output PATH [OPTIONS]
   lectern-benchmark import --database PATH --corpus PATH --output PATH [OPTIONS]
 
 Seed options:
@@ -78,6 +80,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     match command.as_str() {
         "seed" => run_seed(&SeedOptions::parse(&mut args)?),
         "query" => run_query(&QueryOptions::parse(&mut args)?),
+        "query-page" => run_query_page(&QueryOptions::parse(&mut args)?),
         "import" => run_import(&ImportOptions::parse(&mut args)?),
         _ => Err(format!(
             "unknown command '{command}'. Run 'lectern-benchmark --help' for usage"
@@ -568,6 +571,41 @@ struct QueryScenario {
     sort: SortOrder,
 }
 
+#[derive(Clone, Copy)]
+enum PagePosition {
+    First,
+    Deep,
+}
+
+impl PagePosition {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::First => "first",
+            Self::Deep => "deep",
+        }
+    }
+}
+
+struct PageQueryScenario {
+    name: &'static str,
+    search: &'static str,
+    format: Option<BookFormat>,
+    asset_health: Option<AssetHealth>,
+    sort: SortOrder,
+    position: PagePosition,
+}
+
+impl PageQueryScenario {
+    fn query(&self) -> LibraryQuery {
+        LibraryQuery {
+            search: self.search.into(),
+            format: self.format,
+            asset_health: self.asset_health,
+            sort: self.sort,
+        }
+    }
+}
+
 impl QueryScenario {
     fn query(&self) -> LibraryQuery {
         LibraryQuery {
@@ -644,6 +682,131 @@ fn run_query(options: &QueryOptions) -> Result<(), String> {
     write_json(&options.output, &result)?;
     println!(
         "Measured {} query scenarios over {} books ({} iterations each)",
+        result.scenarios.len(),
+        library_books,
+        options.iterations
+    );
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct PageQueryResult {
+    schema_version: u32,
+    kind: &'static str,
+    measured_at_unix_ms: u128,
+    database_path: String,
+    library_books: u64,
+    page_size: u32,
+    warmup_iterations: usize,
+    measured_iterations: usize,
+    scenarios: Vec<PageQueryScenarioResult>,
+}
+
+#[derive(Serialize)]
+struct PageQueryScenarioResult {
+    name: &'static str,
+    position: &'static str,
+    search: &'static str,
+    format: Option<&'static str>,
+    asset_health: Option<&'static str>,
+    sort: &'static str,
+    offset: u64,
+    total_count: u64,
+    result_count: usize,
+    latency_ms: LatencySummary,
+    samples_ns: Vec<u64>,
+}
+
+fn run_query_page(options: &QueryOptions) -> Result<(), String> {
+    ensure_distinct_paths("database", &options.database, "output", &options.output)?;
+    if !options.database.is_file() {
+        return Err(format!(
+            "benchmark database is not a file: {}",
+            options.database.display()
+        ));
+    }
+    let mut database = LibraryDatabase::open(&options.database).map_err(display_error)?;
+    let library_books = database.count().map_err(display_error)?;
+    if library_books == 0 {
+        return Err(format!(
+            "benchmark database contains no books: {}",
+            options.database.display()
+        ));
+    }
+    let scenarios = page_query_scenarios();
+    let mut samples = vec![Vec::with_capacity(options.iterations); scenarios.len()];
+    let mut result_counts = vec![0; scenarios.len()];
+    let mut total_counts = vec![0; scenarios.len()];
+    let mut page_offsets = vec![0; scenarios.len()];
+
+    for round in 0..(options.warmup + options.iterations) {
+        for scenario_offset in 0..scenarios.len() {
+            let index = (scenario_offset + round) % scenarios.len();
+            let query = scenarios[index].query();
+            let started = Instant::now();
+            let (total, offset, books) = match scenarios[index].position {
+                PagePosition::First => {
+                    let page = database
+                        .query_page(&query, 0, QUERY_PAGE_SIZE)
+                        .map_err(display_error)?;
+                    (page.total, page.offset, page.books)
+                }
+                PagePosition::Deep => {
+                    let offset = library_books.saturating_sub(u64::from(QUERY_PAGE_SIZE));
+                    let books = database
+                        .query_window(&query, offset, QUERY_PAGE_SIZE)
+                        .map_err(display_error)?;
+                    (library_books, offset, books)
+                }
+            };
+            let elapsed = started.elapsed();
+            total_counts[index] = total;
+            page_offsets[index] = offset;
+            result_counts[index] = books.len();
+            if round >= options.warmup {
+                samples[index].push(duration_ns(elapsed)?);
+            }
+        }
+    }
+
+    let results = scenarios
+        .into_iter()
+        .zip(samples)
+        .zip(result_counts)
+        .zip(total_counts)
+        .zip(page_offsets)
+        .map(
+            |((((scenario, samples_ns), result_count), total_count), offset)| {
+                PageQueryScenarioResult {
+                    name: scenario.name,
+                    position: scenario.position.as_str(),
+                    search: scenario.search,
+                    format: scenario.format.map(BookFormat::as_str),
+                    asset_health: scenario.asset_health.map(AssetHealth::as_str),
+                    sort: sort_name(scenario.sort),
+                    offset,
+                    total_count,
+                    result_count,
+                    latency_ms: summarize_latency(&samples_ns),
+                    samples_ns,
+                }
+            },
+        )
+        .collect();
+    let result = PageQueryResult {
+        schema_version: 1,
+        kind: "query-page",
+        measured_at_unix_ms: unix_time_ms()?,
+        database_path: options.database.display().to_string(),
+        library_books,
+        page_size: QUERY_PAGE_SIZE,
+        warmup_iterations: options.warmup,
+        measured_iterations: options.iterations,
+        scenarios: results,
+    };
+    write_json(&options.output, &result)?;
+    println!(
+        "Measured {} paged query scenarios over {} books ({} iterations each)",
         result.scenarios.len(),
         library_books,
         options.iterations
@@ -1040,6 +1203,35 @@ fn query_scenarios() -> Vec<QueryScenario> {
             format: None,
             asset_health: Some(AssetHealth::Unknown),
             sort: SortOrder::Title,
+        },
+    ]
+}
+
+fn page_query_scenarios() -> Vec<PageQueryScenario> {
+    vec![
+        PageQueryScenario {
+            name: "first_page_title",
+            search: "",
+            format: None,
+            asset_health: None,
+            sort: SortOrder::Title,
+            position: PagePosition::First,
+        },
+        PageQueryScenario {
+            name: "deep_page_title",
+            search: "",
+            format: None,
+            asset_health: None,
+            sort: SortOrder::Title,
+            position: PagePosition::Deep,
+        },
+        PageQueryScenario {
+            name: "first_page_search_filter",
+            search: "Luminous",
+            format: Some(BookFormat::Pdf),
+            asset_health: None,
+            sort: SortOrder::Author,
+            position: PagePosition::First,
         },
     ]
 }

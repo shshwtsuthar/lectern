@@ -12,8 +12,8 @@ immediately searchable, renders a cover grid, and edits their metadata.
 - Search title, author, series, and publisher with SQLite FTS5 prefix indexes.
 - Represent one logical book with one or more stable file assets and filter by any available format.
 - Sort by title, author, or recently added.
-- Browse a virtualized grid whose cover I/O, image decoding, and database queries stay off the UI
-  thread.
+- Browse a virtualized grid backed by bounded result pages; cover I/O, image decoding, and database
+  queries stay off the UI thread.
 - Edit metadata in place and refresh the search index as soon as it is saved.
 - Rescan referenced book files, filter missing or unreadable assets, and safely relink a missing
   EPUB or PDF without losing its logical-book metadata, cover, or asset identity.
@@ -69,17 +69,17 @@ Current file and folder import remains conservative and does not guess that simi
 are the same book; trusted aggregate importers such as the planned Calibre adapter can attach
 several formats atomically.
 
-The application has performance-conscious boundaries and a deterministic weekly regression suite
-for its 50,000-book release-query path. The broader benchmark study retains raw measurements for
-cold launch, import throughput, scrolling, and memory; see
+The application has performance-conscious boundaries and deterministic weekly regression suites
+for full-result and paged 50,000-book release-query paths. The broader benchmark study retains raw
+measurements for cold launch, import throughput, scrolling, and memory; see
 [`benchmarks/README.md`](benchmarks/README.md) for how to run and interpret both workflows.
 
 ## Quality gates
 
 Every pull request is expected to pass formatting, Clippy with warnings denied, tests on Linux,
 macOS, and Windows, documentation checks, an MSRV build, the benchmark-runner contract tests, and
-the dependency policy in `deny.toml`. The deterministic release-query regression suite runs weekly
-on a pinned GitHub runner and is manually dispatchable. CI definitions live in
+the dependency policy in `deny.toml`. The deterministic release-query regression suites run weekly
+on a pinned GitHub runner and are manually dispatchable. CI definitions live in
 `.github/workflows/`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and

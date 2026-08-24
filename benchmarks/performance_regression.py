@@ -120,7 +120,9 @@ def main(arguments: list[str]) -> int:
                 "-p",
                 "lectern-benchmark",
                 "--",
-                "query",
+                "query-page"
+                if workload.get("query_mode", "full") == "page"
+                else "query",
                 "--database",
                 str(database),
                 "--output",
@@ -178,15 +180,36 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         raise RegressionError(
             "budget.workload.measured_iterations must be greater than zero"
         )
-    scenario_names = workload.get("full_library_scenarios")
-    if not isinstance(scenario_names, list) or not all(
-        isinstance(name, str) and name for name in scenario_names
-    ):
-        raise RegressionError(
-            "budget.workload.full_library_scenarios must be a list of names"
-        )
-    if len(set(scenario_names)) != len(scenario_names):
-        raise RegressionError("budget.workload.full_library_scenarios must not repeat names")
+    query_mode = workload.get("query_mode", "full")
+    if query_mode not in ("full", "page"):
+        raise RegressionError("budget.workload.query_mode must be 'full' or 'page'")
+    if query_mode == "full":
+        scenario_names = workload.get("full_library_scenarios")
+        if not isinstance(scenario_names, list) or not all(
+            isinstance(name, str) and name for name in scenario_names
+        ):
+            raise RegressionError(
+                "budget.workload.full_library_scenarios must be a list of names"
+            )
+        if len(set(scenario_names)) != len(scenario_names):
+            raise RegressionError(
+                "budget.workload.full_library_scenarios must not repeat names"
+            )
+    else:
+        positive_or_zero_field(workload, "page_size", "budget.workload")
+        if workload["page_size"] == 0:
+            raise RegressionError("budget.workload.page_size must be greater than zero")
+        scenario_names = workload.get("full_count_scenarios")
+        if not isinstance(scenario_names, list) or not all(
+            isinstance(name, str) and name for name in scenario_names
+        ):
+            raise RegressionError(
+                "budget.workload.full_count_scenarios must be a list of names"
+            )
+        if len(set(scenario_names)) != len(scenario_names):
+            raise RegressionError(
+                "budget.workload.full_count_scenarios must not repeat names"
+            )
 
     budgets = object_field(budget, "budgets", "budget")
     if not budgets:
@@ -209,11 +232,11 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                     f"budget {name!r}.max_p95_ratio_to must name another scenario"
                 )
             positive_number_field(scenario_budget, "max_p95_ratio", f"budget {name!r}")
-    unknown_full_library = set(scenario_names).difference(budgets)
-    if unknown_full_library:
+    unknown_full_count = set(scenario_names).difference(budgets)
+    if unknown_full_count:
         raise RegressionError(
-            "full-library scenarios must have budgets: "
-            + ", ".join(sorted(unknown_full_library))
+            "full-count scenarios must have budgets: "
+            + ", ".join(sorted(unknown_full_count))
         )
     return budget
 
@@ -221,6 +244,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
 def evaluate_query_result(result: dict[str, Any], budget: dict[str, Any]) -> list[dict[str, Any]]:
     workload = budget["workload"]
     books = workload["books"]
+    query_mode = workload.get("query_mode", "full")
     if positive_or_zero_field(result, "library_books", "query result") != books:
         raise RegressionError(
             f"query library count mismatch: got {result.get('library_books')}, expected {books}"
@@ -235,6 +259,11 @@ def evaluate_query_result(result: dict[str, Any], budget: dict[str, Any]) -> lis
         != workload["measured_iterations"]
     ):
         raise RegressionError("query measured iteration count does not match the budget")
+    if query_mode == "page" and (
+        positive_or_zero_field(result, "page_size", "query result")
+        != workload["page_size"]
+    ):
+        raise RegressionError("query page size does not match the budget")
 
     scenarios = result.get("scenarios")
     if not isinstance(scenarios, list) or not scenarios:
@@ -254,6 +283,21 @@ def evaluate_query_result(result: dict[str, Any], budget: dict[str, Any]) -> lis
             raise RegressionError(
                 f"{context} returned {result_count} rows from {books} books"
             )
+        if query_mode == "page":
+            if result_count > workload["page_size"]:
+                raise RegressionError(
+                    f"{context} returned {result_count} rows above the page size"
+                )
+            total_count = positive_or_zero_field(scenario, "total_count", context)
+            if total_count > books:
+                raise RegressionError(
+                    f"{context} counted {total_count} rows from {books} books"
+                )
+            offset = positive_or_zero_field(scenario, "offset", context)
+            if offset > total_count:
+                raise RegressionError(
+                    f"{context} offset {offset} exceeds its total {total_count}"
+                )
         samples = scenario.get("samples_ns")
         if not isinstance(samples, list) or len(samples) != workload["measured_iterations"]:
             sample_count = len(samples) if isinstance(samples, list) else "invalid"
@@ -282,12 +326,20 @@ def evaluate_query_result(result: dict[str, Any], budget: dict[str, Any]) -> lis
             details.append("unexpected=" + ", ".join(sorted(unexpected)))
         raise RegressionError("query scenarios do not match the versioned budget: " + "; ".join(details))
 
-    for name in workload["full_library_scenarios"]:
-        if by_name[name]["result_count"] != books:
-            raise RegressionError(
-                f"{name} full-library result count mismatch: "
-                f"got {by_name[name]['result_count']}, expected {books}"
-            )
+    if query_mode == "full":
+        for name in workload["full_library_scenarios"]:
+            if by_name[name]["result_count"] != books:
+                raise RegressionError(
+                    f"{name} full-library result count mismatch: "
+                    f"got {by_name[name]['result_count']}, expected {books}"
+                )
+    else:
+        for name in workload["full_count_scenarios"]:
+            if by_name[name]["total_count"] != books:
+                raise RegressionError(
+                    f"{name} full-count mismatch: "
+                    f"got {by_name[name]['total_count']}, expected {books}"
+                )
 
     p95_by_name = {
         name: float(scenario["latency_ms"]["p95"]) for name, scenario in by_name.items()

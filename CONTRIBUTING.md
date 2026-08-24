@@ -21,6 +21,8 @@
 
    ```sh
    python3 benchmarks/performance_regression.py
+   python3 benchmarks/performance_regression.py \
+     --budget benchmarks/query-page-regression-v1.json
    ```
 
    Compare the retained JSON output before changing any versioned performance budget.

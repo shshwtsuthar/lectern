@@ -37,12 +37,15 @@ them.
 ## Runtime model
 
 The render loop creates widgets only for visible cover-grid rows. A persistent query worker
-coalesces superseded searches, a bounded worker pool loads and decodes cover thumbnails, a metadata
-worker serializes edits, and dedicated import and asset-maintenance workers perform filesystem and
-write-heavy work off the UI thread. Asset scans check referenced paths with metadata and openability
-checks, then persist only changed health states in one transaction; relinking validates publication
-structure without regenerating thumbnails. The UI retains at most 256 cover textures and requests
-repainting only when background work completes or interaction requires it.
+coalesces superseded searches and returns 128-summary windows; the first window also establishes the
+matching count, while later windows skip the repeated count. The desktop retains at most six result
+windows and at most one queued query request. A bounded worker pool loads and decodes cover
+thumbnails, a metadata worker serializes edits, and dedicated import and asset-maintenance workers
+perform filesystem and write-heavy work off the UI thread. Asset scans check referenced paths with
+metadata and openability checks, then persist only changed health states in one transaction;
+relinking validates publication structure without regenerating thumbnails. The UI retains at most
+256 cover textures and requests repainting only when background work completes or interaction
+requires it.
 
 SQLite runs in WAL mode for the persistent library. FTS5 triggers keep search data consistent with
 imports and metadata edits. Imports never extract archive members to disk, reject unsafe archive
@@ -67,9 +70,9 @@ advance the schema version only after validation succeeds.
   transactional where possible, and recoverable.
 - Keep indexing and import work observable. Add cancellation when the UI exposes a cancel action.
 - Build complete user workflows first; profile representative libraries before optimizing or making
-  large-library performance claims. Preserve the versioned 50,000-book release-query budget in
-  `benchmarks/` when changing its storage path, and use broader representative studies for other
-  performance claims.
+  large-library performance claims. Preserve the versioned 50,000-book full-result and paged-query
+  budgets in `benchmarks/` when changing their storage paths, and use broader representative studies
+  for other performance claims.
 - Use structured diagnostics internally and translate them to actionable messages at application
   boundaries.
 - Keep platform-specific code behind adapters and exercise the workspace on all supported operating

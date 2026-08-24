@@ -9,6 +9,8 @@ follow [Semantic Versioning](https://semver.org/) once releases begin.
 
 ### Added
 
+- Bounded 128-book library result pages with a six-page desktop cache, one queued query request,
+  and deterministic 50,000-book first-page, deep-page, and filtered-page regression coverage.
 - A deterministic 50,000-book release-query regression suite with versioned p95/relative budgets,
   local execution, weekly/manual GitHub Actions runs, and retained diagnostic artifacts.
 - Referenced-asset health scans, missing/unreadable file reporting and filtering, and validated
