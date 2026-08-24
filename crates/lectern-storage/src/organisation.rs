@@ -9,7 +9,7 @@ use lectern_core::{
         ContributorReference, ContributorRole, ContributorUsage, ImportedContributorCredit,
         ImportedOrganisation, NameKind, SavedSearch, SavedSearchId, Series, SeriesId, SeriesIndex,
         SeriesMembership, SeriesMembershipEdit, SeriesReference, SeriesUsage, Tag, TagId,
-        TagReference, TagUsage, identity_key, normalize_name,
+        TagReference, TagUsage, VocabularyMutationResult, identity_key, normalize_name,
     },
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -160,6 +160,9 @@ CREATE TRIGGER books_after_delete AFTER DELETE ON books BEGIN
     );
 END;
 
+";
+
+const BOOKS_AFTER_UPDATE_TRIGGER: &str = r"
 CREATE TRIGGER books_after_update
 AFTER UPDATE OF title, authors_search, contributors_search, series, publisher, tags_search ON books
 WHEN old.title IS NOT new.title
@@ -184,6 +187,8 @@ BEGIN
     );
 END;
 ";
+
+const BULK_FTS_REFRESH_MIN_BOOKS: u64 = 512;
 
 /// Converts flattened version-five metadata without reading any publication file.
 pub(super) fn migrate_v5_to_v6(transaction: &Transaction<'_>) -> Result<()> {
@@ -285,6 +290,7 @@ pub(super) fn migrate_v5_to_v6(transaction: &Transaction<'_>) -> Result<()> {
     drop(insert_credit);
     drop(insert_contributor);
     transaction.execute("INSERT INTO books_fts(books_fts) VALUES ('rebuild')", [])?;
+    transaction.execute_batch(BOOKS_AFTER_UPDATE_TRIGGER)?;
     Ok(())
 }
 
@@ -1088,6 +1094,732 @@ pub(super) fn search_tags(
         })
     })
     .collect()
+}
+
+/// Counts books and saved projections that currently reference one contributor.
+pub(super) fn contributor_impact(
+    connection: &Connection,
+    id: ContributorId,
+) -> Result<VocabularyMutationResult> {
+    entity_impact(
+        connection,
+        "contributors",
+        id.value(),
+        "SELECT count(DISTINCT book_id) FROM book_contributors WHERE contributor_id = ?1",
+        "SELECT count(*) FROM saved_search_contributors WHERE contributor_id = ?1",
+    )
+}
+
+/// Counts books and saved projections that currently reference one series.
+pub(super) fn series_impact(
+    connection: &Connection,
+    id: SeriesId,
+) -> Result<VocabularyMutationResult> {
+    entity_impact(
+        connection,
+        "series_entities",
+        id.value(),
+        "SELECT count(*) FROM series_memberships WHERE series_id = ?1",
+        "SELECT count(*) FROM saved_searches WHERE series_id = ?1",
+    )
+}
+
+/// Counts books and distinct saved projections that currently reference one tag.
+pub(super) fn tag_impact(connection: &Connection, id: TagId) -> Result<VocabularyMutationResult> {
+    entity_impact(
+        connection,
+        "tags",
+        id.value(),
+        "SELECT count(*) FROM book_tags WHERE tag_id = ?1",
+        "SELECT count(*) FROM ( \
+             SELECT saved_search_id FROM saved_search_included_tags WHERE tag_id = ?1 \
+             UNION \
+             SELECT saved_search_id FROM saved_search_excluded_tags WHERE tag_id = ?1 \
+         )",
+    )
+}
+
+fn entity_impact(
+    connection: &Connection,
+    table: &'static str,
+    id: i64,
+    books_sql: &'static str,
+    searches_sql: &'static str,
+) -> Result<VocabularyMutationResult> {
+    let exists = connection.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id = ?1)"),
+        [id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        return Err(StorageError::InvalidCuration(format!(
+            "{table} entity {id} does not exist"
+        )));
+    }
+    let books = connection.query_row(books_sql, [id], |row| row.get::<_, i64>(0))?;
+    let saved_searches = connection.query_row(searches_sql, [id], |row| row.get::<_, i64>(0))?;
+    Ok(VocabularyMutationResult {
+        books: checked_count(books)?,
+        saved_searches: checked_count(saved_searches)?,
+    })
+}
+
+/// Renames one contributor and rebuilds only its affected book projections.
+pub(super) fn rename_contributor(
+    transaction: &Transaction<'_>,
+    id: ContributorId,
+    display_name: &str,
+    sort_name: &str,
+) -> Result<VocabularyMutationResult> {
+    let impact = contributor_impact(transaction, id)?;
+    let display_name = normalize_user_name(NameKind::Contributor, display_name)?;
+    let sort_name = normalize_user_name(NameKind::Contributor, sort_name)?;
+    let identity = identity_key(&display_name);
+    ensure_entity_name_available(transaction, "contributors", &identity, id.value())?;
+    let affected_books = prepare_affected_books(
+        transaction,
+        "book_contributors",
+        "contributor_id",
+        id.value(),
+    )?;
+    let affects_author_projection = contributor_affects_author_projection(transaction, id.value())?;
+    let sort_key = identity_key(&sort_name);
+    transaction.execute(
+        "UPDATE contributors SET display_name = ?1, sort_name = ?2, \
+             identity_key = ?3, sort_key = ?4 WHERE id = ?5",
+        params![display_name, sort_name, identity, sort_key, id.value()],
+    )?;
+    transaction.execute(
+        "UPDATE book_contributors SET display_name_projection = ?1, sort_key_projection = ?2 \
+         WHERE contributor_id = ?3",
+        params![display_name, sort_key, id.value()],
+    )?;
+    rebuild_affected_contributor_projections(
+        transaction,
+        affected_books,
+        affects_author_projection,
+    )?;
+    Ok(impact)
+}
+
+/// Merges a contributor source into an explicit stable target.
+pub(super) fn merge_contributors(
+    transaction: &Transaction<'_>,
+    source: ContributorId,
+    target: ContributorId,
+) -> Result<VocabularyMutationResult> {
+    ensure_distinct_entities(source.value(), target.value(), "contributor")?;
+    let impact = contributor_impact(transaction, source)?;
+    let (target_display, target_sort) = transaction
+        .query_row(
+            "SELECT display_name, sort_key FROM contributors WHERE id = ?1",
+            [target.value()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::InvalidCuration(format!("contributor {target} does not exist"))
+        })?;
+    let affected_books = prepare_affected_books(
+        transaction,
+        "book_contributors",
+        "contributor_id",
+        source.value(),
+    )?;
+    let affects_author_projection =
+        contributor_affects_author_projection(transaction, source.value())?;
+    prepare_source_credits(transaction, source, target)?;
+    transaction.execute(
+        "DELETE FROM book_contributors AS source_credit \
+         WHERE source_credit.contributor_id = ?1 \
+           AND EXISTS ( \
+               SELECT 1 FROM temp.lectern_source_credits prepared \
+               WHERE prepared.book_id = source_credit.book_id \
+                 AND prepared.role = source_credit.role \
+                 AND prepared.target_existed = 1 \
+           )",
+        [source.value()],
+    )?;
+    transaction.execute(
+        "UPDATE book_contributors AS target_credit SET position = ( \
+             SELECT min(target_credit.position, source_credit.position) \
+             FROM temp.lectern_source_credits source_credit \
+             WHERE source_credit.book_id = target_credit.book_id \
+               AND source_credit.role = target_credit.role \
+         ) WHERE target_credit.contributor_id = ?1 \
+             AND EXISTS ( \
+                 SELECT 1 FROM temp.lectern_source_credits source_credit \
+                 WHERE source_credit.book_id = target_credit.book_id \
+                   AND source_credit.role = target_credit.role \
+                   AND source_credit.target_existed = 1 \
+             )",
+        [target.value()],
+    )?;
+    transaction.execute(
+        "UPDATE book_contributors SET \
+             contributor_id = ?1, display_name_projection = ?2, sort_key_projection = ?3 \
+         WHERE contributor_id = ?4",
+        params![target.value(), target_display, target_sort, source.value()],
+    )?;
+    compact_affected_credit_positions(transaction)?;
+    merge_saved_contributor_facets(transaction, source, target)?;
+    transaction.execute("DELETE FROM contributors WHERE id = ?1", [source.value()])?;
+    rebuild_affected_contributor_projections(
+        transaction,
+        affected_books,
+        affects_author_projection,
+    )?;
+    Ok(impact)
+}
+
+/// Deletes an unused contributor, rejecting any book or saved-search reference.
+pub(super) fn delete_contributor(transaction: &Transaction<'_>, id: ContributorId) -> Result<()> {
+    let impact = contributor_impact(transaction, id)?;
+    ensure_unused(impact, "contributor", id.value())?;
+    transaction.execute("DELETE FROM contributors WHERE id = ?1", [id.value()])?;
+    Ok(())
+}
+
+/// Renames one series and rebuilds only its affected book projections.
+pub(super) fn rename_series(
+    transaction: &Transaction<'_>,
+    id: SeriesId,
+    name: &str,
+) -> Result<VocabularyMutationResult> {
+    let impact = series_impact(transaction, id)?;
+    let name = normalize_user_name(NameKind::Series, name)?;
+    let identity = identity_key(&name);
+    ensure_entity_name_available(transaction, "series_entities", &identity, id.value())?;
+    let affected_books =
+        prepare_affected_books(transaction, "series_memberships", "series_id", id.value())?;
+    transaction.execute(
+        "UPDATE series_entities SET name = ?1, identity_key = ?2 WHERE id = ?3",
+        params![name, identity, id.value()],
+    )?;
+    transaction.execute(
+        "UPDATE series_memberships SET name_projection = ?1, key_projection = ?2 \
+         WHERE series_id = ?3",
+        params![name, identity, id.value()],
+    )?;
+    rebuild_affected_series_projections(transaction, affected_books)?;
+    Ok(impact)
+}
+
+/// Merges a series source into an explicit stable target.
+pub(super) fn merge_series(
+    transaction: &Transaction<'_>,
+    source: SeriesId,
+    target: SeriesId,
+) -> Result<VocabularyMutationResult> {
+    ensure_distinct_entities(source.value(), target.value(), "series")?;
+    let impact = series_impact(transaction, source)?;
+    let (target_name, target_key) = transaction
+        .query_row(
+            "SELECT name, identity_key FROM series_entities WHERE id = ?1",
+            [target.value()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| StorageError::InvalidCuration(format!("series {target} does not exist")))?;
+    let affected_books = prepare_affected_books(
+        transaction,
+        "series_memberships",
+        "series_id",
+        source.value(),
+    )?;
+    transaction.execute(
+        "UPDATE series_memberships SET series_id = ?1, name_projection = ?2, \
+             key_projection = ?3 WHERE series_id = ?4",
+        params![target.value(), target_name, target_key, source.value()],
+    )?;
+    transaction.execute(
+        "UPDATE saved_searches SET series_id = ?1 WHERE series_id = ?2",
+        params![target.value(), source.value()],
+    )?;
+    transaction.execute(
+        "DELETE FROM series_entities WHERE id = ?1",
+        [source.value()],
+    )?;
+    rebuild_affected_series_projections(transaction, affected_books)?;
+    Ok(impact)
+}
+
+/// Deletes an unused series, rejecting any book or saved-search reference.
+pub(super) fn delete_series(transaction: &Transaction<'_>, id: SeriesId) -> Result<()> {
+    let impact = series_impact(transaction, id)?;
+    ensure_unused(impact, "series", id.value())?;
+    transaction.execute("DELETE FROM series_entities WHERE id = ?1", [id.value()])?;
+    Ok(())
+}
+
+/// Renames one tag and rebuilds only its affected book search projections.
+pub(super) fn rename_tag(
+    transaction: &Transaction<'_>,
+    id: TagId,
+    name: &str,
+) -> Result<VocabularyMutationResult> {
+    let impact = tag_impact(transaction, id)?;
+    let name = normalize_user_name(NameKind::Tag, name)?;
+    let identity = identity_key(&name);
+    ensure_entity_name_available(transaction, "tags", &identity, id.value())?;
+    let affected_books = prepare_affected_books(transaction, "book_tags", "tag_id", id.value())?;
+    transaction.execute(
+        "UPDATE tags SET name = ?1, identity_key = ?2 WHERE id = ?3",
+        params![name, identity, id.value()],
+    )?;
+    rebuild_affected_tag_projections(transaction, affected_books)?;
+    Ok(impact)
+}
+
+/// Merges a tag source into an explicit stable target and deduplicates every reference.
+pub(super) fn merge_tags(
+    transaction: &Transaction<'_>,
+    source: TagId,
+    target: TagId,
+) -> Result<VocabularyMutationResult> {
+    ensure_distinct_entities(source.value(), target.value(), "tag")?;
+    let impact = tag_impact(transaction, source)?;
+    let target_exists = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)",
+        [target.value()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !target_exists {
+        return Err(StorageError::InvalidCuration(format!(
+            "tag {target} does not exist"
+        )));
+    }
+    let affected_books =
+        prepare_affected_books(transaction, "book_tags", "tag_id", source.value())?;
+    transaction.execute(
+        "DELETE FROM book_tags AS source_pair \
+         WHERE source_pair.tag_id = ?1 \
+           AND EXISTS ( \
+               SELECT 1 FROM book_tags target_pair \
+               WHERE target_pair.book_id = source_pair.book_id \
+                 AND target_pair.tag_id = ?2 \
+           )",
+        params![source.value(), target.value()],
+    )?;
+    transaction.execute(
+        "UPDATE book_tags SET tag_id = ?1 WHERE tag_id = ?2",
+        params![target.value(), source.value()],
+    )?;
+    merge_saved_tag_facets(transaction, source, target)?;
+    transaction.execute("DELETE FROM tags WHERE id = ?1", [source.value()])?;
+    rebuild_affected_tag_projections(transaction, affected_books)?;
+    Ok(impact)
+}
+
+/// Deletes a tag only when its current usage matches the confirmed counts.
+pub(super) fn delete_tag(
+    transaction: &Transaction<'_>,
+    id: TagId,
+    confirmed: VocabularyMutationResult,
+) -> Result<VocabularyMutationResult> {
+    let impact = tag_impact(transaction, id)?;
+    if impact != confirmed {
+        return Err(StorageError::InvalidCuration(format!(
+            "tag usage changed from the confirmed counts: expected {} books and {} saved \
+             searches, found {} books and {} saved searches",
+            confirmed.books, confirmed.saved_searches, impact.books, impact.saved_searches
+        )));
+    }
+    let affected_books = prepare_affected_books(transaction, "book_tags", "tag_id", id.value())?;
+    transaction.execute("DELETE FROM book_tags WHERE tag_id = ?1", [id.value()])?;
+    transaction.execute(
+        "DELETE FROM saved_search_included_tags WHERE tag_id = ?1",
+        [id.value()],
+    )?;
+    transaction.execute(
+        "DELETE FROM saved_search_excluded_tags WHERE tag_id = ?1",
+        [id.value()],
+    )?;
+    transaction.execute("DELETE FROM tags WHERE id = ?1", [id.value()])?;
+    rebuild_affected_tag_projections(transaction, affected_books)?;
+    Ok(impact)
+}
+
+fn ensure_distinct_entities(source: i64, target: i64, kind: &str) -> Result<()> {
+    if source == target {
+        return Err(StorageError::InvalidCuration(format!(
+            "{kind} merge source and target must differ"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_unused(impact: VocabularyMutationResult, kind: &str, id: i64) -> Result<()> {
+    if impact.books != 0 || impact.saved_searches != 0 {
+        return Err(StorageError::InvalidCuration(format!(
+            "{kind} {id} is still used by {} books and {} saved searches",
+            impact.books, impact.saved_searches
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_entity_name_available(
+    connection: &Connection,
+    table: &'static str,
+    identity: &str,
+    current: i64,
+) -> Result<()> {
+    let collision = connection
+        .query_row(
+            &format!("SELECT id FROM {table} WHERE identity_key = ?1 AND id <> ?2"),
+            params![identity, current],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if let Some(target) = collision {
+        return Err(StorageError::InvalidCuration(format!(
+            "name collides with {table} entity {target}; merge into that entity instead"
+        )));
+    }
+    Ok(())
+}
+
+fn prepare_affected_books(
+    transaction: &Transaction<'_>,
+    table: &'static str,
+    id_column: &'static str,
+    id: i64,
+) -> Result<u64> {
+    transaction.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS lectern_vocabulary_books( \
+             book_id INTEGER PRIMARY KEY \
+         ) WITHOUT ROWID;",
+    )?;
+    transaction.execute("DELETE FROM temp.lectern_vocabulary_books", [])?;
+    transaction.execute(
+        &format!(
+            "INSERT INTO temp.lectern_vocabulary_books(book_id) \
+             SELECT DISTINCT book_id FROM {table} WHERE {id_column} = ?1"
+        ),
+        [id],
+    )?;
+    let count = transaction.query_row(
+        "SELECT count(*) FROM temp.lectern_vocabulary_books",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    checked_count(count)
+}
+
+fn prepare_source_credits(
+    transaction: &Transaction<'_>,
+    source: ContributorId,
+    target: ContributorId,
+) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS lectern_source_credits( \
+             book_id INTEGER NOT NULL, \
+             role TEXT NOT NULL, \
+             position INTEGER NOT NULL, \
+             target_existed INTEGER NOT NULL, \
+             PRIMARY KEY(book_id, role) \
+         ) WITHOUT ROWID;",
+    )?;
+    transaction.execute("DELETE FROM temp.lectern_source_credits", [])?;
+    transaction.execute(
+        "INSERT INTO temp.lectern_source_credits(book_id, role, position, target_existed) \
+         SELECT source.book_id, source.role, source.position, EXISTS( \
+             SELECT 1 FROM book_contributors target \
+             WHERE target.book_id = source.book_id \
+               AND target.role = source.role \
+               AND target.contributor_id = ?1 \
+         ) FROM book_contributors source WHERE source.contributor_id = ?2",
+        params![target.value(), source.value()],
+    )?;
+    Ok(())
+}
+
+fn contributor_affects_author_projection(
+    transaction: &Transaction<'_>,
+    contributor_id: i64,
+) -> Result<bool> {
+    transaction
+        .query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM book_contributors \
+                 WHERE contributor_id = ?1 AND role = 'author' \
+                 UNION ALL \
+                 SELECT 1 FROM temp.lectern_vocabulary_books affected \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM book_contributors author_credit \
+                     WHERE author_credit.book_id = affected.book_id \
+                       AND author_credit.role = 'author' \
+                 ) \
+             )",
+            [contributor_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn compact_affected_credit_positions(transaction: &Transaction<'_>) -> Result<()> {
+    let needs_compaction = transaction.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM ( \
+                 SELECT source.book_id, source.role \
+                 FROM temp.lectern_source_credits source \
+                 JOIN book_contributors credit \
+                   ON credit.book_id = source.book_id AND credit.role = source.role \
+                 GROUP BY source.book_id, source.role \
+                 HAVING min(credit.position) <> 0 \
+                    OR max(credit.position) <> count(*) - 1 \
+             ) \
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !needs_compaction {
+        return Ok(());
+    }
+
+    transaction.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS lectern_compacted_credits( \
+             book_id INTEGER NOT NULL, \
+             contributor_id INTEGER NOT NULL, \
+             role TEXT NOT NULL, \
+             position INTEGER NOT NULL, \
+             PRIMARY KEY(book_id, contributor_id, role) \
+         ) WITHOUT ROWID;",
+    )?;
+    transaction.execute("DELETE FROM temp.lectern_compacted_credits", [])?;
+    transaction.execute(
+        "INSERT INTO temp.lectern_compacted_credits(book_id, contributor_id, role, position) \
+         SELECT book_id, contributor_id, role, \
+                row_number() OVER (PARTITION BY book_id, role ORDER BY position, contributor_id) - 1 \
+         FROM book_contributors AS credit \
+         WHERE EXISTS ( \
+             SELECT 1 FROM temp.lectern_source_credits source \
+             WHERE source.book_id = credit.book_id AND source.role = credit.role \
+         )",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE book_contributors SET position = position + 1000000 \
+         WHERE EXISTS ( \
+             SELECT 1 FROM temp.lectern_compacted_credits compact \
+             WHERE compact.book_id = book_contributors.book_id \
+               AND compact.contributor_id = book_contributors.contributor_id \
+               AND compact.role = book_contributors.role \
+               AND compact.position <> book_contributors.position \
+         )",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE book_contributors AS credit SET position = ( \
+             SELECT compact.position FROM temp.lectern_compacted_credits compact \
+             WHERE compact.book_id = credit.book_id \
+               AND compact.contributor_id = credit.contributor_id \
+               AND compact.role = credit.role \
+         ) WHERE credit.position >= 1000000 \
+             AND EXISTS ( \
+                 SELECT 1 FROM temp.lectern_compacted_credits compact \
+                 WHERE compact.book_id = credit.book_id \
+                   AND compact.contributor_id = credit.contributor_id \
+                   AND compact.role = credit.role \
+             )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn merge_saved_contributor_facets(
+    transaction: &Transaction<'_>,
+    source: ContributorId,
+    target: ContributorId,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO saved_search_contributors(saved_search_id, contributor_id, author_only) \
+         SELECT saved_search_id, ?1, author_only \
+         FROM saved_search_contributors WHERE contributor_id = ?2 \
+         ON CONFLICT(saved_search_id, contributor_id) DO UPDATE SET \
+             author_only = max(author_only, excluded.author_only)",
+        params![target.value(), source.value()],
+    )?;
+    transaction.execute(
+        "DELETE FROM saved_search_contributors WHERE contributor_id = ?1",
+        [source.value()],
+    )?;
+    Ok(())
+}
+
+fn merge_saved_tag_facets(
+    transaction: &Transaction<'_>,
+    source: TagId,
+    target: TagId,
+) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM saved_search_excluded_tags \
+         WHERE tag_id = ?1 AND saved_search_id IN ( \
+             SELECT saved_search_id FROM saved_search_included_tags WHERE tag_id = ?2 \
+         )",
+        params![source.value(), target.value()],
+    )?;
+    transaction.execute(
+        "DELETE FROM saved_search_included_tags \
+         WHERE tag_id = ?1 AND saved_search_id IN ( \
+             SELECT saved_search_id FROM saved_search_excluded_tags WHERE tag_id = ?2 \
+         )",
+        params![source.value(), target.value()],
+    )?;
+    for table in ["saved_search_included_tags", "saved_search_excluded_tags"] {
+        transaction.execute(
+            &format!(
+                "INSERT OR IGNORE INTO {table}(saved_search_id, tag_id) \
+                 SELECT saved_search_id, ?1 FROM {table} WHERE tag_id = ?2"
+            ),
+            params![target.value(), source.value()],
+        )?;
+        transaction.execute(
+            &format!("DELETE FROM {table} WHERE tag_id = ?1"),
+            [source.value()],
+        )?;
+    }
+    Ok(())
+}
+
+fn rebuild_affected_contributor_projections(
+    transaction: &Transaction<'_>,
+    affected_books: u64,
+    affects_author_projection: bool,
+) -> Result<()> {
+    if !affects_author_projection {
+        return rebuild_affected_projections(
+            transaction,
+            affected_books,
+            "UPDATE books AS b SET contributors_search = coalesce(( \
+                 SELECT group_concat(display_name_projection, ' ') FROM ( \
+                     SELECT display_name_projection FROM book_contributors WHERE book_id = b.id \
+                     ORDER BY CASE role WHEN 'author' THEN 0 WHEN 'editor' THEN 1 \
+                         WHEN 'translator' THEN 2 WHEN 'illustrator' THEN 3 ELSE 4 END, \
+                         position, contributor_id \
+                 ) \
+             ), '') \
+             WHERE b.id IN (SELECT book_id FROM temp.lectern_vocabulary_books)",
+        );
+    }
+
+    rebuild_affected_projections(
+        transaction,
+        affected_books,
+        "UPDATE books AS b SET \
+             authors = coalesce(( \
+                 SELECT group_concat(display_name_projection, ', ') FROM ( \
+                     SELECT display_name_projection FROM book_contributors \
+                     WHERE book_id = b.id AND role = 'author' \
+                     ORDER BY position, contributor_id \
+                 ) \
+             ), ( \
+                 SELECT display_name_projection || ' (' || \
+                     CASE role WHEN 'author' THEN 'Author' WHEN 'editor' THEN 'Editor' \
+                         WHEN 'translator' THEN 'Translator' \
+                         WHEN 'illustrator' THEN 'Illustrator' ELSE 'Other' END || ')' \
+                 FROM book_contributors WHERE book_id = b.id \
+                 ORDER BY CASE role WHEN 'author' THEN 0 WHEN 'editor' THEN 1 \
+                     WHEN 'translator' THEN 2 WHEN 'illustrator' THEN 3 ELSE 4 END, \
+                     position, contributor_id LIMIT 1 \
+             ), ''), \
+             authors_search = coalesce(( \
+                 SELECT group_concat(display_name_projection, ' ') FROM ( \
+                     SELECT display_name_projection FROM book_contributors \
+                     WHERE book_id = b.id AND role = 'author' \
+                     ORDER BY position, contributor_id \
+                 ) \
+             ), ''), \
+             contributors_search = coalesce(( \
+                 SELECT group_concat(display_name_projection, ' ') FROM ( \
+                     SELECT display_name_projection FROM book_contributors WHERE book_id = b.id \
+                     ORDER BY CASE role WHEN 'author' THEN 0 WHEN 'editor' THEN 1 \
+                         WHEN 'translator' THEN 2 WHEN 'illustrator' THEN 3 ELSE 4 END, \
+                         position, contributor_id \
+                 ) \
+             ), ''), \
+             sort_authors = coalesce(( \
+                 SELECT sort_key_projection FROM book_contributors \
+                 WHERE book_id = b.id AND role = 'author' \
+                 ORDER BY position, contributor_id LIMIT 1 \
+             ), ( \
+                 SELECT sort_key_projection FROM book_contributors WHERE book_id = b.id \
+                 ORDER BY CASE role WHEN 'author' THEN 0 WHEN 'editor' THEN 1 \
+                     WHEN 'translator' THEN 2 WHEN 'illustrator' THEN 3 ELSE 4 END, \
+                     position, contributor_id LIMIT 1 \
+             ), '') \
+         WHERE b.id IN (SELECT book_id FROM temp.lectern_vocabulary_books)",
+    )
+}
+
+fn rebuild_affected_series_projections(
+    transaction: &Transaction<'_>,
+    affected_books: u64,
+) -> Result<()> {
+    rebuild_affected_projections(
+        transaction,
+        affected_books,
+        "UPDATE books AS b SET \
+             series = (SELECT name_projection FROM series_memberships WHERE book_id = b.id), \
+             series_key = (SELECT key_projection FROM series_memberships WHERE book_id = b.id), \
+             series_index = (SELECT series_index FROM series_memberships WHERE book_id = b.id) \
+         WHERE b.id IN (SELECT book_id FROM temp.lectern_vocabulary_books)",
+    )
+}
+
+fn rebuild_affected_tag_projections(
+    transaction: &Transaction<'_>,
+    affected_books: u64,
+) -> Result<()> {
+    rebuild_affected_projections(
+        transaction,
+        affected_books,
+        "UPDATE books AS b SET tags_search = coalesce(( \
+             SELECT group_concat(name, ' ') FROM ( \
+                 SELECT t.name AS name FROM book_tags bt \
+                 JOIN tags t ON t.id = bt.tag_id \
+                 WHERE bt.book_id = b.id ORDER BY t.identity_key, t.id \
+             ) \
+         ), '') WHERE b.id IN (SELECT book_id FROM temp.lectern_vocabulary_books)",
+    )
+}
+
+fn rebuild_affected_projections(
+    transaction: &Transaction<'_>,
+    affected_books: u64,
+    update_sql: &str,
+) -> Result<()> {
+    if affected_books < BULK_FTS_REFRESH_MIN_BOOKS {
+        transaction.execute(update_sql, [])?;
+        return Ok(());
+    }
+
+    transaction.execute(
+        "INSERT INTO books_fts( \
+             books_fts, rowid, title, authors_search, contributors_search, \
+             series, publisher, tags_search \
+         ) SELECT \
+             'delete', b.id, b.title, b.authors_search, b.contributors_search, \
+             b.series, b.publisher, b.tags_search \
+           FROM books b \
+           JOIN temp.lectern_vocabulary_books affected ON affected.book_id = b.id",
+        [],
+    )?;
+    transaction.execute_batch("DROP TRIGGER books_after_update")?;
+    transaction.execute(update_sql, [])?;
+    transaction.execute(
+        "INSERT INTO books_fts( \
+             rowid, title, authors_search, contributors_search, series, publisher, tags_search \
+         ) SELECT \
+             b.id, b.title, b.authors_search, b.contributors_search, \
+             b.series, b.publisher, b.tags_search \
+           FROM books b \
+           JOIN temp.lectern_vocabulary_books affected ON affected.book_id = b.id",
+        [],
+    )?;
+    transaction.execute_batch(BOOKS_AFTER_UPDATE_TRIGGER)?;
+    Ok(())
 }
 
 fn contributor_usage_row(

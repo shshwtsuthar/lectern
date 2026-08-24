@@ -19,7 +19,7 @@ use lectern_core::organisation::{
     BookEdit, BookSelection, BulkTagEdit, BulkTagResult, ContributorId, ContributorUsage,
     LibraryGeneration, NameKind, SavedSearch, SavedSearchId, SearchClause, SearchExpression,
     SearchParseError, SelectionSnapshot, SelectionTagUsage, SeriesId, SeriesUsage, TagId,
-    TagReference, TagUsage, TextMatch, identity_key, normalize_name,
+    TagReference, TagUsage, TextMatch, VocabularyMutationResult, identity_key, normalize_name,
 };
 use lectern_core::{
     AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookAssetDraft,
@@ -1113,6 +1113,195 @@ impl LibraryDatabase {
     /// Returns an error when the prefix is invalid or the bounded indexed query fails.
     pub fn search_tags(&self, prefix: &str, offset: u64, limit: u32) -> Result<Vec<TagUsage>> {
         organisation::search_tags(&self.connection, prefix, offset, limit)
+    }
+
+    /// Counts books and saved projections affected by a contributor mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the contributor is absent or counts cannot be loaded.
+    pub fn contributor_mutation_impact(
+        &self,
+        id: ContributorId,
+    ) -> Result<VocabularyMutationResult> {
+        organisation::contributor_impact(&self.connection, id)
+    }
+
+    /// Counts books and saved projections affected by a series mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the series is absent or counts cannot be loaded.
+    pub fn series_mutation_impact(&self, id: SeriesId) -> Result<VocabularyMutationResult> {
+        organisation::series_impact(&self.connection, id)
+    }
+
+    /// Counts books and saved projections affected by a tag mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tag is absent or counts cannot be loaded.
+    pub fn tag_mutation_impact(&self, id: TagId) -> Result<VocabularyMutationResult> {
+        organisation::tag_impact(&self.connection, id)
+    }
+
+    /// Renames a contributor and its affected projections in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the entity or name is invalid, the name collides, or the transaction
+    /// cannot commit.
+    pub fn rename_contributor(
+        &mut self,
+        id: ContributorId,
+        display_name: &str,
+        sort_name: &str,
+    ) -> Result<VocabularyMutationResult> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = organisation::rename_contributor(&transaction, id, display_name, sort_name)?;
+        transaction.commit()?;
+        self.bump_generation();
+        Ok(result)
+    }
+
+    /// Merges a contributor source into an explicit stable target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either entity is absent, source equals target, or any relationship,
+    /// saved facet, projection, or FTS change cannot commit.
+    pub fn merge_contributors(
+        &mut self,
+        source: ContributorId,
+        target: ContributorId,
+    ) -> Result<VocabularyMutationResult> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = organisation::merge_contributors(&transaction, source, target)?;
+        transaction.commit()?;
+        self.bump_generation();
+        Ok(result)
+    }
+
+    /// Deletes a contributor only when no book or saved search references it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the contributor is absent, still used, or cannot be deleted.
+    pub fn delete_contributor(&mut self, id: ContributorId) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        organisation::delete_contributor(&transaction, id)?;
+        transaction.commit()?;
+        self.bump_generation();
+        Ok(())
+    }
+
+    /// Renames a series and its affected projections in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the entity or name is invalid, the name collides, or the transaction
+    /// cannot commit.
+    pub fn rename_series(&mut self, id: SeriesId, name: &str) -> Result<VocabularyMutationResult> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = organisation::rename_series(&transaction, id, name)?;
+        transaction.commit()?;
+        self.bump_generation();
+        Ok(result)
+    }
+
+    /// Merges a series source into an explicit stable target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either entity is absent, source equals target, or any relationship,
+    /// saved facet, projection, or FTS change cannot commit.
+    pub fn merge_series(
+        &mut self,
+        source: SeriesId,
+        target: SeriesId,
+    ) -> Result<VocabularyMutationResult> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = organisation::merge_series(&transaction, source, target)?;
+        transaction.commit()?;
+        self.bump_generation();
+        Ok(result)
+    }
+
+    /// Deletes a series only when no book or saved search references it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the series is absent, still used, or cannot be deleted.
+    pub fn delete_series(&mut self, id: SeriesId) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        organisation::delete_series(&transaction, id)?;
+        transaction.commit()?;
+        self.bump_generation();
+        Ok(())
+    }
+
+    /// Renames a tag and its affected search projections in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the entity or name is invalid, the name collides, or the transaction
+    /// cannot commit.
+    pub fn rename_tag(&mut self, id: TagId, name: &str) -> Result<VocabularyMutationResult> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = organisation::rename_tag(&transaction, id, name)?;
+        transaction.commit()?;
+        self.bump_generation();
+        Ok(result)
+    }
+
+    /// Merges a tag source into an explicit stable target and deduplicates every reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either entity is absent, source equals target, or any relationship,
+    /// saved facet, projection, or FTS change cannot commit.
+    pub fn merge_tags(&mut self, source: TagId, target: TagId) -> Result<VocabularyMutationResult> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = organisation::merge_tags(&transaction, source, target)?;
+        transaction.commit()?;
+        self.bump_generation();
+        Ok(result)
+    }
+
+    /// Deletes a tag only when its usage still matches the user-confirmed counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tag is absent, counts changed, or relationships, saved facets,
+    /// projections, and the entity cannot be deleted atomically.
+    pub fn delete_tag(
+        &mut self,
+        id: TagId,
+        confirmed: VocabularyMutationResult,
+    ) -> Result<VocabularyMutationResult> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = organisation::delete_tag(&transaction, id, confirmed)?;
+        transaction.commit()?;
+        self.bump_generation();
+        Ok(result)
     }
 
     /// Lists durable saved projections alphabetically by normalized name.
@@ -2412,7 +2601,7 @@ mod tests {
             BookEdit, BookSelection, BulkTagEdit, ContributorCreditEdit, ContributorFacet,
             ContributorReference, ContributorRole, ExactFacets, ImportedContributorCredit,
             ImportedOrganisation, SavedSearchId, SearchExpression, SeriesIndex,
-            SeriesMembershipEdit, SeriesReference, TagId, TagReference,
+            SeriesMembershipEdit, SeriesReference, TagId, TagReference, VocabularyMutationResult,
         },
     };
     use rusqlite::{Connection, params};
@@ -4646,6 +4835,410 @@ END;
                 .collect::<Vec<_>>(),
             [first_id]
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn vocabulary_mutations_rewrite_relations_saved_facets_and_projections_atomically() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let first = database
+            .import_books(&[record("/books/merge-first.epub", "First", "Legacy")])
+            .unwrap()[0];
+        let second = database
+            .import_books(&[record("/books/merge-second.epub", "Second", "Legacy")])
+            .unwrap()[0];
+        database
+            .save_book_edit(&BookEdit {
+                id: first,
+                title: "First".into(),
+                publisher: Some("Publisher".into()),
+                language: Some("en".into()),
+                description: None,
+                contributors: vec![
+                    ContributorCreditEdit {
+                        contributor: ContributorReference::New {
+                            display_name: "Source Writer".into(),
+                            sort_name: "Writer, Source".into(),
+                        },
+                        role: ContributorRole::Author,
+                        position: 0,
+                    },
+                    ContributorCreditEdit {
+                        contributor: ContributorReference::New {
+                            display_name: "Other Writer".into(),
+                            sort_name: "Writer, Other".into(),
+                        },
+                        role: ContributorRole::Author,
+                        position: 1,
+                    },
+                    ContributorCreditEdit {
+                        contributor: ContributorReference::New {
+                            display_name: "Target Writer".into(),
+                            sort_name: "Writer, Target".into(),
+                        },
+                        role: ContributorRole::Author,
+                        position: 2,
+                    },
+                    ContributorCreditEdit {
+                        contributor: ContributorReference::New {
+                            display_name: "Source Writer".into(),
+                            sort_name: "Writer, Source".into(),
+                        },
+                        role: ContributorRole::Editor,
+                        position: 0,
+                    },
+                ],
+                series: Some(SeriesMembershipEdit {
+                    series: SeriesReference::New("Source Series".into()),
+                    index: Some("1.5".parse().unwrap()),
+                }),
+                tags: vec![
+                    TagReference::New("Source Tag".into()),
+                    TagReference::New("Target Tag".into()),
+                ],
+            })
+            .unwrap();
+        let seeded_first = database.get_book(first).unwrap().unwrap();
+        let source_contributor = seeded_first
+            .contributors
+            .iter()
+            .find(|credit| credit.contributor.display_name == "Source Writer")
+            .unwrap()
+            .contributor
+            .id;
+        let target_contributor = seeded_first
+            .contributors
+            .iter()
+            .find(|credit| credit.contributor.display_name == "Target Writer")
+            .unwrap()
+            .contributor
+            .id;
+        let source_series = seeded_first.series_membership.as_ref().unwrap().series.id;
+        let source_tag = seeded_first
+            .tags
+            .iter()
+            .find(|tag| tag.name == "Source Tag")
+            .unwrap()
+            .id;
+        let target_tag = seeded_first
+            .tags
+            .iter()
+            .find(|tag| tag.name == "Target Tag")
+            .unwrap()
+            .id;
+        database
+            .save_book_edit(&BookEdit {
+                id: second,
+                title: "Second".into(),
+                publisher: None,
+                language: Some("en".into()),
+                description: None,
+                contributors: vec![
+                    ContributorCreditEdit {
+                        contributor: ContributorReference::Existing(target_contributor),
+                        role: ContributorRole::Author,
+                        position: 0,
+                    },
+                    ContributorCreditEdit {
+                        contributor: ContributorReference::Existing(source_contributor),
+                        role: ContributorRole::Author,
+                        position: 1,
+                    },
+                ],
+                series: Some(SeriesMembershipEdit {
+                    series: SeriesReference::Existing(source_series),
+                    index: Some("2".parse().unwrap()),
+                }),
+                tags: vec![TagReference::Existing(source_tag)],
+            })
+            .unwrap();
+        let target_series = {
+            database
+                .connection
+                .execute(
+                    "INSERT INTO series_entities(name, identity_key) VALUES ('Target Series', \
+                     'target series')",
+                    [],
+                )
+                .unwrap();
+            lectern_core::organisation::SeriesId::new(database.connection.last_insert_rowid())
+        };
+
+        let saved_source = database
+            .create_saved_search(
+                "Source facets",
+                &LibraryQuery {
+                    facets: ExactFacets::new(
+                        vec![ContributorFacet {
+                            contributor: source_contributor,
+                            author_only: false,
+                        }],
+                        Some(source_series),
+                        vec![source_tag],
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                    ..LibraryQuery::default()
+                },
+            )
+            .unwrap();
+        let saved_target_wins = database
+            .create_saved_search(
+                "Target include wins",
+                &LibraryQuery {
+                    facets: ExactFacets::new(
+                        vec![
+                            ContributorFacet {
+                                contributor: target_contributor,
+                                author_only: true,
+                            },
+                            ContributorFacet {
+                                contributor: source_contributor,
+                                author_only: false,
+                            },
+                        ],
+                        None,
+                        vec![target_tag],
+                        vec![source_tag],
+                    )
+                    .unwrap(),
+                    ..LibraryQuery::default()
+                },
+            )
+            .unwrap();
+        let saved_exclusion_wins = database
+            .create_saved_search(
+                "Target exclusion wins",
+                &LibraryQuery {
+                    facets: ExactFacets::new(Vec::new(), None, vec![source_tag], vec![target_tag])
+                        .unwrap(),
+                    ..LibraryQuery::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .contributor_mutation_impact(source_contributor)
+                .unwrap(),
+            VocabularyMutationResult {
+                books: 2,
+                saved_searches: 2
+            }
+        );
+        assert_eq!(
+            database.series_mutation_impact(source_series).unwrap(),
+            VocabularyMutationResult {
+                books: 2,
+                saved_searches: 1
+            }
+        );
+        assert_eq!(
+            database.tag_mutation_impact(source_tag).unwrap(),
+            VocabularyMutationResult {
+                books: 2,
+                saved_searches: 3
+            }
+        );
+        let assets_before = [
+            database.get_book(first).unwrap().unwrap().assets,
+            database.get_book(second).unwrap().unwrap().assets,
+        ];
+
+        database
+            .rename_contributor(source_contributor, "Renamed Source", "Source, Renamed")
+            .unwrap();
+        assert_eq!(
+            database
+                .query(&LibraryQuery {
+                    search: "author:\"Renamed Source\"".into(),
+                    ..LibraryQuery::default()
+                })
+                .unwrap()
+                .len(),
+            2
+        );
+        let before_collision = database.get_book(first).unwrap().unwrap();
+        assert!(matches!(
+            database.rename_contributor(source_contributor, " target   writer ", "Writer, Target"),
+            Err(StorageError::InvalidCuration(_))
+        ));
+        assert_eq!(database.get_book(first).unwrap().unwrap(), before_collision);
+
+        database
+            .connection
+            .execute_batch(&format!(
+                "CREATE TEMP TRIGGER inject_contributor_merge_failure \
+                 BEFORE DELETE ON contributors WHEN old.id = {} BEGIN \
+                     SELECT raise(ABORT, 'injected contributor merge failure'); \
+                 END;",
+                source_contributor.value()
+            ))
+            .unwrap();
+        assert!(
+            database
+                .merge_contributors(source_contributor, target_contributor)
+                .is_err()
+        );
+        assert_eq!(
+            database
+                .contributor_mutation_impact(source_contributor)
+                .unwrap()
+                .books,
+            2
+        );
+        assert_eq!(database.get_book(first).unwrap().unwrap(), before_collision);
+        database
+            .connection
+            .execute_batch("DROP TRIGGER inject_contributor_merge_failure")
+            .unwrap();
+
+        database
+            .merge_contributors(source_contributor, target_contributor)
+            .unwrap();
+        let merged_first = database.get_book(first).unwrap().unwrap();
+        let first_authors = merged_first
+            .contributors
+            .iter()
+            .filter(|credit| credit.role == ContributorRole::Author)
+            .collect::<Vec<_>>();
+        assert_eq!(first_authors.len(), 2);
+        assert_eq!(first_authors[0].contributor.id, target_contributor);
+        assert_eq!(first_authors[0].position, 0);
+        assert_eq!(first_authors[1].position, 1);
+        assert_eq!(merged_first.authors, "Target Writer, Other Writer");
+        assert!(merged_first.contributors.iter().any(|credit| {
+            credit.contributor.id == target_contributor && credit.role == ContributorRole::Editor
+        }));
+        assert!(
+            database
+                .search_contributors("Renamed Source", 0, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(database.delete_contributor(target_contributor).is_err());
+
+        database
+            .rename_series(source_series, "Renamed Series")
+            .unwrap();
+        database.merge_series(source_series, target_series).unwrap();
+        for id in [first, second] {
+            let membership = database
+                .get_book(id)
+                .unwrap()
+                .unwrap()
+                .series_membership
+                .unwrap();
+            assert_eq!(membership.series.id, target_series);
+            assert_eq!(membership.series.name, "Target Series");
+        }
+        assert!(database.delete_series(target_series).is_err());
+
+        database.rename_tag(source_tag, "Renamed Tag").unwrap();
+        assert_eq!(
+            database
+                .query(&LibraryQuery {
+                    search: "tag:\"Renamed Tag\"".into(),
+                    ..LibraryQuery::default()
+                })
+                .unwrap()
+                .len(),
+            2
+        );
+        database.merge_tags(source_tag, target_tag).unwrap();
+        for id in [first, second] {
+            let tags = database.get_book(id).unwrap().unwrap().tags;
+            assert_eq!(tags.len(), 1);
+            assert_eq!(tags[0].id, target_tag);
+        }
+
+        let saved = database.list_saved_searches().unwrap();
+        let source = saved.iter().find(|value| value.id == saved_source).unwrap();
+        assert_eq!(source.query.facets.contributors.len(), 1);
+        assert_eq!(
+            source.query.facets.contributors[0].contributor,
+            target_contributor
+        );
+        assert_eq!(source.query.facets.series, Some(target_series));
+        assert_eq!(source.query.facets.included_tags, [target_tag]);
+        let include = saved
+            .iter()
+            .find(|value| value.id == saved_target_wins)
+            .unwrap();
+        assert_eq!(include.query.facets.contributors.len(), 1);
+        assert!(include.query.facets.contributors[0].author_only);
+        assert_eq!(include.query.facets.included_tags, [target_tag]);
+        assert!(include.query.facets.excluded_tags.is_empty());
+        let exclude = saved
+            .iter()
+            .find(|value| value.id == saved_exclusion_wins)
+            .unwrap();
+        assert!(exclude.query.facets.included_tags.is_empty());
+        assert_eq!(exclude.query.facets.excluded_tags, [target_tag]);
+
+        let confirmed = database.tag_mutation_impact(target_tag).unwrap();
+        assert!(
+            database
+                .delete_tag(
+                    target_tag,
+                    VocabularyMutationResult {
+                        books: confirmed.books + 1,
+                        ..confirmed
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(database.tag_mutation_impact(target_tag).unwrap(), confirmed);
+        assert_eq!(
+            database.delete_tag(target_tag, confirmed).unwrap(),
+            confirmed
+        );
+        assert!(
+            database
+                .search_tags("Target Tag", 0, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            database
+                .query(&LibraryQuery {
+                    search: "tag:\"Target Tag\"".into(),
+                    ..LibraryQuery::default()
+                })
+                .unwrap()
+                .is_empty()
+        );
+        for (offset, id) in [first, second].into_iter().enumerate() {
+            let book = database.get_book(id).unwrap().unwrap();
+            assert!(book.tags.is_empty());
+            assert_eq!(book.assets, assets_before[offset]);
+        }
+        assert!(database.list_saved_searches().unwrap().iter().all(|saved| {
+            !saved.query.facets.included_tags.contains(&target_tag)
+                && !saved.query.facets.excluded_tags.contains(&target_tag)
+        }));
+
+        database
+            .connection
+            .execute(
+                "INSERT INTO contributors(display_name, sort_name, identity_key, sort_key) \
+                 VALUES ('Unused Writer', 'Unused Writer', 'unused writer', 'unused writer')",
+                [],
+            )
+            .unwrap();
+        let unused_contributor =
+            lectern_core::organisation::ContributorId::new(database.connection.last_insert_rowid());
+        database.delete_contributor(unused_contributor).unwrap();
+        database
+            .connection
+            .execute(
+                "INSERT INTO series_entities(name, identity_key) \
+                 VALUES ('Unused Series', 'unused series')",
+                [],
+            )
+            .unwrap();
+        let unused_series =
+            lectern_core::organisation::SeriesId::new(database.connection.last_insert_rowid());
+        database.delete_series(unused_series).unwrap();
     }
 
     #[test]

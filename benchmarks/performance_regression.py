@@ -98,13 +98,14 @@ def main(arguments: list[str]) -> int:
             "reimport": "reimports.json",
             "organisation-migration": "migrations.json",
             "organisation-query": "organisation-queries.json",
+            "organisation-vocabulary": "organisation-vocabulary.json",
         }
         query_output = output / result_names[mode]
         run_command(seed_command(mode, database, seed_output, workload), commands)
         seed = read_json(seed_output)
         if mode == "organisation-migration":
             validate_migration_seed_result(seed, workload)
-        elif mode == "organisation-query":
+        elif mode in ("organisation-query", "organisation-vocabulary"):
             validate_organisation_query_seed_result(seed, workload)
         else:
             validate_seed_result(seed, workload["books"])
@@ -127,6 +128,8 @@ def main(arguments: list[str]) -> int:
             decisions = evaluate_migration_result(query_result, budget)
         elif mode == "organisation-query":
             decisions = evaluate_organisation_query_result(query_result, budget)
+        elif mode == "organisation-vocabulary":
+            decisions = evaluate_organisation_vocabulary_result(query_result, budget)
         else:
             decisions = evaluate_query_result(query_result, budget)
         report["seed"] = seed
@@ -162,7 +165,7 @@ def seed_command(
     command = ["cargo", "run", "--release", "--locked", "-p", "lectern-benchmark"]
     if mode == "organisation-migration":
         command += ["--bin", "organisation-benchmark", "--", "seed-migration"]
-    elif mode == "organisation-query":
+    elif mode in ("organisation-query", "organisation-vocabulary"):
         command += ["--bin", "organisation-query-benchmark", "--", "seed"]
     else:
         command += ["--", "seed"]
@@ -191,6 +194,8 @@ def workload_command(
         command += ["--bin", "organisation-benchmark", "--", "migration"]
     elif mode == "organisation-query":
         command += ["--bin", "organisation-query-benchmark", "--", "query"]
+    elif mode == "organisation-vocabulary":
+        command += ["--bin", "organisation-vocabulary-benchmark", "--"]
     else:
         command += [
             "--",
@@ -268,11 +273,13 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "reimport",
         "organisation-migration",
         "organisation-query",
+        "organisation-vocabulary",
     ):
         raise RegressionError(
             "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
             "'remove', 'detach', 'attach', 'replace', 'export', 'reimport', "
-            "'organisation-migration'"
+            "'organisation-migration', 'organisation-query', or "
+            "'organisation-vocabulary'"
         )
     if query_mode == "full":
         scenario_names = workload.get("full_library_scenarios")
@@ -326,7 +333,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 raise RegressionError(
                     "organisation migration must use source schema version five"
                 )
-        if query_mode == "organisation-query":
+        if query_mode in ("organisation-query", "organisation-vocabulary"):
             for field in (
                 "page_size",
                 "contributors",
@@ -338,8 +345,15 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             ):
                 if positive_or_zero_field(workload, field, "budget.workload") == 0:
                     raise RegressionError(
-                        f"organisation query workload {field} must be greater than zero"
+                        f"organisation workload {field} must be greater than zero"
                     )
+        if query_mode == "organisation-vocabulary":
+            if positive_or_zero_field(
+                workload, "matching_books", "budget.workload"
+            ) == 0:
+                raise RegressionError(
+                    "organisation vocabulary matching_books must be greater than zero"
+                )
         scenario_names = workload.get("scenarios")
         if not isinstance(scenario_names, list) or not all(
             isinstance(name, str) and name for name in scenario_names
@@ -387,6 +401,12 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             positive_or_zero_field(
                 scenario_budget,
                 "max_peak_rss_bytes",
+                f"budget {name!r}",
+            )
+        if query_mode == "organisation-vocabulary":
+            positive_or_zero_field(
+                scenario_budget,
+                "max_peak_rss_delta_bytes",
                 f"budget {name!r}",
             )
         ratio_to = scenario_budget.get("max_p95_ratio_to")
@@ -1063,6 +1083,85 @@ def evaluate_organisation_query_result(
     if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
         raise RegressionError("organisation query scenarios do not match the versioned budget")
     return evaluate_latency_budgets(by_name, budget)
+
+
+def evaluate_organisation_vocabulary_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "organisation vocabulary result"
+    if result.get("kind") != "organisation-vocabulary":
+        raise RegressionError("organisation vocabulary result kind is invalid")
+    expected_fields = {
+        "library_books": workload["books"],
+        "matching_books": workload["matching_books"],
+        "saved_searches": workload["saved_searches"],
+        "warmup_iterations": workload["warmup_iterations"],
+        "measured_iterations": workload["measured_iterations"],
+    }
+    for field, expected in expected_fields.items():
+        if positive_or_zero_field(result, field, context) != expected:
+            raise RegressionError(
+                f"organisation vocabulary {field} does not match the budget"
+            )
+    if positive_or_zero_field(result, "page_size", context) != workload["page_size"]:
+        raise RegressionError("organisation vocabulary page size does not match the budget")
+    checks = result.get("verified_checks")
+    if not isinstance(checks, list) or set(checks) != set(workload["correctness"]):
+        raise RegressionError("organisation vocabulary correctness checks did not reconcile")
+    peak_rss = positive_or_zero_field(result, "peak_rss_delta_bytes", context)
+
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError("organisation vocabulary result must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    operations = workload["warmup_iterations"] + workload["measured_iterations"]
+    for index, scenario in enumerate(scenarios):
+        scenario_context = f"organisation vocabulary scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{scenario_context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{scenario_context}.name must be unique and non-empty")
+        if positive_or_zero_field(
+            scenario, "successful_operations", scenario_context
+        ) != operations:
+            raise RegressionError(f"{scenario_context} operation count does not reconcile")
+        expected_books = 0 if name == "manager_search_page" else workload["matching_books"]
+        if positive_or_zero_field(
+            scenario, "books_affected_per_operation", scenario_context
+        ) != expected_books:
+            raise RegressionError(f"{scenario_context} book count does not reconcile")
+        expected_searches = 0 if name == "manager_search_page" else workload["saved_searches"]
+        if positive_or_zero_field(
+            scenario, "saved_searches_affected_per_operation", scenario_context
+        ) != expected_searches:
+            raise RegressionError(f"{scenario_context} saved-search count does not reconcile")
+        positive_or_zero_field(scenario, "refreshed_result_count", scenario_context)
+        samples = scenario.get("samples_ns")
+        if not isinstance(samples, list) or len(samples) != workload["measured_iterations"]:
+            raise RegressionError(f"{scenario_context} sample count does not match the budget")
+        if any(
+            isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+            for sample in samples
+        ):
+            raise RegressionError(f"{scenario_context}.samples_ns must contain positive integers")
+        latency = object_field(scenario, "latency_ms", scenario_context)
+        positive_number_field(latency, "p95", f"{scenario_context}.latency_ms")
+        by_name[name] = scenario
+
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("organisation vocabulary scenarios do not match the budget")
+    decisions = evaluate_latency_budgets(by_name, budget)
+    for decision in decisions:
+        maximum_rss = budget["budgets"][decision["name"]]["max_peak_rss_delta_bytes"]
+        decision |= {
+            "peak_rss_delta_bytes": peak_rss,
+            "max_peak_rss_delta_bytes": maximum_rss,
+        }
+        decision["passed"] = bool(decision["passed"] and peak_rss <= maximum_rss)
+    return decisions
 
 
 def evaluate_latency_budgets(
