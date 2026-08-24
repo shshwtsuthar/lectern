@@ -52,6 +52,7 @@ struct MetadataActions {
     open: Option<(AssetId, PathBuf)>,
     reveal: Option<(AssetId, PathBuf)>,
     relink: Option<(AssetId, BookFormat)>,
+    replace: Option<AssetReplaceSelection>,
     detach: Option<AssetDetachConfirmation>,
     attach: Option<BookFormat>,
     remove: bool,
@@ -76,6 +77,8 @@ struct AssetMaintenanceUi {
     show_report: bool,
     attaching_format: Option<BookFormat>,
     relinking_asset: Option<AssetId>,
+    replacing_asset: Option<AssetId>,
+    replace_confirmation: Option<AssetReplaceConfirmation>,
     detaching_asset: Option<AssetId>,
     detach_confirmation: Option<AssetDetachConfirmation>,
 }
@@ -85,6 +88,7 @@ impl AssetMaintenanceUi {
         self.scanning
             || self.attaching_format.is_some()
             || self.relinking_asset.is_some()
+            || self.replacing_asset.is_some()
             || self.detaching_asset.is_some()
     }
 }
@@ -97,9 +101,24 @@ struct AssetDetachConfirmation {
     path: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssetReplaceSelection {
+    book_id: BookId,
+    asset_id: AssetId,
+    format: BookFormat,
+    current_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssetReplaceConfirmation {
+    selection: AssetReplaceSelection,
+    replacement_path: PathBuf,
+}
+
 #[derive(Clone, Copy)]
 struct MetadataOperationState {
     relinking_asset: Option<AssetId>,
+    replacing_asset: Option<AssetId>,
     detaching_asset: Option<AssetId>,
     platform_busy: Option<(AssetId, PlatformAction)>,
     attaching_format: Option<BookFormat>,
@@ -358,6 +377,12 @@ impl LecternApp {
                     asset_id,
                     result,
                 } => self.asset_relinked(book_id, asset_id, result),
+                WorkerEvent::AssetReplaced {
+                    book_id,
+                    asset_id,
+                    replacement_path,
+                    result,
+                } => self.asset_replaced(book_id, asset_id, replacement_path, result),
                 WorkerEvent::QueryFinished { .. }
                 | WorkerEvent::QueryDiscarded { .. }
                 | WorkerEvent::BookLoaded { .. } => {}
@@ -622,6 +647,47 @@ impl LecternApp {
                         .assets
                         .iter()
                         .any(|asset| asset.id == asset_id)
+                {
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn asset_replaced(
+        &mut self,
+        book_id: BookId,
+        asset_id: AssetId,
+        replacement_path: PathBuf,
+        result: Result<(), String>,
+    ) {
+        if self.asset_maintenance.replacing_asset == Some(asset_id) {
+            self.asset_maintenance.replacing_asset = None;
+        }
+        match result {
+            Ok(()) => {
+                "Replaced book file; the old file was kept on disk".clone_into(&mut self.status);
+                if let Some(editor) = &mut self.editor
+                    && editor.original.id == book_id
+                    && let Some(asset) = editor
+                        .original
+                        .assets
+                        .iter_mut()
+                        .find(|asset| asset.id == asset_id)
+                {
+                    asset.path = replacement_path;
+                    asset.health = AssetHealth::Available;
+                    editor.error = None;
+                }
+                self.refresh_library();
+                if self.selected == Some(book_id) {
+                    self.reload_selected_book_after_asset_change();
+                }
+            }
+            Err(error) => {
+                self.status = format!("Could not replace book file: {error}");
+                if let Some(editor) = &mut self.editor
+                    && editor.original.id == book_id
                 {
                     editor.error = Some(error);
                 }
@@ -988,6 +1054,7 @@ impl LecternApp {
     fn select_book(&mut self, id: BookId) {
         self.book_removal.confirmation = None;
         self.asset_maintenance.detach_confirmation = None;
+        self.asset_maintenance.replace_confirmation = None;
         self.selected = Some(id);
         self.editor = None;
         if self.workers.load_book(id) {
@@ -1001,6 +1068,7 @@ impl LecternApp {
     fn clear_selection(&mut self) {
         self.book_removal.confirmation = None;
         self.asset_maintenance.detach_confirmation = None;
+        self.asset_maintenance.replace_confirmation = None;
         self.selected = None;
         self.editor_loading = None;
         self.editor = None;
@@ -1026,6 +1094,7 @@ impl LecternApp {
         let mut open = None;
         let mut reveal = None;
         let mut relink = None;
+        let mut replace = None;
         let mut detach = None;
         let mut attach = None;
         let mut remove = false;
@@ -1066,6 +1135,7 @@ impl LecternApp {
                     editor,
                     MetadataOperationState {
                         relinking_asset: self.asset_maintenance.relinking_asset,
+                        replacing_asset: self.asset_maintenance.replacing_asset,
                         detaching_asset: self.asset_maintenance.detaching_asset,
                         platform_busy: self.platform_busy,
                         attaching_format: self.asset_maintenance.attaching_format,
@@ -1078,6 +1148,7 @@ impl LecternApp {
                 open = actions.open;
                 reveal = actions.reveal;
                 relink = actions.relink;
+                replace = actions.replace;
                 detach = actions.detach;
                 attach = actions.attach;
                 remove = actions.remove;
@@ -1104,7 +1175,9 @@ impl LecternApp {
         } else if let Some((asset_id, path)) = reveal {
             self.start_platform_action(asset_id, PlatformAction::Reveal, path);
         } else if let Some((asset_id, format)) = relink {
-            self.choose_asset_replacement(asset_id, format);
+            self.choose_asset_relink(asset_id, format);
+        } else if let Some(selection) = replace {
+            self.choose_asset_replacement(selection);
         } else if let Some(confirmation) = detach {
             self.asset_maintenance.detach_confirmation = Some(confirmation);
         } else if let Some(format) = attach {
@@ -1243,6 +1316,81 @@ impl LecternApp {
         }
     }
 
+    fn asset_replace_confirmation_window(&mut self, context: &egui::Context) {
+        let Some(confirmation) = self.asset_maintenance.replace_confirmation.clone() else {
+            return;
+        };
+        let response =
+            egui::Modal::new(egui::Id::new("asset-replace-confirmation")).show(context, |ui| {
+                ui.set_max_width(500.0);
+                ui.heading(format!("Replace {} file?", confirmation.selection.format));
+                ui.add_space(6.0);
+                ui.label("Current file:");
+                ui.label(
+                    RichText::new(confirmation.selection.current_path.display().to_string())
+                        .monospace()
+                        .color(MUTED),
+                );
+                ui.add_space(4.0);
+                ui.label("Replacement file:");
+                ui.label(
+                    RichText::new(confirmation.replacement_path.display().to_string())
+                        .monospace()
+                        .color(MUTED),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "The old referenced file will remain on disk and will not be modified.",
+                    )
+                    .color(MUTED),
+                );
+                ui.add_space(14.0);
+                let mut confirm = false;
+                let mut cancel = false;
+                ui.horizontal(|ui| {
+                    confirm = ui.button("Replace file").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+                (confirm, cancel)
+            });
+        let should_close = response.should_close();
+        let (confirm, cancel) = response.inner;
+        if confirm {
+            self.start_asset_replacement(&confirmation);
+        } else if cancel || should_close {
+            self.asset_maintenance.replace_confirmation = None;
+        }
+    }
+
+    fn start_asset_replacement(&mut self, confirmation: &AssetReplaceConfirmation) {
+        self.asset_maintenance.replace_confirmation = None;
+        if self.importing
+            || self.asset_maintenance.busy()
+            || self.book_removal.removing.is_some()
+            || self.selected != Some(confirmation.selection.book_id)
+        {
+            return;
+        }
+        if self.workers.replace_reference_asset(
+            confirmation.selection.book_id,
+            confirmation.selection.asset_id,
+            confirmation.selection.format,
+            confirmation.replacement_path.clone(),
+        ) {
+            self.asset_maintenance.replacing_asset = Some(confirmation.selection.asset_id);
+            if let Some(editor) = &mut self.editor {
+                editor.error = None;
+            }
+            self.status = format!(
+                "Validating replacement {} file…",
+                confirmation.selection.format
+            );
+        } else {
+            "Library maintenance worker is unavailable".clone_into(&mut self.status);
+        }
+    }
+
     fn start_book_removal(&mut self, confirmation: BookRemovalConfirmation) {
         self.book_removal.confirmation = None;
         if self.book_removal.removing.is_some() {
@@ -1282,7 +1430,7 @@ impl LecternApp {
         }
     }
 
-    fn choose_asset_replacement(&mut self, asset_id: AssetId, format: BookFormat) {
+    fn choose_asset_relink(&mut self, asset_id: AssetId, format: BookFormat) {
         if self.asset_maintenance.busy() {
             return;
         }
@@ -1310,6 +1458,25 @@ impl LecternApp {
         } else {
             "Library maintenance worker is unavailable".clone_into(&mut self.status);
         }
+    }
+
+    fn choose_asset_replacement(&mut self, selection: AssetReplaceSelection) {
+        if self.importing || self.asset_maintenance.busy() || self.book_removal.removing.is_some() {
+            return;
+        }
+        let extension = format_extension(selection.format);
+        let title = format!("Replace {} file", selection.format);
+        let Some(replacement_path) = rfd::FileDialog::new()
+            .set_title(&title)
+            .add_filter(selection.format.to_string(), &[extension])
+            .pick_file()
+        else {
+            return;
+        };
+        self.asset_maintenance.replace_confirmation = Some(AssetReplaceConfirmation {
+            selection,
+            replacement_path,
+        });
     }
 
     fn choose_format_attachment(&mut self, format: BookFormat) {
@@ -1581,6 +1748,7 @@ impl eframe::App for LecternApp {
         self.import_summary_window(ui.ctx());
         self.asset_health_report_window(ui.ctx());
         self.asset_detach_confirmation_window(ui.ctx());
+        self.asset_replace_confirmation_window(ui.ctx());
         self.book_removal_confirmation_window(ui.ctx());
 
         if files_hovering {
@@ -1731,9 +1899,7 @@ fn metadata_form(
             asset_rows(
                 ui,
                 &editor.original,
-                state.relinking_asset,
-                state.detaching_asset,
-                state.platform_busy,
+                state,
                 !editor.saving && !state.library_operation_busy && !state.removal_busy,
                 &mut actions,
             );
@@ -1768,9 +1934,7 @@ fn metadata_form(
 fn asset_rows(
     ui: &mut egui::Ui,
     book: &Book,
-    relinking_asset: Option<AssetId>,
-    detaching_asset: Option<AssetId>,
-    platform_busy: Option<(AssetId, PlatformAction)>,
+    state: MetadataOperationState,
     action_enabled: bool,
     actions: &mut MetadataActions,
 ) {
@@ -1791,9 +1955,9 @@ fn asset_rows(
                     .color(health_color)
                     .size(12.0),
             );
-            let platform_enabled =
-                platform_busy.is_none() && asset.storage == lectern_core::AssetStorage::Reference;
-            let open_text = if platform_busy == Some((asset.id, PlatformAction::Open)) {
+            let platform_enabled = state.platform_busy.is_none()
+                && asset.storage == lectern_core::AssetStorage::Reference;
+            let open_text = if state.platform_busy == Some((asset.id, PlatformAction::Open)) {
                 "Opening…"
             } else {
                 "Open"
@@ -1805,18 +1969,23 @@ fn asset_rows(
             {
                 actions.open = Some((asset.id, asset.path.clone()));
             }
-            let menu_text = if detaching_asset == Some(asset.id) {
+            let menu_text = if state.detaching_asset == Some(asset.id) {
                 "Detaching…"
+            } else if state.replacing_asset == Some(asset.id) {
+                "Replacing…"
             } else {
                 "File actions"
             };
             ui.add_enabled_ui(
                 platform_enabled
-                    || (action_enabled && relinking_asset.is_none() && detaching_asset.is_none()),
+                    || (action_enabled
+                        && state.relinking_asset.is_none()
+                        && state.detaching_asset.is_none()
+                        && state.replacing_asset.is_none()),
                 |ui| {
                     ui.menu_button(menu_text, |ui| {
                         let reveal_text =
-                            if platform_busy == Some((asset.id, PlatformAction::Reveal)) {
+                            if state.platform_busy == Some((asset.id, PlatformAction::Reveal)) {
                                 "Revealing…"
                             } else {
                                 "Reveal in file manager"
@@ -1833,8 +2002,9 @@ fn asset_rows(
                             && ui
                                 .add_enabled(
                                     action_enabled
-                                        && relinking_asset.is_none()
-                                        && detaching_asset.is_none(),
+                                        && state.relinking_asset.is_none()
+                                        && state.detaching_asset.is_none()
+                                        && state.replacing_asset.is_none(),
                                     egui::Button::new("Relink"),
                                 )
                                 .clicked()
@@ -1842,12 +2012,32 @@ fn asset_rows(
                             actions.relink = Some((asset.id, asset.format));
                             ui.close();
                         }
+                        if asset.storage == lectern_core::AssetStorage::Reference
+                            && ui
+                                .add_enabled(
+                                    action_enabled
+                                        && state.relinking_asset.is_none()
+                                        && state.detaching_asset.is_none()
+                                        && state.replacing_asset.is_none(),
+                                    egui::Button::new("Replace file"),
+                                )
+                                .clicked()
+                        {
+                            actions.replace = Some(AssetReplaceSelection {
+                                book_id: book.id,
+                                asset_id: asset.id,
+                                format: asset.format,
+                                current_path: asset.path.clone(),
+                            });
+                            ui.close();
+                        }
                         let detach = ui
                             .add_enabled(
                                 book.assets.len() > 1
                                     && action_enabled
-                                    && relinking_asset.is_none()
-                                    && detaching_asset.is_none(),
+                                    && state.relinking_asset.is_none()
+                                    && state.detaching_asset.is_none()
+                                    && state.replacing_asset.is_none(),
                                 egui::Button::new("Detach from book"),
                             )
                             .on_disabled_hover_text("A logical book must retain at least one file");

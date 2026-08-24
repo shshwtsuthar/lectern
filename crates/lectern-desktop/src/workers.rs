@@ -65,6 +65,12 @@ enum AssetMaintenanceRequest {
         format: BookFormat,
         replacement_path: PathBuf,
     },
+    Replace {
+        book_id: BookId,
+        asset_id: AssetId,
+        format: BookFormat,
+        replacement_path: PathBuf,
+    },
 }
 
 pub(crate) struct DecodedCover {
@@ -114,6 +120,12 @@ pub(crate) enum WorkerEvent {
     AssetRelinked {
         book_id: BookId,
         asset_id: AssetId,
+        result: Result<(), String>,
+    },
+    AssetReplaced {
+        book_id: BookId,
+        asset_id: AssetId,
+        replacement_path: PathBuf,
         result: Result<(), String>,
     },
     Error(String),
@@ -256,6 +268,23 @@ impl WorkerSet {
     ) -> bool {
         self.asset_maintenance_sender
             .try_send(AssetMaintenanceRequest::Relink {
+                book_id,
+                asset_id,
+                format,
+                replacement_path,
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn replace_reference_asset(
+        &self,
+        book_id: BookId,
+        asset_id: AssetId,
+        format: BookFormat,
+        replacement_path: PathBuf,
+    ) -> bool {
+        self.asset_maintenance_sender
+            .try_send(AssetMaintenanceRequest::Replace {
                 book_id,
                 asset_id,
                 format,
@@ -425,6 +454,30 @@ fn asset_maintenance_worker(
                     WorkerEvent::AssetRelinked {
                         book_id,
                         asset_id,
+                        result,
+                    },
+                )
+            }
+            AssetMaintenanceRequest::Replace {
+                book_id,
+                asset_id,
+                format,
+                replacement_path,
+            } => {
+                let result = validate_publication(&replacement_path, format)
+                    .and_then(|()| {
+                        database
+                            .replace_reference_asset(asset_id, &replacement_path, format)
+                            .map_err(lectern_import::ImportError::from)
+                    })
+                    .map_err(|error| error.to_string());
+                publish(
+                    events,
+                    context,
+                    WorkerEvent::AssetReplaced {
+                        book_id,
+                        asset_id,
+                        replacement_path,
                         result,
                     },
                 )
