@@ -26,6 +26,13 @@ silently dropping it from the performance suite. The full-result asset-health fi
 relative budget against the full title sort, which catches a disproportionate regression even if a
 runner becomes slower overall.
 
+Performance-sensitive pull requests additionally run the base and candidate revisions three times
+each on the same runner. The gate compares the median of their run-level p95 values and fails a
+scenario when it exceeds both the versioned percentage limit and minimum material latency delta.
+Using three paired runs reduces the influence of a single noisy process while retaining every raw
+sample. A newly versioned workload that does not exist on the base revision runs against its
+absolute budget until it has a comparable history.
+
 Run it locally from the repository root:
 
 ```bash
@@ -45,6 +52,10 @@ available through **Run workflow**. The artifact is retained for 30 days even if
 Hosted runners have unavoidable variance, so adjust a limit only after comparing retained raw
 artifacts from several runs and understanding the change. Do not raise a threshold merely to make
 a failure disappear.
+
+The `Performance gate` check also runs on pull requests selected by the conservative changed-path
+classifier. It always reports a stable pass/fail status for branch protection; documentation-only
+changes pass without building the release benchmark.
 
 ## Exploratory study
 

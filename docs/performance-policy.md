@@ -46,6 +46,8 @@ after raw results and add or improve deterministic coverage rather than claiming
 ## Merge gate
 
 Performance-sensitive pull requests are measured against their base revision on the same runner.
+The checked-in query suites use three base/candidate runs and compare the median run-level p95 so a
+single noisy process does not decide a merge.
 Each comparable scenario must pass two independent controls:
 
 - the absolute p95 budget, which protects the user experience even when the base is already slow;

@@ -211,6 +211,21 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 "budget.workload.full_count_scenarios must not repeat names"
             )
 
+    comparison = object_field(budget, "comparison", "budget")
+    positive_or_zero_field(comparison, "paired_runs", "budget.comparison")
+    if comparison["paired_runs"] == 0:
+        raise RegressionError("budget.comparison.paired_runs must be greater than zero")
+    positive_number_field(
+        comparison,
+        "max_p95_regression_percent",
+        "budget.comparison",
+    )
+    non_negative_number_field(
+        comparison,
+        "minimum_p95_delta_ms",
+        "budget.comparison",
+    )
+
     budgets = object_field(budget, "budgets", "budget")
     if not budgets:
         raise RegressionError("budget.budgets must not be empty")
@@ -423,6 +438,16 @@ def positive_number_field(value: dict[str, Any], key: str, context: str) -> floa
     number = float(field)
     if not math.isfinite(number) or number <= 0:
         raise RegressionError(f"{context}.{key} must be a finite number greater than zero")
+    return number
+
+
+def non_negative_number_field(value: dict[str, Any], key: str, context: str) -> float:
+    field = value.get(key)
+    if isinstance(field, bool) or not isinstance(field, (int, float)):
+        raise RegressionError(f"{context}.{key} must be a finite non-negative number")
+    number = float(field)
+    if not math.isfinite(number) or number < 0:
+        raise RegressionError(f"{context}.{key} must be a finite non-negative number")
     return number
 
 

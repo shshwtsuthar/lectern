@@ -14,6 +14,11 @@
       "deep_page_title"
     ]
   },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 0.25
+  },
   "budgets": {
     "first_page_title": {
       "max_p95_ms": 50

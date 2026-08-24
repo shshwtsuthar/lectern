@@ -26,6 +26,11 @@ def budget() -> dict:
             "measured_iterations": 3,
             "full_library_scenarios": ["sort_title", "filter_unchecked_assets"],
         },
+        "comparison": {
+            "paired_runs": 3,
+            "max_p95_regression_percent": 10,
+            "minimum_p95_delta_ms": 0.5,
+        },
         "budgets": {
             "search_title_prefix": {"max_p95_ms": 10},
             "sort_title": {"max_p95_ms": 20},
@@ -73,6 +78,11 @@ def page_budget() -> dict:
             "measured_iterations": 3,
             "full_count_scenarios": ["first_page_title", "deep_page_title"],
         },
+        "comparison": {
+            "paired_runs": 3,
+            "max_p95_regression_percent": 10,
+            "minimum_p95_delta_ms": 0.25,
+        },
         "budgets": {
             "first_page_title": {"max_p95_ms": 10},
             "deep_page_title": {"max_p95_ms": 20},
@@ -112,6 +122,7 @@ class PerformanceRegressionTests(unittest.TestCase):
         checked_in = REGRESSION.load_budget(REGRESSION.DEFAULT_BUDGET)
 
         self.assertEqual(checked_in["workload"]["books"], 50_000)
+        self.assertEqual(checked_in["comparison"]["paired_runs"], 3)
         self.assertIn("filter_unchecked_assets", checked_in["budgets"])
 
     def test_checked_in_page_budget_is_valid(self) -> None:
@@ -127,6 +138,20 @@ class PerformanceRegressionTests(unittest.TestCase):
         del invalid["budgets"]["filter_unchecked_assets"]["max_p95_ratio"]
 
         with self.assertRaisesRegex(REGRESSION.RegressionError, "both ratio fields"):
+            REGRESSION.validate_budget(invalid)
+
+    def test_load_budget_rejects_invalid_comparison_thresholds(self) -> None:
+        invalid = budget()
+        invalid["comparison"]["minimum_p95_delta_ms"] = -0.1
+
+        with self.assertRaisesRegex(REGRESSION.RegressionError, "non-negative"):
+            REGRESSION.validate_budget(invalid)
+
+    def test_load_budget_rejects_zero_paired_runs(self) -> None:
+        invalid = budget()
+        invalid["comparison"]["paired_runs"] = 0
+
+        with self.assertRaisesRegex(REGRESSION.RegressionError, "greater than zero"):
             REGRESSION.validate_budget(invalid)
 
     def test_evaluate_query_result_accepts_within_budget_workload(self) -> None:
