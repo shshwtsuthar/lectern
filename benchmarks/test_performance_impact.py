@@ -63,13 +63,45 @@ class PerformanceImpactTests(unittest.TestCase):
         )
 
     def test_github_output_is_appended(self) -> None:
-        classification = IMPACT.classify_paths(["crates/lectern-core/src/lib.rs"])
         with tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory) / "github-output"
 
-            IMPACT.append_github_output(output, classification)
+            IMPACT.append_github_output(output, True)
 
             self.assertEqual(output.read_text(encoding="utf-8"), "required=true\n")
+
+    def test_runtime_change_cannot_declare_no_impact(self) -> None:
+        body = "- [x] None — cannot affect runtime work\n"
+
+        with self.assertRaisesRegex(RuntimeError, "requires Potential or Material"):
+            IMPACT.validate_pull_request_declaration(body, True)
+
+    def test_sensitive_declaration_requires_all_acknowledgements(self) -> None:
+        body = "- [x] Potential — may affect a measured path\n"
+
+        with self.assertRaisesRegex(RuntimeError, "must acknowledge"):
+            IMPACT.validate_pull_request_declaration(body, False)
+
+    def test_material_declaration_with_evidence_is_accepted(self) -> None:
+        lines = [
+            "- [x] Material — changes or adds a hot path",
+            *[
+                f"- [x] {acknowledgement}"
+                for acknowledgement in IMPACT.REQUIRED_ACKNOWLEDGEMENTS
+            ],
+        ]
+
+        declaration = IMPACT.validate_pull_request_declaration(
+            "\n".join(lines), True
+        )
+
+        self.assertEqual(declaration, "Material")
+
+    def test_exactly_one_declaration_is_required(self) -> None:
+        body = "- [x] None\n- [x] Potential\n"
+
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
+            IMPACT.validate_pull_request_declaration(body, False)
 
 
 if __name__ == "__main__":

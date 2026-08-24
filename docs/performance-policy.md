@@ -21,6 +21,10 @@ may classify additional changes as sensitive, but must not downgrade a path sele
 UI work is exempt only when it cannot alter runtime layout, rendering, repainting, texture handling,
 or interaction work.
 
+CI rejects a missing, ambiguous, or downgraded declaration. Potential and Material declarations
+must acknowledge the applicable deterministic coverage, budgets, and retained evidence before the
+benchmark job starts.
+
 ## Evidence required before commit
 
 Before every commit containing a performance-sensitive change:

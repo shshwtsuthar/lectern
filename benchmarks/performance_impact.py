@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -23,6 +25,14 @@ SENSITIVE_FILES = frozenset(
     }
 )
 SENSITIVE_PREFIXES = (".cargo/", "benchmarks/", "crates/")
+CLASSIFICATION_PATTERN = re.compile(
+    r"^\s*-\s*\[[xX]\]\s*(None|Potential|Material)\b", re.MULTILINE
+)
+REQUIRED_ACKNOWLEDGEMENTS = (
+    "Applicable deterministic scenario and budget added or updated",
+    "Candidate passes applicable absolute and relative regression budgets",
+    "No benchmark workload or budget was weakened to obtain a pass",
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +59,11 @@ def parse_arguments(arguments: list[str]) -> argparse.Namespace:
         "--github-output",
         type=pathlib.Path,
         help="Append the required=true/false output for GitHub Actions",
+    )
+    parser.add_argument(
+        "--github-event",
+        type=pathlib.Path,
+        help="Validate the pull-request declaration in this GitHub event payload",
     )
     return parser.parse_args(arguments)
 
@@ -107,16 +122,60 @@ def changed_paths(base: str, head: str, repository: pathlib.Path = REPOSITORY) -
     ]
 
 
-def append_github_output(path: pathlib.Path, classification: Classification) -> None:
+def validate_pull_request_declaration(body: str, automated_required: bool) -> str:
+    """Validate and return the exactly-one performance impact declaration."""
+
+    selected = CLASSIFICATION_PATTERN.findall(body)
+    if len(selected) != 1:
+        raise RuntimeError(
+            "pull request must select exactly one performance impact: "
+            "None, Potential, or Material"
+        )
+    declaration = selected[0]
+    if automated_required and declaration == "None":
+        raise RuntimeError(
+            "automated path classification requires Potential or Material performance impact"
+        )
+    if declaration != "None":
+        for acknowledgement in REQUIRED_ACKNOWLEDGEMENTS:
+            pattern = re.compile(
+                rf"^\s*-\s*\[[xX]\]\s*{re.escape(acknowledgement)}\s*$",
+                re.MULTILINE,
+            )
+            if pattern.search(body) is None:
+                raise RuntimeError(
+                    f"pull request must acknowledge: {acknowledgement}"
+                )
+    return declaration
+
+
+def declaration_from_event(path: pathlib.Path, automated_required: bool) -> str:
+    """Read and validate a GitHub pull-request body from its event payload."""
+
+    with path.open(encoding="utf-8") as source:
+        event = json.load(source)
+    if not isinstance(event, dict) or not isinstance(event.get("pull_request"), dict):
+        raise RuntimeError("GitHub event does not contain a pull request")
+    body = event["pull_request"].get("body")
+    if body is None:
+        body = ""
+    if not isinstance(body, str):
+        raise RuntimeError("GitHub pull-request body must be text")
+    return validate_pull_request_declaration(body, automated_required)
+
+
+def append_github_output(path: pathlib.Path, required: bool) -> None:
     """Publish the stable output consumed by the performance workflow."""
 
     with path.open("a", encoding="utf-8") as output:
-        output.write(f"required={'true' if classification.required else 'false'}\n")
+        output.write(f"required={'true' if required else 'false'}\n")
 
 
-def report(classification: Classification) -> None:
-    decision = "required" if classification.required else "not required"
+def report(classification: Classification, required: bool, declaration: str | None) -> None:
+    decision = "required" if required else "not required"
     print(f"Performance benchmark: {decision}")
+    if declaration is not None:
+        print(f"Pull-request declaration: {declaration}")
     if classification.sensitive:
         print("Sensitive paths:")
         for path in classification.sensitive:
@@ -130,9 +189,15 @@ def report(classification: Classification) -> None:
 def main(arguments: list[str]) -> int:
     options = parse_arguments(arguments)
     classification = classify_paths(changed_paths(options.base, options.head))
-    report(classification)
+    declaration = (
+        declaration_from_event(options.github_event, classification.required)
+        if options.github_event is not None
+        else None
+    )
+    required = classification.required or declaration in ("Potential", "Material")
+    report(classification, required, declaration)
     if options.github_output is not None:
-        append_github_output(options.github_output, classification)
+        append_github_output(options.github_output, required)
     return 0
 
 

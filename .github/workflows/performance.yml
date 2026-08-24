@@ -41,6 +41,7 @@ jobs:
             python3 benchmarks/performance_impact.py \
               --base "$BASE_SHA" \
               --head "$HEAD_SHA" \
+              --github-event "$GITHUB_EVENT_PATH" \
               --github-output "$GITHUB_OUTPUT"
           else
             echo "required=true" >> "$GITHUB_OUTPUT"

@@ -29,7 +29,7 @@ Benchmark commands and before/after p95, throughput, frame, or memory results:
 <!-- Required for Potential or Material. Link retained raw artifacts when available. -->
 
 - [ ] Applicable deterministic scenario and budget added or updated
-- [ ] Candidate passes both absolute and relative regression budgets
+- [ ] Candidate passes applicable absolute and relative regression budgets
 - [ ] No benchmark workload or budget was weakened to obtain a pass
 
 ## Risk and rollout
