@@ -4,6 +4,8 @@
 //! capabilities can grow here behind explicit interfaces while desktop, CLI,
 //! storage, and device integrations remain replaceable adapters.
 
+pub mod organisation;
+
 use std::{fmt, path::PathBuf};
 
 /// Compile-time information about the running Lectern build.
