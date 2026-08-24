@@ -25,6 +25,11 @@ Bulk editing, device export, filesystem export, and Calibre-library import are n
 Password-protected PDFs also require a future password prompt. These remain product work rather
 than hidden placeholders in this release.
 
+The next file-management tranche adds detach, open, reveal, deliberate replacement, and
+single-asset export without adding another parser or deleting externally referenced files. Its
+rules, sequence, performance evidence, and exclusions are defined in
+[`docs/asset-management-scope.md`](docs/asset-management-scope.md).
+
 ## Quick start
 
 Install Rust with [rustup](https://rustup.rs/). The workspace supports Rust 1.97 or newer and uses
