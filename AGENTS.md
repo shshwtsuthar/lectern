@@ -2,8 +2,51 @@
 
 ## Rule #1: Make performance a core design priority
 
-Lectern's primary goal is to be an exceptionally fast, highly performant Rust application. Treat performance as a first-class requirement when designing or changing core functionality: choose efficient algorithms and data structures, avoid unnecessary allocations and copying, and consider memory, concurrency, and cache behavior where they matter. Keep the resulting code correct, idiomatic, and maintainable, and validate performance-sensitive decisions with profiling or
-benchmarks rather than assumptions.
+Lectern's primary goal is to be an exceptionally fast, highly performant Rust application.
+Performance is a product requirement and a merge requirement, not a cleanup activity.
+
+Treat a change as performance-sensitive unless it is clearly incapable of affecting runtime work.
+Performance-sensitive changes include, without exception:
+
+- Rust source changes in any runtime crate;
+- dependency, feature-flag, toolchain, allocator, or release-profile changes;
+- database schemas, migrations, indexes, transactions, and queries;
+- filesystem discovery, parsing, image/PDF processing, imports, and persistence;
+- rendering, layout, repaint behavior, texture handling, and other UI hot paths;
+- worker scheduling, channels, locking, batching, pagination, caching, and memory ownership; and
+- benchmark workloads, measurement code, budgets, or performance CI configuration.
+
+Documentation, comments, tests that do not alter production code, and purely static copy changes may
+be classified as non-performance-sensitive. A change being described as "UI-only" is not sufficient
+for an exemption: rendering and interaction changes can affect frame time, allocation volume, and
+memory use.
+
+For every performance-sensitive change:
+
+1. Identify the affected user journey and its representative workload before implementation.
+2. Run the fastest relevant release-mode benchmark before every commit containing that change. The
+   benchmark must retain raw samples, validate result correctness, and report p95 for latency or the
+   corresponding tail/throughput and memory measures for that workload.
+3. If no applicable benchmark exists, add a deterministic benchmark scenario and an explicit budget
+   as part of the change. Do not commit an unmeasured hot path with a promise to benchmark it later.
+4. Compare the candidate against its base revision on the same machine when a comparable baseline
+   exists. A result must satisfy both the absolute product budget and the checked-in relative
+   regression budget.
+5. Use representative data sizes and production code paths. Debug builds, toy inputs, single timing
+   samples, and unverified synthetic shortcuts are not performance evidence.
+6. Prefer efficient algorithms and data structures; avoid unnecessary allocations, copying, I/O,
+   wakeups, and unbounded work. Consider memory, concurrency, and cache behavior explicitly.
+7. Preserve the raw benchmark artifacts and record the command and result in the commit or pull
+   request validation notes.
+
+Never weaken, remove, rename, or reduce a benchmark workload merely to make a regression pass. A
+budget relaxation or workload-version change requires a separate, explicit performance-policy
+change with measured evidence and user approval. If the relevant benchmark cannot run because of an
+environment or tooling constraint, report the exact blocker immediately and do not commit the
+performance-sensitive change.
+
+The authoritative process, classifications, budgets, and commands are documented in
+`docs/performance-policy.md`.
 
 ## Rule #2: Commit often and frequently
 

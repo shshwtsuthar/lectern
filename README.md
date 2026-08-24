@@ -83,7 +83,9 @@ on a pinned GitHub runner and are manually dispatchable. CI definitions live in
 `.github/workflows/`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and
-[docs/architecture.md](docs/architecture.md) for dependency rules.
+[docs/architecture.md](docs/architecture.md) for dependency rules. Performance-sensitive changes
+are governed by the mandatory classification, measurement, and merge rules in
+[`docs/performance-policy.md`](docs/performance-policy.md).
 
 ## License
 

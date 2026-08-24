@@ -17,7 +17,10 @@
    If `cargo-deny` is installed, also run `cargo deny check` to validate advisories, licenses,
    duplicate versions, and dependency sources. CI always runs this check.
 
-5. For a performance-sensitive storage or query change, also run:
+5. Classify the pull request's performance impact using
+   [`docs/performance-policy.md`](docs/performance-policy.md). Runtime Rust, dependency/profile,
+   storage, query, import, worker, cache, rendering, and benchmark changes are performance-sensitive.
+   Before every commit containing a performance-sensitive storage or query change, run:
 
    ```sh
    python3 benchmarks/performance_regression.py
@@ -25,9 +28,12 @@
      --budget benchmarks/query-page-regression-v1.json
    ```
 
-   Compare the retained JSON output before changing any versioned performance budget.
+   Compare retained raw output against the base revision. Other performance-sensitive paths require
+   their applicable workload from `benchmarks/run.py`; add deterministic coverage when none exists.
+   Never relax a versioned performance budget merely to make a change pass.
 
-6. Explain user-visible behavior, risks, and validation in the pull request.
+6. Explain user-visible behavior, risks, performance classification, and validation in the pull
+   request. The required performance workflow automatically gates runtime changes.
 
 ## Engineering conventions
 
