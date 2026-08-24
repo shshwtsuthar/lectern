@@ -67,7 +67,9 @@ advance the schema version only after validation succeeds.
   transactional where possible, and recoverable.
 - Keep indexing and import work observable. Add cancellation when the UI exposes a cancel action.
 - Build complete user workflows first; profile representative libraries before optimizing or making
-  large-library performance claims.
+  large-library performance claims. Preserve the versioned 50,000-book release-query budget in
+  `benchmarks/` when changing its storage path, and use broader representative studies for other
+  performance claims.
 - Use structured diagnostics internally and translate them to actionable messages at application
   boundaries.
 - Keep platform-specific code behind adapters and exercise the workspace on all supported operating

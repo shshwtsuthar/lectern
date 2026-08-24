@@ -17,7 +17,15 @@
    If `cargo-deny` is installed, also run `cargo deny check` to validate advisories, licenses,
    duplicate versions, and dependency sources. CI always runs this check.
 
-5. Explain user-visible behavior, risks, and validation in the pull request.
+5. For a performance-sensitive storage or query change, also run:
+
+   ```sh
+   python3 benchmarks/performance_regression.py
+   ```
+
+   Compare the retained JSON output before changing any versioned performance budget.
+
+6. Explain user-visible behavior, risks, and validation in the pull request.
 
 ## Engineering conventions
 

@@ -9,6 +9,8 @@ follow [Semantic Versioning](https://semver.org/) once releases begin.
 
 ### Added
 
+- A deterministic 50,000-book release-query regression suite with versioned p95/relative budgets,
+  local execution, weekly/manual GitHub Actions runs, and retained diagnostic artifacts.
 - Referenced-asset health scans, missing/unreadable file reporting and filtering, and validated
   in-place relinking that preserves book metadata, covers, and stable asset IDs.
 - Logical books with stable EPUB/PDF assets, explicit managed/reference ownership, reversible paths,

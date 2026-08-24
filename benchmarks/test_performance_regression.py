@@ -60,6 +60,12 @@ def query_result(*, health_p95: float = 12.0) -> dict:
 
 
 class PerformanceRegressionTests(unittest.TestCase):
+    def test_checked_in_budget_is_valid(self) -> None:
+        checked_in = REGRESSION.load_budget(REGRESSION.DEFAULT_BUDGET)
+
+        self.assertEqual(checked_in["workload"]["books"], 50_000)
+        self.assertIn("filter_unchecked_assets", checked_in["budgets"])
+
     def test_load_budget_rejects_unpaired_ratio_fields(self) -> None:
         invalid = budget()
         del invalid["budgets"]["filter_unchecked_assets"]["max_p95_ratio"]

@@ -69,15 +69,18 @@ Current file and folder import remains conservative and does not guess that simi
 are the same book; trusted aggregate importers such as the planned Calibre adapter can attach
 several formats atomically.
 
-The application has performance-conscious boundaries but makes no unmeasured performance claims.
-Once the thin workflow and representative libraries are stable, profiling and targeted benchmarks
-can guide optimization of cold launch, import throughput, query latency, scrolling, and memory.
+The application has performance-conscious boundaries and a deterministic weekly regression suite
+for its 50,000-book release-query path. The broader benchmark study retains raw measurements for
+cold launch, import throughput, scrolling, and memory; see
+[`benchmarks/README.md`](benchmarks/README.md) for how to run and interpret both workflows.
 
 ## Quality gates
 
 Every pull request is expected to pass formatting, Clippy with warnings denied, tests on Linux,
-macOS, and Windows, documentation checks, an MSRV build, and the dependency policy in `deny.toml`.
-CI definitions live in `.github/workflows/ci.yml`.
+macOS, and Windows, documentation checks, an MSRV build, the benchmark-runner contract tests, and
+the dependency policy in `deny.toml`. The deterministic release-query regression suite runs weekly
+on a pinned GitHub runner and is manually dispatchable. CI definitions live in
+`.github/workflows/`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and
 [docs/architecture.md](docs/architecture.md) for dependency rules.

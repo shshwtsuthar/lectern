@@ -1,0 +1,41 @@
+name: Performance regression
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-regression-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  query:
+    name: 50k release-query regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Measure release-query performance
+        run: >-
+          python3 benchmarks/performance_regression.py
+          --output-dir "$RUNNER_TEMP/lectern-performance-regression"
+      - name: Upload performance artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: performance-regression-${{ github.run_id }}
+          path: ${{ runner.temp }}/lectern-performance-regression
+          if-no-files-found: warn
+          retention-days: 30

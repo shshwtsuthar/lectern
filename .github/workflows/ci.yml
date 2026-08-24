@@ -32,6 +32,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Run Clippy
         run: cargo clippy-all
+      - name: Test benchmark runners
+        run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
       - name: Check documentation
         env:
           RUSTDOCFLAGS: -D warnings
