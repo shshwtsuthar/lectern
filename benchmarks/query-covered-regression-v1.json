@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-query-regression-budget",
+  "workload": {
+    "books": 50000,
+    "seed": 20260824,
+    "cover_every": 3,
+    "warmup_iterations": 10,
+    "measured_iterations": 40,
+    "full_library_scenarios": [
+      "sort_title",
+      "sort_author",
+      "sort_recently_added",
+      "filter_unchecked_assets"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 0.5
+  },
+  "budgets": {
+    "search_title_prefix": {
+      "max_p95_ms": 100
+    },
+    "search_author_prefix": {
+      "max_p95_ms": 100
+    },
+    "filter_epub": {
+      "max_p95_ms": 150
+    },
+    "sort_title": {
+      "max_p95_ms": 175
+    },
+    "sort_author": {
+      "max_p95_ms": 175
+    },
+    "sort_recently_added": {
+      "max_p95_ms": 175
+    },
+    "search_filter_sort": {
+      "max_p95_ms": 125
+    },
+    "filter_unchecked_assets": {
+      "max_p95_ms": 200,
+      "max_p95_ratio_to": "sort_title",
+      "max_p95_ratio": 1.8
+    }
+  }
+}

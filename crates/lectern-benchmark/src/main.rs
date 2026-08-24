@@ -50,6 +50,7 @@ Usage:
   lectern-benchmark seed --database PATH --output PATH [OPTIONS]
   lectern-benchmark query --database PATH --output PATH [OPTIONS]
   lectern-benchmark query-page --database PATH --output PATH [OPTIONS]
+  lectern-benchmark query-page-covered --database PATH --output PATH [OPTIONS]
   lectern-benchmark remove --database PATH --output PATH [OPTIONS]
   lectern-benchmark attach --database PATH --output PATH [OPTIONS]
   lectern-benchmark import --database PATH --corpus PATH --output PATH [OPTIONS]
@@ -103,6 +104,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         "seed" => run_seed(&SeedOptions::parse(&mut args)?),
         "query" => run_query(&QueryOptions::parse(&mut args)?),
         "query-page" => run_query_page(&QueryOptions::parse(&mut args)?),
+        "query-page-covered" => run_query_page_covered(&QueryOptions::parse(&mut args)?),
         "remove" => run_remove(&QueryOptions::parse(&mut args)?),
         "attach" => run_attach(&QueryOptions::parse(&mut args)?),
         "import" => run_import(&ImportOptions::parse(&mut args)?),
@@ -742,6 +744,17 @@ struct PageQueryScenarioResult {
 }
 
 fn run_query_page(options: &QueryOptions) -> Result<(), String> {
+    run_query_page_scenarios(options, page_query_scenarios())
+}
+
+fn run_query_page_covered(options: &QueryOptions) -> Result<(), String> {
+    run_query_page_scenarios(options, covered_page_query_scenarios())
+}
+
+fn run_query_page_scenarios(
+    options: &QueryOptions,
+    scenarios: Vec<PageQueryScenario>,
+) -> Result<(), String> {
     ensure_distinct_paths("database", &options.database, "output", &options.output)?;
     if !options.database.is_file() {
         return Err(format!(
@@ -757,7 +770,6 @@ fn run_query_page(options: &QueryOptions) -> Result<(), String> {
             options.database.display()
         ));
     }
-    let scenarios = page_query_scenarios();
     let mut samples = vec![Vec::with_capacity(options.iterations); scenarios.len()];
     let mut result_counts = vec![0; scenarios.len()];
     let mut total_counts = vec![0; scenarios.len()];
@@ -1886,6 +1898,51 @@ fn page_query_scenarios() -> Vec<PageQueryScenario> {
             format: None,
             asset_health: None,
             sort: SortOrder::Title,
+            position: PagePosition::First,
+        },
+        PageQueryScenario {
+            name: "deep_page_title",
+            search: "",
+            format: None,
+            asset_health: None,
+            sort: SortOrder::Title,
+            position: PagePosition::Deep,
+        },
+        PageQueryScenario {
+            name: "first_page_search_filter",
+            search: "Luminous",
+            format: Some(BookFormat::Pdf),
+            asset_health: None,
+            sort: SortOrder::Author,
+            position: PagePosition::First,
+        },
+    ]
+}
+
+fn covered_page_query_scenarios() -> Vec<PageQueryScenario> {
+    vec![
+        PageQueryScenario {
+            name: "first_page_title",
+            search: "",
+            format: None,
+            asset_health: None,
+            sort: SortOrder::Title,
+            position: PagePosition::First,
+        },
+        PageQueryScenario {
+            name: "first_page_author",
+            search: "",
+            format: None,
+            asset_health: None,
+            sort: SortOrder::Author,
+            position: PagePosition::First,
+        },
+        PageQueryScenario {
+            name: "first_page_recently_added",
+            search: "",
+            format: None,
+            asset_health: None,
+            sort: SortOrder::RecentlyAdded,
             position: PagePosition::First,
         },
         PageQueryScenario {

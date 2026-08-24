@@ -88,6 +88,7 @@ def main(arguments: list[str]) -> int:
         result_names = {
             "full": "queries.json",
             "page": "queries.json",
+            "page-covered": "queries.json",
             "remove": "removals.json",
             "attach": "attachments.json",
         }
@@ -130,6 +131,7 @@ def main(arguments: list[str]) -> int:
                 {
                     "full": "query",
                     "page": "query-page",
+                    "page-covered": "query-page-covered",
                     "remove": "remove",
                     "attach": "attach",
                 }[mode],
@@ -196,9 +198,10 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             "budget.workload.measured_iterations must be greater than zero"
         )
     query_mode = workload.get("query_mode", "full")
-    if query_mode not in ("full", "page", "remove", "attach"):
+    if query_mode not in ("full", "page", "page-covered", "remove", "attach"):
         raise RegressionError(
-            "budget.workload.query_mode must be 'full', 'page', 'remove', or 'attach'"
+            "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
+            "'remove', or 'attach'"
         )
     if query_mode == "full":
         scenario_names = workload.get("full_library_scenarios")
@@ -212,7 +215,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             raise RegressionError(
                 "budget.workload.full_library_scenarios must not repeat names"
             )
-    elif query_mode == "page":
+    elif query_mode in ("page", "page-covered"):
         positive_or_zero_field(workload, "page_size", "budget.workload")
         if workload["page_size"] == 0:
             raise RegressionError("budget.workload.page_size must be greater than zero")
@@ -308,7 +311,7 @@ def evaluate_query_result(result: dict[str, Any], budget: dict[str, Any]) -> lis
         != workload["measured_iterations"]
     ):
         raise RegressionError("query measured iteration count does not match the budget")
-    if query_mode == "page" and (
+    if query_mode in ("page", "page-covered") and (
         positive_or_zero_field(result, "page_size", "query result")
         != workload["page_size"]
     ):
@@ -332,7 +335,7 @@ def evaluate_query_result(result: dict[str, Any], budget: dict[str, Any]) -> lis
             raise RegressionError(
                 f"{context} returned {result_count} rows from {books} books"
             )
-        if query_mode == "page":
+        if query_mode in ("page", "page-covered"):
             if result_count > workload["page_size"]:
                 raise RegressionError(
                     f"{context} returned {result_count} rows above the page size"

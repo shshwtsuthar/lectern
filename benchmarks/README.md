@@ -3,9 +3,9 @@
 This directory contains two complementary workflows:
 
 - `performance_regression.py` is a deterministic, versioned storage regression runner. It exercises
-  full-result queries, paged queries, single-book removal, and validated format attachment followed
-  by a first-page refresh each week in GitHub Actions, can be dispatched manually, and fails when a
-  release latency budget is exceeded.
+  full-result queries and paged queries over both metadata-only and covered libraries, single-book
+  removal, and validated format attachment followed by a first-page refresh each week in GitHub
+  Actions, can be dispatched manually, and fails when a release latency budget is exceeded.
 - `run.py` is an opt-in exploratory study for large libraries. It exercises the production SQLite
   query path, EPUB/PDF importer, and native egui cover grid. Its raw JSON is intentionally
   non-gating because the workload requires a prepared corpus and a graphical desktop session.
@@ -17,15 +17,18 @@ warmup iterations followed by 40 measured iterations of every versioned query sc
 both result integrity and p95 latency. It records all raw samples, the database, toolchain/host
 metadata, commands, and a compact pass/fail report.
 
-The full-result workload and its limits live in
-[`query-regression-v1.json`](query-regression-v1.json). The bounded-window workload lives in
-[`query-page-regression-v1.json`](query-page-regression-v1.json): its first page includes the
-matching count, its deep title page checks late-window access, and its filtered page exercises FTS
-with the format join. The budget is intentionally tied to the workload version: adding, removing,
-or materially changing a scenario requires an explicit review of the configuration rather than
-silently dropping it from the performance suite. The full-result asset-health filter also has a
-relative budget against the full title sort, which catches a disproportionate regression even if a
-runner becomes slower overall.
+The metadata-only full-result workload and its limits live in
+[`query-regression-v1.json`](query-regression-v1.json), with a matching covered-library projection
+in [`query-covered-regression-v1.json`](query-covered-regression-v1.json). The original
+bounded-window workload lives in [`query-page-regression-v1.json`](query-page-regression-v1.json):
+its first page includes the matching count, its deep title page checks late-window access, and its
+filtered page exercises FTS with the format join. The covered-library bounded workload in
+[`query-page-covered-regression-v1.json`](query-page-covered-regression-v1.json) additionally gates
+the first author and recently-added pages that users request from the desktop. The budget is
+intentionally tied to the workload version: adding, removing, or materially changing a scenario
+requires an explicit review of the configuration rather than silently dropping it from the
+performance suite. Each full-result asset-health filter also has a relative budget against its full
+title sort, which catches a disproportionate regression even if a runner becomes slower overall.
 
 The single-book lifecycle workload lives in
 [`remove-book-regression-v1.json`](remove-book-regression-v1.json). It repeatedly adds a covered
@@ -51,7 +54,11 @@ Run it locally from the repository root:
 ```bash
 python3 benchmarks/performance_regression.py
 python3 benchmarks/performance_regression.py \
+  --budget benchmarks/query-covered-regression-v1.json
+python3 benchmarks/performance_regression.py \
   --budget benchmarks/query-page-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/query-page-covered-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/remove-book-regression-v1.json
 python3 benchmarks/performance_regression.py \

@@ -7,8 +7,16 @@
       "budget": "benchmarks/query-regression-v1.json"
     },
     {
+      "name": "query-full-covered-v1",
+      "budget": "benchmarks/query-covered-regression-v1.json"
+    },
+    {
       "name": "query-page-v1",
       "budget": "benchmarks/query-page-regression-v1.json"
+    },
+    {
+      "name": "query-page-covered-v1",
+      "budget": "benchmarks/query-page-covered-regression-v1.json"
     },
     {
       "name": "remove-book-v1",

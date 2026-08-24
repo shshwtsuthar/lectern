@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-query-regression-budget",
+  "workload": {
+    "query_mode": "page-covered",
+    "books": 50000,
+    "seed": 20260824,
+    "cover_every": 3,
+    "page_size": 128,
+    "warmup_iterations": 10,
+    "measured_iterations": 40,
+    "full_count_scenarios": [
+      "first_page_title",
+      "first_page_author",
+      "first_page_recently_added",
+      "deep_page_title"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 0.25
+  },
+  "budgets": {
+    "first_page_title": {
+      "max_p95_ms": 10
+    },
+    "first_page_author": {
+      "max_p95_ms": 10
+    },
+    "first_page_recently_added": {
+      "max_p95_ms": 10
+    },
+    "deep_page_title": {
+      "max_p95_ms": 10
+    },
+    "first_page_search_filter": {
+      "max_p95_ms": 15
+    }
+  }
+}

@@ -40,7 +40,11 @@ Storage and query changes currently require all registered deterministic storage
 ```sh
 python3 benchmarks/performance_regression.py
 python3 benchmarks/performance_regression.py \
+  --budget benchmarks/query-covered-regression-v1.json
+python3 benchmarks/performance_regression.py \
   --budget benchmarks/query-page-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/query-page-covered-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/remove-book-regression-v1.json
 python3 benchmarks/performance_regression.py \

@@ -232,6 +232,24 @@ class PerformanceRegressionTests(unittest.TestCase):
         self.assertEqual(checked_in["workload"]["page_size"], 128)
         self.assertEqual(checked_in["workload"]["query_mode"], "page")
 
+    def test_checked_in_covered_query_budget_is_valid(self) -> None:
+        checked_in = REGRESSION.load_budget(
+            pathlib.Path(__file__).with_name("query-covered-regression-v1.json")
+        )
+
+        self.assertEqual(checked_in["workload"]["books"], 50_000)
+        self.assertEqual(checked_in["workload"]["cover_every"], 3)
+        self.assertIn("sort_author", checked_in["budgets"])
+
+    def test_checked_in_covered_page_budget_is_valid(self) -> None:
+        checked_in = REGRESSION.load_budget(
+            pathlib.Path(__file__).with_name("query-page-covered-regression-v1.json")
+        )
+
+        self.assertEqual(checked_in["workload"]["query_mode"], "page-covered")
+        self.assertEqual(checked_in["workload"]["cover_every"], 3)
+        self.assertIn("first_page_author", checked_in["budgets"])
+
     def test_checked_in_remove_budget_is_valid(self) -> None:
         checked_in = REGRESSION.load_budget(
             pathlib.Path(__file__).with_name("remove-book-regression-v1.json")
