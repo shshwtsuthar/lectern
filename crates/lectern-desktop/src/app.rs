@@ -1280,10 +1280,7 @@ impl LecternApp {
 
         if let Some(cover) = self.covers.get_mut(&book.id) {
             cover.last_used = self.frame_number;
-            ui.add_sized(
-                COVER_SIZE,
-                egui::Image::from_texture(&cover.texture).corner_radius(7),
-            );
+            ui.add(cover_image(&cover.texture));
         } else {
             let (rect, _) = ui.allocate_exact_size(COVER_SIZE, Sense::hover());
             ui.painter()
@@ -1388,6 +1385,12 @@ impl eframe::App for LecternApp {
             );
         }
     }
+}
+
+fn cover_image(texture: impl Into<egui::load::SizedTexture>) -> egui::Image<'static> {
+    egui::Image::from_texture(texture)
+        .fit_to_exact_size(COVER_SIZE)
+        .corner_radius(7)
 }
 
 fn default_database_path() -> PathBuf {
@@ -1707,14 +1710,15 @@ fn optional_metadata(value: &str) -> Option<String> {
 mod tests {
     use std::path::PathBuf;
 
+    use eframe::egui;
     use lectern_core::{
         AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId,
     };
     use lectern_import::ImportProgress;
 
     use super::{
-        BookEditor, CARD_GAP, CARD_WIDTH, QUERY_PAGE_SIZE, asset_health_status, column_count,
-        import_status, query_page_offset, removal_file_message,
+        BookEditor, CARD_GAP, CARD_WIDTH, COVER_SIZE, QUERY_PAGE_SIZE, asset_health_status,
+        column_count, cover_image, import_status, query_page_offset, removal_file_message,
     };
 
     #[test]
@@ -1735,6 +1739,20 @@ mod tests {
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE - 1), 0);
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE), QUERY_PAGE_SIZE);
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE + 17), QUERY_PAGE_SIZE);
+    }
+
+    #[test]
+    fn decoded_covers_stay_within_the_fixed_grid_slot() {
+        egui::__run_test_ui(|ui| {
+            for source_size in [egui::vec2(320.0, 480.0), egui::vec2(900.0, 300.0)] {
+                let texture =
+                    egui::load::SizedTexture::new(egui::TextureId::Managed(1), source_size);
+                let response = ui.add(cover_image(texture));
+
+                assert!(response.rect.width() <= COVER_SIZE.x);
+                assert!(response.rect.height() <= COVER_SIZE.y);
+            }
+        });
     }
 
     #[test]
