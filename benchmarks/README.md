@@ -3,9 +3,9 @@
 This directory contains two complementary workflows:
 
 - `performance_regression.py` is a deterministic, versioned storage regression runner. It exercises
-  full-result queries, paged queries, and single-book removal followed by a first-page refresh each
-  week in GitHub Actions, can be dispatched manually, and fails when a release latency budget is
-  exceeded.
+  full-result queries, paged queries, single-book removal, and validated format attachment followed
+  by a first-page refresh each week in GitHub Actions, can be dispatched manually, and fails when a
+  release latency budget is exceeded.
 - `run.py` is an opt-in exploratory study for large libraries. It exercises the production SQLite
   query path, EPUB/PDF importer, and native egui cover grid. Its raw JSON is intentionally
   non-gating because the workload requires a prepared corpus and a graphical desktop session.
@@ -33,6 +33,12 @@ logical book with EPUB and PDF assets to a 50,000-book library, measures its dur
 first bounded library refresh, and verifies the book, cover, and search entry are gone while both
 source files remain byte-for-byte unchanged.
 
+The format-attachment lifecycle workload lives in
+[`attach-format-regression-v1.json`](attach-format-regression-v1.json). It selects covered EPUB-only
+books from a 50,000-book library, validates a distinct 8 MiB PDF for each iteration, atomically
+attaches it, and refreshes the first PDF-filtered page. It verifies the logical-book count, metadata,
+cover, existing asset identity, unique filtered result, and source bytes after every attachment.
+
 Performance-sensitive pull requests additionally run the base and candidate revisions three times
 each on the same runner. The gate compares the median of their run-level p95 values and fails a
 scenario when it exceeds both the versioned percentage limit and minimum material latency delta.
@@ -48,6 +54,8 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/query-page-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/remove-book-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/attach-format-regression-v1.json
 ```
 
 Use `--output-dir PATH` to choose a new artifact directory, or `--budget PATH` to evaluate a

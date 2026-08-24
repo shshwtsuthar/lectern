@@ -28,6 +28,8 @@
      --budget benchmarks/query-page-regression-v1.json
    python3 benchmarks/performance_regression.py \
      --budget benchmarks/remove-book-regression-v1.json
+   python3 benchmarks/performance_regression.py \
+     --budget benchmarks/attach-format-regression-v1.json
    ```
 
    Compare retained raw output against the base revision. Other performance-sensitive paths require

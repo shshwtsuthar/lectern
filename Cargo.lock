@@ -2044,6 +2044,7 @@ dependencies = [
  "lectern-core",
  "lectern-import",
  "lectern-storage",
+ "lopdf",
  "rusqlite",
  "serde",
  "serde_json",

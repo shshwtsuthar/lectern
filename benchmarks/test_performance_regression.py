@@ -162,6 +162,60 @@ def remove_result() -> dict:
     }
 
 
+def attach_budget() -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "lectern-query-regression-budget",
+        "workload": {
+            "query_mode": "attach",
+            "books": 50,
+            "seed": 7,
+            "cover_every": 3,
+            "page_size": 8,
+            "source_payload_bytes": 8_388_608,
+            "warmup_iterations": 2,
+            "measured_iterations": 3,
+            "scenarios": ["attach_validated_format_and_refresh"],
+        },
+        "comparison": {
+            "paired_runs": 3,
+            "max_p95_regression_percent": 10,
+            "minimum_p95_delta_ms": 1.0,
+        },
+        "budgets": {"attach_validated_format_and_refresh": {"max_p95_ms": 150}},
+    }
+
+
+def attach_result() -> dict:
+    return {
+        "library_books": 50,
+        "final_library_books": 50,
+        "initial_pdf_books": 10,
+        "final_pdf_books": 15,
+        "page_size": 8,
+        "source_payload_bytes": 8_388_608,
+        "minimum_source_bytes": 8_389_000,
+        "maximum_source_bytes": 8_389_000,
+        "warmup_iterations": 2,
+        "measured_iterations": 3,
+        "source_files": [f"attachment-{index}.pdf" for index in range(5)],
+        "source_bytes_unchanged": True,
+        "metadata_preserved": True,
+        "covers_preserved": True,
+        "scenarios": [
+            {
+                "name": "attach_validated_format_and_refresh",
+                "validated_publications": 5,
+                "successful_attachments": 5,
+                "refreshed_total": 15,
+                "refreshed_result_count": 8,
+                "latency_ms": {"p95": 12.0},
+                "samples_ns": [1_000_000, 2_000_000, 3_000_000],
+            }
+        ],
+    }
+
+
 class PerformanceRegressionTests(unittest.TestCase):
     def test_checked_in_budget_is_valid(self) -> None:
         checked_in = REGRESSION.load_budget(REGRESSION.DEFAULT_BUDGET)
@@ -185,6 +239,14 @@ class PerformanceRegressionTests(unittest.TestCase):
 
         self.assertEqual(checked_in["workload"]["query_mode"], "remove")
         self.assertEqual(checked_in["budgets"]["remove_book_and_refresh"]["max_p95_ms"], 100)
+
+    def test_checked_in_attach_budget_is_valid(self) -> None:
+        checked_in = REGRESSION.load_budget(
+            pathlib.Path(__file__).with_name("attach-format-regression-v1.json")
+        )
+
+        self.assertEqual(checked_in["workload"]["query_mode"], "attach")
+        self.assertEqual(checked_in["workload"]["source_payload_bytes"], 8_388_608)
 
     def test_load_budget_rejects_unpaired_ratio_fields(self) -> None:
         invalid = budget()
@@ -260,6 +322,25 @@ class PerformanceRegressionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(REGRESSION.RegressionError, "source bytes"):
             REGRESSION.evaluate_remove_result(invalid, remove_budget())
+
+    def test_evaluate_attach_result_accepts_reconciled_workload(self) -> None:
+        decisions = REGRESSION.evaluate_attach_result(attach_result(), attach_budget())
+
+        self.assertTrue(all(decision["passed"] for decision in decisions))
+
+    def test_evaluate_attach_result_requires_preserved_book_data(self) -> None:
+        invalid = attach_result()
+        invalid["covers_preserved"] = False
+
+        with self.assertRaisesRegex(REGRESSION.RegressionError, "cached covers"):
+            REGRESSION.evaluate_attach_result(invalid, attach_budget())
+
+    def test_evaluate_attach_result_reconciles_format_count(self) -> None:
+        invalid = attach_result()
+        invalid["final_pdf_books"] = 14
+
+        with self.assertRaisesRegex(REGRESSION.RegressionError, "PDF count"):
+            REGRESSION.evaluate_attach_result(invalid, attach_budget())
 
 
 if __name__ == "__main__":

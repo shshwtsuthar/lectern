@@ -244,6 +244,14 @@ pub enum StorageError {
     /// The requested file asset no longer exists.
     #[error("asset {0} was not found")]
     AssetNotFound(AssetId),
+    /// The selected logical book already has a file in the requested format.
+    #[error("book {book} already has a {format} asset")]
+    BookAlreadyHasFormat {
+        /// Logical book that already owns the format.
+        book: BookId,
+        /// Format that cannot be attached twice.
+        format: BookFormat,
+    },
     /// An operation that requires a referenced asset was requested for a managed asset.
     #[error("asset {0} is managed and cannot be relinked as an external file")]
     AssetNotReference(AssetId),
@@ -255,9 +263,12 @@ pub enum StorageError {
         /// Format validated from the replacement file.
         found: BookFormat,
     },
-    /// The proposed replacement path was already linked by another reference asset.
-    #[error("replacement path is already linked by asset {0}")]
+    /// The proposed path was already linked by another reference asset.
+    #[error("reference path is already linked by asset {0}")]
     ReferencePathInUse(AssetId),
+    /// The file proposed for attachment was not usable when the transaction began.
+    #[error("file to attach is {0}")]
+    AttachmentUnavailable(AssetHealth),
     /// The proposed replacement file was not usable at the time of relinking.
     #[error("replacement file is {0}")]
     ReplacementUnavailable(AssetHealth),
@@ -624,6 +635,77 @@ impl LibraryDatabase {
             return Err(StorageError::BookNotFound(book.id));
         }
         Ok(())
+    }
+
+    /// Attaches one externally referenced publication to an existing logical book.
+    ///
+    /// Callers must validate the publication before invoking this method. The immediate
+    /// transaction preserves the book's metadata, cover, and existing assets while enforcing one
+    /// asset per format and global reference-path ownership. The source file is never copied,
+    /// moved, or modified.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the book is absent, already has the requested format, the source is
+    /// unavailable, another reference asset owns the path, or the insertion cannot be committed.
+    pub fn attach_reference_asset(
+        &mut self,
+        book: BookId,
+        format: BookFormat,
+        path: impl AsRef<Path>,
+    ) -> Result<AssetId> {
+        let path = path.as_ref();
+        validate_asset_path(AssetStorage::Reference, path)?;
+        let health = inspect_reference_asset(path);
+        if health != AssetHealth::Available {
+            return Err(StorageError::AttachmentUnavailable(health));
+        }
+        let (path_encoding, encoded_path) = encode_path(path);
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let book_exists = transaction
+            .query_row("SELECT 1 FROM books WHERE id = ?1", [book.value()], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        if !book_exists {
+            return Err(StorageError::BookNotFound(book));
+        }
+
+        let existing_format = transaction
+            .query_row(
+                "SELECT id FROM book_assets WHERE book_id = ?1 AND format = ?2",
+                params![book.value(), format.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if existing_format.is_some() {
+            return Err(StorageError::BookAlreadyHasFormat { book, format });
+        }
+
+        let path_owner = transaction
+            .query_row(
+                "SELECT id FROM book_assets \
+                 WHERE storage_mode = 'reference' AND path_encoding = ?1 AND path = ?2",
+                params![path_encoding, &encoded_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if let Some(owner) = path_owner {
+            return Err(StorageError::ReferencePathInUse(AssetId::new(owner)));
+        }
+
+        transaction.execute(
+            "INSERT INTO book_assets (book_id, format, storage_mode, health, path_encoding, path) \
+             VALUES (?1, ?2, 'reference', 'available', ?3, ?4)",
+            params![book.value(), format.as_str(), path_encoding, encoded_path],
+        )?;
+        let asset = AssetId::new(transaction.last_insert_rowid());
+        transaction.commit()?;
+        Ok(asset)
     }
 
     /// Removes one logical book and its stored library data.
@@ -2153,6 +2235,141 @@ mod tests {
                 .assets,
             assets
         );
+    }
+
+    #[test]
+    fn attaching_a_reference_format_preserves_the_logical_book_and_source() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let source = TestAsset::file("attach-source");
+        let mut imported = record("/books/dune.epub", "Dune", "Frank Herbert");
+        imported.book.series = Some("Dune".into());
+        imported.cover_thumbnail = Some(vec![1, 2, 3]);
+        let id = database.import_books(&[imported]).expect("import book")[0];
+        let original = database
+            .get_book(id)
+            .expect("load original")
+            .expect("book exists");
+
+        let attached = database
+            .attach_reference_asset(id, BookFormat::Pdf, source.path())
+            .expect("attach PDF");
+
+        assert_eq!(database.count().expect("count books"), 1);
+        let updated = database
+            .get_book(id)
+            .expect("load updated")
+            .expect("book exists");
+        assert_eq!(updated.title, original.title);
+        assert_eq!(updated.authors, original.authors);
+        assert_eq!(updated.series, original.series);
+        assert_eq!(updated.assets.len(), 2);
+        assert_eq!(updated.assets[0], original.assets[0]);
+        assert_eq!(updated.assets[1].id, attached);
+        assert_eq!(updated.assets[1].format, BookFormat::Pdf);
+        assert_eq!(updated.assets[1].health, AssetHealth::Available);
+        assert_eq!(updated.assets[1].path, source.path());
+        assert_eq!(
+            database.load_cover(id).expect("load cover"),
+            Some(vec![1, 2, 3])
+        );
+        let filtered = database
+            .query(&LibraryQuery {
+                format: Some(BookFormat::Pdf),
+                ..LibraryQuery::default()
+            })
+            .expect("filter PDF books");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, id);
+        assert_eq!(
+            fs::read(source.path()).expect("read attached source"),
+            b"publication"
+        );
+    }
+
+    #[test]
+    fn attaching_a_duplicate_format_is_rejected_without_changing_assets() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let source = TestAsset::file("duplicate-attachment");
+        let id = database
+            .import_books(&[record("/books/dune.epub", "Dune", "Frank Herbert")])
+            .expect("import book")[0];
+
+        assert!(matches!(
+            database.attach_reference_asset(id, BookFormat::Epub, source.path()),
+            Err(StorageError::BookAlreadyHasFormat {
+                book,
+                format: BookFormat::Epub,
+            }) if book == id
+        ));
+        assert_eq!(
+            database
+                .get_book(id)
+                .expect("load book")
+                .expect("book exists")
+                .assets
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn attaching_a_path_owned_by_another_book_is_rejected() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let source = TestAsset::file("owned-attachment");
+        let owner = database
+            .import_books(&[record(
+                source.path().to_str().expect("UTF-8 test path"),
+                "Owner",
+                "Author",
+            )])
+            .expect("import owner")[0];
+        let target = database
+            .import_books(&[record_with_format(
+                "/books/target.pdf",
+                "Target",
+                "Author",
+                BookFormat::Pdf,
+            )])
+            .expect("import target")[0];
+        let owner_asset = database
+            .get_book(owner)
+            .expect("load owner")
+            .expect("owner exists")
+            .assets[0]
+            .id;
+
+        assert!(matches!(
+            database.attach_reference_asset(target, BookFormat::Epub, source.path()),
+            Err(StorageError::ReferencePathInUse(asset)) if asset == owner_asset
+        ));
+        assert_eq!(
+            database
+                .get_book(target)
+                .expect("load target")
+                .expect("target exists")
+                .assets
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn attaching_requires_an_existing_book_and_available_file() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let source = TestAsset::file("missing-book-attachment");
+        assert!(matches!(
+            database.attach_reference_asset(BookId::new(404), BookFormat::Pdf, source.path()),
+            Err(StorageError::BookNotFound(book)) if book == BookId::new(404)
+        ));
+
+        let id = database
+            .import_books(&[record("/books/dune.epub", "Dune", "Frank Herbert")])
+            .expect("import book")[0];
+        let missing = temporary_asset_path("missing-attachment");
+        assert!(matches!(
+            database.attach_reference_asset(id, BookFormat::Pdf, &missing),
+            Err(StorageError::AttachmentUnavailable(AssetHealth::Missing))
+        ));
     }
 
     #[test]

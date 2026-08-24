@@ -85,7 +85,13 @@ def main(arguments: list[str]) -> int:
         database = output / "library.sqlite3"
         seed_output = output / "seed.json"
         mode = workload.get("query_mode", "full")
-        query_output = output / ("removals.json" if mode == "remove" else "queries.json")
+        result_names = {
+            "full": "queries.json",
+            "page": "queries.json",
+            "remove": "removals.json",
+            "attach": "attachments.json",
+        }
+        query_output = output / result_names[mode]
         run_command(
             [
                 "cargo",
@@ -121,7 +127,12 @@ def main(arguments: list[str]) -> int:
                 "-p",
                 "lectern-benchmark",
                 "--",
-                {"full": "query", "page": "query-page", "remove": "remove"}[mode],
+                {
+                    "full": "query",
+                    "page": "query-page",
+                    "remove": "remove",
+                    "attach": "attach",
+                }[mode],
                 "--database",
                 str(database),
                 "--output",
@@ -134,11 +145,12 @@ def main(arguments: list[str]) -> int:
             commands,
         )
         query_result = read_json(query_output)
-        decisions = (
-            evaluate_remove_result(query_result, budget)
-            if mode == "remove"
-            else evaluate_query_result(query_result, budget)
-        )
+        if mode == "remove":
+            decisions = evaluate_remove_result(query_result, budget)
+        elif mode == "attach":
+            decisions = evaluate_attach_result(query_result, budget)
+        else:
+            decisions = evaluate_query_result(query_result, budget)
         report["seed"] = seed
         report["query"] = {
             "path": str(query_output),
@@ -184,9 +196,9 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             "budget.workload.measured_iterations must be greater than zero"
         )
     query_mode = workload.get("query_mode", "full")
-    if query_mode not in ("full", "page", "remove"):
+    if query_mode not in ("full", "page", "remove", "attach"):
         raise RegressionError(
-            "budget.workload.query_mode must be 'full', 'page', or 'remove'"
+            "budget.workload.query_mode must be 'full', 'page', 'remove', or 'attach'"
         )
     if query_mode == "full":
         scenario_names = workload.get("full_library_scenarios")
@@ -219,6 +231,12 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         positive_or_zero_field(workload, "page_size", "budget.workload")
         if workload["page_size"] == 0:
             raise RegressionError("budget.workload.page_size must be greater than zero")
+        if query_mode == "attach":
+            positive_or_zero_field(workload, "source_payload_bytes", "budget.workload")
+            if workload["source_payload_bytes"] == 0:
+                raise RegressionError(
+                    "budget.workload.source_payload_bytes must be greater than zero"
+                )
         scenario_names = workload.get("scenarios")
         if not isinstance(scenario_names, list) or not all(
             isinstance(name, str) and name for name in scenario_names
@@ -435,6 +453,93 @@ def evaluate_remove_result(
     expected_names = set(workload["scenarios"])
     if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
         raise RegressionError("remove scenarios do not match the versioned budget")
+    return evaluate_latency_budgets(by_name, budget)
+
+
+def evaluate_attach_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    books = workload["books"]
+    if positive_or_zero_field(result, "library_books", "attach result") != books:
+        raise RegressionError("attach workload initial library count does not match the budget")
+    if positive_or_zero_field(result, "final_library_books", "attach result") != books:
+        raise RegressionError("attach workload changed the logical-book count")
+    warmup = positive_or_zero_field(result, "warmup_iterations", "attach result")
+    measured = positive_or_zero_field(result, "measured_iterations", "attach result")
+    if warmup != workload["warmup_iterations"] or measured != workload["measured_iterations"]:
+        raise RegressionError("attach iteration counts do not match the budget")
+    total_rounds = warmup + measured
+    page_size = positive_or_zero_field(result, "page_size", "attach result")
+    if page_size != workload["page_size"]:
+        raise RegressionError("attach refresh page size does not match the budget")
+    payload_bytes = positive_or_zero_field(result, "source_payload_bytes", "attach result")
+    if payload_bytes != workload["source_payload_bytes"]:
+        raise RegressionError("attach source payload does not match the budget")
+    minimum_source_bytes = positive_or_zero_field(
+        result, "minimum_source_bytes", "attach result"
+    )
+    maximum_source_bytes = positive_or_zero_field(
+        result, "maximum_source_bytes", "attach result"
+    )
+    if minimum_source_bytes < payload_bytes or maximum_source_bytes < minimum_source_bytes:
+        raise RegressionError("attach sources are smaller than the representative payload")
+    source_files = result.get("source_files")
+    if (
+        not isinstance(source_files, list)
+        or len(source_files) != total_rounds
+        or not all(isinstance(path, str) and path for path in source_files)
+    ):
+        raise RegressionError("attach result must retain one source-file path per iteration")
+    if result.get("source_bytes_unchanged") is not True:
+        raise RegressionError("attach workload did not preserve source bytes")
+    if result.get("metadata_preserved") is not True:
+        raise RegressionError("attach workload did not preserve logical-book metadata")
+    if result.get("covers_preserved") is not True:
+        raise RegressionError("attach workload did not preserve cached covers")
+
+    initial_pdf_books = positive_or_zero_field(
+        result, "initial_pdf_books", "attach result"
+    )
+    final_pdf_books = positive_or_zero_field(result, "final_pdf_books", "attach result")
+    if final_pdf_books != initial_pdf_books + total_rounds:
+        raise RegressionError("attach workload PDF count does not reconcile")
+
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError("attach result must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, scenario in enumerate(scenarios):
+        context = f"attach scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{context}.name must be unique and non-empty")
+        validated = positive_or_zero_field(scenario, "validated_publications", context)
+        attached = positive_or_zero_field(scenario, "successful_attachments", context)
+        if validated != total_rounds or attached != total_rounds:
+            raise RegressionError(f"{context} operation counts do not reconcile")
+        if positive_or_zero_field(scenario, "refreshed_total", context) != final_pdf_books:
+            raise RegressionError(f"{context} refreshed total does not reconcile")
+        expected_page = min(final_pdf_books, page_size)
+        if positive_or_zero_field(scenario, "refreshed_result_count", context) != expected_page:
+            raise RegressionError(f"{context} refreshed page count does not reconcile")
+        samples = scenario.get("samples_ns")
+        if not isinstance(samples, list) or len(samples) != measured:
+            raise RegressionError(f"{context} sample count does not match the budget")
+        if any(
+            isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+            for sample in samples
+        ):
+            raise RegressionError(f"{context}.samples_ns must contain positive integers")
+        latency = object_field(scenario, "latency_ms", context)
+        positive_number_field(latency, "p95", f"{context}.latency_ms")
+        by_name[name] = scenario
+
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("attach scenarios do not match the versioned budget")
     return evaluate_latency_budgets(by_name, budget)
 
 

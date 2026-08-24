@@ -13,6 +13,10 @@
     {
       "name": "remove-book-v1",
       "budget": "benchmarks/remove-book-regression-v1.json"
+    },
+    {
+      "name": "attach-format-v1",
+      "budget": "benchmarks/attach-format-regression-v1.json"
     }
   ]
 }

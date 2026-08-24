@@ -15,6 +15,7 @@ image.workspace = true
 lectern-core.workspace = true
 lectern-import.workspace = true
 lectern-storage.workspace = true
+lopdf.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

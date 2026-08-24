@@ -3,8 +3,8 @@
 use std::{
     env,
     ffi::OsString,
-    fs::{self, OpenOptions},
-    io::{self, BufWriter, Write},
+    fs::{self, File, OpenOptions},
+    io::{self, BufWriter, Read, Write},
     path::{Path, PathBuf},
     process::{self, ExitCode},
     sync::{
@@ -17,11 +17,18 @@ use std::{
 
 use image::{Rgb, RgbImage, codecs::jpeg::JpegEncoder};
 use lectern_core::{
-    AssetHealth, AssetStorage, BookAssetDraft, BookDraft, BookFormat, BookMetadataDraft,
-    LibraryQuery, SortOrder,
+    AssetHealth, AssetId, AssetStorage, Book, BookAssetDraft, BookDraft, BookFormat,
+    BookMetadataDraft, BookSummary, LibraryQuery, SortOrder,
 };
-use lectern_import::{ImportProgress, ImportSummary, discover_publications, import_paths};
+use lectern_import::{
+    ImportProgress, ImportSummary, discover_publications, import_paths, validate_publication,
+};
 use lectern_storage::{BookImport, ImportRecord, LibraryDatabase};
+use lopdf::{
+    Document, Object, Stream,
+    content::{Content, Operation},
+    dictionary,
+};
 use serde::Serialize;
 
 const DEFAULT_BOOKS: usize = 50_000;
@@ -35,6 +42,7 @@ const BENCHMARK_COVER_WIDTH: u32 = 320;
 const BENCHMARK_COVER_HEIGHT: u32 = 480;
 const BENCHMARK_ADDED_AT_UNIX_SECONDS: i64 = 1_700_000_000;
 const REMOVAL_SOURCE_CONTENTS: &[u8] = b"Lectern removal benchmark source bytes\n";
+const ATTACHMENT_SOURCE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 
 const USAGE: &str = "Lectern exploratory performance harness
 
@@ -43,6 +51,7 @@ Usage:
   lectern-benchmark query --database PATH --output PATH [OPTIONS]
   lectern-benchmark query-page --database PATH --output PATH [OPTIONS]
   lectern-benchmark remove --database PATH --output PATH [OPTIONS]
+  lectern-benchmark attach --database PATH --output PATH [OPTIONS]
   lectern-benchmark import --database PATH --corpus PATH --output PATH [OPTIONS]
 
 Seed options:
@@ -57,6 +66,10 @@ Query options:
 
 Remove options:
   --iterations N     Measured remove-and-refresh iterations (default: 100)
+  --warmup N         Warmup iterations (default: 10)
+
+Attach options:
+  --iterations N     Measured validate-attach-refresh iterations (default: 100)
   --warmup N         Warmup iterations (default: 10)
 
 Import options:
@@ -91,6 +104,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         "query" => run_query(&QueryOptions::parse(&mut args)?),
         "query-page" => run_query_page(&QueryOptions::parse(&mut args)?),
         "remove" => run_remove(&QueryOptions::parse(&mut args)?),
+        "attach" => run_attach(&QueryOptions::parse(&mut args)?),
         "import" => run_import(&ImportOptions::parse(&mut args)?),
         _ => Err(format!(
             "unknown command '{command}'. Run 'lectern-benchmark --help' for usage"
@@ -1027,6 +1041,448 @@ fn removal_candidate(
         ],
         cover_thumbnail: Some(cover_thumbnail),
     }
+}
+
+#[derive(Serialize)]
+struct AttachResult {
+    schema_version: u32,
+    kind: &'static str,
+    measured_at_unix_ms: u128,
+    database_path: String,
+    library_books: u64,
+    final_library_books: u64,
+    initial_pdf_books: u64,
+    final_pdf_books: u64,
+    page_size: u32,
+    source_payload_bytes: usize,
+    minimum_source_bytes: u64,
+    maximum_source_bytes: u64,
+    warmup_iterations: usize,
+    measured_iterations: usize,
+    source_files: Vec<String>,
+    source_bytes_unchanged: bool,
+    metadata_preserved: bool,
+    covers_preserved: bool,
+    scenarios: Vec<AttachScenarioResult>,
+}
+
+#[derive(Serialize)]
+struct AttachScenarioResult {
+    name: &'static str,
+    validated_publications: usize,
+    successful_attachments: usize,
+    refreshed_total: u64,
+    refreshed_result_count: usize,
+    latency_ms: LatencySummary,
+    samples_ns: Vec<u64>,
+}
+
+struct PreparedAttachmentSources {
+    files: Vec<PathBuf>,
+    fingerprint: FileFingerprint,
+}
+
+struct AttachmentMeasurements {
+    validated_publications: usize,
+    successful_attachments: usize,
+    refreshed_total: u64,
+    refreshed_result_count: usize,
+    samples_ns: Vec<u64>,
+}
+
+fn run_attach(options: &QueryOptions) -> Result<(), String> {
+    ensure_distinct_paths("database", &options.database, "output", &options.output)?;
+    if !options.database.is_file() {
+        return Err(format!(
+            "benchmark database is not a file: {}",
+            options.database.display()
+        ));
+    }
+
+    let rounds = options
+        .warmup
+        .checked_add(options.iterations)
+        .ok_or_else(|| "attachment iteration count overflowed".to_owned())?;
+    let sources = prepare_attachment_sources(&options.output, rounds)?;
+
+    let mut database = LibraryDatabase::open(&options.database).map_err(display_error)?;
+    let library_books = database.count().map_err(display_error)?;
+    if library_books == 0 {
+        return Err(format!(
+            "benchmark database contains no books: {}",
+            options.database.display()
+        ));
+    }
+    let candidates = covered_epub_candidates(&database, rounds)?;
+    let initial_pdf_books = database
+        .query_page(
+            &LibraryQuery {
+                format: Some(BookFormat::Pdf),
+                ..LibraryQuery::default()
+            },
+            0,
+            0,
+        )
+        .map_err(display_error)?
+        .total;
+
+    let measurements = measure_attachments(
+        &mut database,
+        &candidates,
+        &sources,
+        initial_pdf_books,
+        options.warmup,
+        options.iterations,
+    )?;
+
+    let final_library_books = database.count().map_err(display_error)?;
+    if final_library_books != library_books {
+        return Err(format!(
+            "attachment benchmark changed book count: got {final_library_books}, expected {library_books}"
+        ));
+    }
+    let final_pdf_books = initial_pdf_books
+        .checked_add(u64::try_from(rounds).expect("attachment count fits u64"))
+        .ok_or_else(|| "attachment final PDF count overflowed".to_owned())?;
+    if measurements.refreshed_total != final_pdf_books {
+        return Err("attachment benchmark final PDF count did not reconcile".into());
+    }
+
+    let result = AttachResult {
+        schema_version: 1,
+        kind: "attach",
+        measured_at_unix_ms: unix_time_ms()?,
+        database_path: options.database.display().to_string(),
+        library_books,
+        final_library_books,
+        initial_pdf_books,
+        final_pdf_books,
+        page_size: QUERY_PAGE_SIZE,
+        source_payload_bytes: ATTACHMENT_SOURCE_PAYLOAD_BYTES,
+        minimum_source_bytes: sources.fingerprint.bytes,
+        maximum_source_bytes: sources.fingerprint.bytes,
+        warmup_iterations: options.warmup,
+        measured_iterations: options.iterations,
+        source_files: sources
+            .files
+            .iter()
+            .map(|source| source.display().to_string())
+            .collect(),
+        source_bytes_unchanged: true,
+        metadata_preserved: true,
+        covers_preserved: true,
+        scenarios: vec![AttachScenarioResult {
+            name: "attach_validated_format_and_refresh",
+            validated_publications: measurements.validated_publications,
+            successful_attachments: measurements.successful_attachments,
+            refreshed_total: measurements.refreshed_total,
+            refreshed_result_count: measurements.refreshed_result_count,
+            latency_ms: summarize_latency(&measurements.samples_ns),
+            samples_ns: measurements.samples_ns,
+        }],
+    };
+    write_json(&options.output, &result)?;
+    println!(
+        "Measured {} validate-attach-refresh iterations over {} books",
+        options.iterations, library_books
+    );
+    Ok(())
+}
+
+fn prepare_attachment_sources(
+    output: &Path,
+    rounds: usize,
+) -> Result<PreparedAttachmentSources, String> {
+    let directory = output.with_extension("sources");
+    fs::create_dir(&directory).map_err(display_error)?;
+    let prototype = directory.join("prototype.pdf");
+    create_attachment_pdf(&prototype, ATTACHMENT_SOURCE_PAYLOAD_BYTES)?;
+    validate_publication(&prototype, BookFormat::Pdf).map_err(display_error)?;
+    let fingerprint = fingerprint_file(&prototype)?;
+
+    let mut files = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        let source = directory.join(format!("attachment-{round:04}.pdf"));
+        if fs::hard_link(&prototype, &source).is_err() {
+            fs::copy(&prototype, &source).map_err(display_error)?;
+        }
+        if fingerprint_file(&source)? != fingerprint {
+            return Err(format!(
+                "attachment benchmark source copy did not reconcile: {}",
+                source.display()
+            ));
+        }
+        files.push(source);
+    }
+    Ok(PreparedAttachmentSources { files, fingerprint })
+}
+
+fn covered_epub_candidates(
+    database: &LibraryDatabase,
+    rounds: usize,
+) -> Result<Vec<BookSummary>, String> {
+    let candidates = database
+        .query(&LibraryQuery {
+            format: Some(BookFormat::Epub),
+            ..LibraryQuery::default()
+        })
+        .map_err(display_error)?
+        .into_iter()
+        .filter(|book| book.has_cover)
+        .take(rounds)
+        .collect::<Vec<_>>();
+    if candidates.len() != rounds {
+        return Err(format!(
+            "attachment benchmark needs {rounds} covered EPUB books but found {}",
+            candidates.len()
+        ));
+    }
+    Ok(candidates)
+}
+
+fn measure_attachments(
+    database: &mut LibraryDatabase,
+    candidates: &[BookSummary],
+    sources: &PreparedAttachmentSources,
+    initial_pdf_books: u64,
+    warmup: usize,
+    measured: usize,
+) -> Result<AttachmentMeasurements, String> {
+    let mut samples_ns = Vec::with_capacity(measured);
+    let mut refreshed_total = initial_pdf_books;
+    let mut refreshed_result_count = 0;
+    for (round, (candidate, source)) in candidates.iter().zip(&sources.files).enumerate() {
+        let expected_pdf_books = initial_pdf_books
+            .checked_add(u64::try_from(round + 1).expect("attachment count fits u64"))
+            .ok_or_else(|| "attachment PDF count overflowed".to_owned())?;
+        let (elapsed, result_count) = attach_and_refresh(
+            database,
+            candidate,
+            source,
+            sources.fingerprint,
+            expected_pdf_books,
+        )?;
+        refreshed_total = expected_pdf_books;
+        refreshed_result_count = result_count;
+        if round >= warmup {
+            samples_ns.push(duration_ns(elapsed)?);
+        }
+    }
+    let successful_attachments = warmup
+        .checked_add(measured)
+        .ok_or_else(|| "attachment count overflowed".to_owned())?;
+    Ok(AttachmentMeasurements {
+        validated_publications: successful_attachments,
+        successful_attachments,
+        refreshed_total,
+        refreshed_result_count,
+        samples_ns,
+    })
+}
+
+fn attach_and_refresh(
+    database: &mut LibraryDatabase,
+    candidate: &BookSummary,
+    source: &Path,
+    expected_source: FileFingerprint,
+    expected_pdf_books: u64,
+) -> Result<(Duration, usize), String> {
+    let original = database
+        .get_book(candidate.id)
+        .map_err(display_error)?
+        .ok_or_else(|| format!("attachment candidate {} disappeared", candidate.id))?;
+    if original.assets.len() != 1 || original.assets[0].format != BookFormat::Epub {
+        return Err(format!(
+            "attachment candidate {} was not EPUB-only",
+            candidate.id
+        ));
+    }
+    let original_cover = database
+        .load_cover(candidate.id)
+        .map_err(display_error)?
+        .ok_or_else(|| format!("attachment candidate {} lost its cover", candidate.id))?;
+
+    let started = Instant::now();
+    validate_publication(source, BookFormat::Pdf).map_err(display_error)?;
+    let attached = database
+        .attach_reference_asset(candidate.id, BookFormat::Pdf, source)
+        .map_err(display_error)?;
+    let page = database
+        .query_page(
+            &LibraryQuery {
+                format: Some(BookFormat::Pdf),
+                ..LibraryQuery::default()
+            },
+            0,
+            QUERY_PAGE_SIZE,
+        )
+        .map_err(display_error)?;
+    let elapsed = started.elapsed();
+
+    let expected_page = usize::try_from(expected_pdf_books.min(u64::from(QUERY_PAGE_SIZE)))
+        .expect("bounded page count fits usize");
+    if page.total != expected_pdf_books || page.books.len() != expected_page {
+        return Err(format!(
+            "attachment refresh did not reconcile for book {}",
+            candidate.id
+        ));
+    }
+    validate_attached_book(
+        database,
+        candidate,
+        source,
+        attached,
+        &original,
+        &original_cover,
+    )?;
+    if fingerprint_file(source)? != expected_source {
+        return Err(format!(
+            "attachment changed source file {}",
+            source.display()
+        ));
+    }
+    Ok((elapsed, page.books.len()))
+}
+
+fn validate_attached_book(
+    database: &LibraryDatabase,
+    candidate: &BookSummary,
+    source: &Path,
+    attached: AssetId,
+    original: &Book,
+    original_cover: &[u8],
+) -> Result<(), String> {
+    let updated = database
+        .get_book(candidate.id)
+        .map_err(display_error)?
+        .ok_or_else(|| format!("attached book {} disappeared", candidate.id))?;
+    if !book_metadata_matches(original, &updated)
+        || updated.assets.len() != 2
+        || updated.assets[0] != original.assets[0]
+    {
+        return Err(format!(
+            "attachment changed metadata or existing assets for book {}",
+            candidate.id
+        ));
+    }
+    let attached_asset = updated
+        .assets
+        .iter()
+        .find(|asset| asset.id == attached)
+        .ok_or_else(|| format!("attached asset {attached} was not stored"))?;
+    if attached_asset.format != BookFormat::Pdf
+        || attached_asset.storage != AssetStorage::Reference
+        || attached_asset.health != AssetHealth::Available
+        || attached_asset.path != source
+    {
+        return Err(format!("attached asset {attached} did not reconcile"));
+    }
+    if database
+        .load_cover(candidate.id)
+        .map_err(display_error)?
+        .as_deref()
+        != Some(original_cover)
+    {
+        return Err(format!(
+            "attachment changed the cover for book {}",
+            candidate.id
+        ));
+    }
+    let matching = database
+        .query(&LibraryQuery {
+            search: original.title.clone(),
+            format: Some(BookFormat::Pdf),
+            ..LibraryQuery::default()
+        })
+        .map_err(display_error)?;
+    if matching.len() != 1 || matching[0].id != candidate.id {
+        return Err(format!(
+            "attached book {} was not uniquely discoverable",
+            candidate.id
+        ));
+    }
+    Ok(())
+}
+
+fn create_attachment_pdf(path: &Path, payload_bytes: usize) -> Result<(), String> {
+    let mut document = Document::with_version("1.5");
+    let page_tree_id = document.new_object_id();
+    let content = Content {
+        operations: vec![
+            Operation::new("q", vec![]),
+            Operation::new("rg", vec![0.09.into(), 0.31.into(), 0.55.into()]),
+            Operation::new("re", vec![0.into(), 0.into(), 300.into(), 450.into()]),
+            Operation::new("f", vec![]),
+            Operation::new("Q", vec![]),
+        ],
+    };
+    let content_id = document.add_object(Stream::new(
+        dictionary! {},
+        content.encode().map_err(display_error)?,
+    ));
+    let payload_id = document.add_object(Stream::new(dictionary! {}, vec![b'L'; payload_bytes]));
+    let page_id = document.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => page_tree_id,
+        "Contents" => content_id,
+        "MediaBox" => vec![0.into(), 0.into(), 300.into(), 450.into()],
+        "Resources" => dictionary! {},
+    });
+    document.objects.insert(
+        page_tree_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = document.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => page_tree_id,
+        "LecternBenchmarkPayload" => payload_id,
+    });
+    document.trailer.set("Root", catalog_id);
+    document.save(path).map_err(display_error)?;
+    Ok(())
+}
+
+fn book_metadata_matches(original: &Book, updated: &Book) -> bool {
+    original.id == updated.id
+        && original.title == updated.title
+        && original.authors == updated.authors
+        && original.series == updated.series
+        && original.publisher == updated.publisher
+        && original.language == updated.language
+        && original.description == updated.description
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct FileFingerprint {
+    bytes: u64,
+    hash: u64,
+}
+
+fn fingerprint_file(path: &Path) -> Result<FileFingerprint, String> {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut file = File::open(path).map_err(display_error)?;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut bytes = 0_u64;
+    let mut hash = FNV_OFFSET;
+    loop {
+        let read = file.read(&mut buffer).map_err(display_error)?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(u64::try_from(read).expect("buffer length fits u64"))
+            .ok_or_else(|| format!("file size overflowed for {}", path.display()))?;
+        for byte in &buffer[..read] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    Ok(FileFingerprint { bytes, hash })
 }
 
 #[derive(Serialize)]
