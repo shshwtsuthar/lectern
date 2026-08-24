@@ -9,8 +9,8 @@ thresholds while the baseline is being established.
 
 - A deterministic 50,000-book SQLite library, with stable metadata and one 320×480 JPEG cover
   for every three books by default.
-- Seven interleaved search, format-filter, and sort scenarios, retaining 100 measured samples
-  per scenario after warmup.
+- Eight interleaved search, format-filter, asset-health-filter, and sort scenarios, retaining 100
+  measured samples per scenario after warmup.
 - Fresh desktop processes for populated-library startup measurements.
 - A deterministic sustained cover-grid scroll with wall-frame, egui interval, and CPU-frame
   samples after a warmup window.

@@ -5,7 +5,10 @@ use std::{
 
 use directories::ProjectDirs;
 use eframe::egui::{self, Align, Color32, FontId, RichText, Sense, Stroke, StrokeKind, Vec2};
-use lectern_core::{Book, BookFormat, BookId, BookSummary, LibraryQuery, SortOrder};
+use lectern_core::{
+    AssetHealth, AssetHealthReport, AssetId, Book, BookFormat, BookId, BookSummary, LibraryQuery,
+    SortOrder,
+};
 use lectern_import::{ImportProgress, ImportSummary};
 use lectern_storage::LibraryDatabase;
 
@@ -42,6 +45,14 @@ struct BookEditor {
     description: String,
     saving: bool,
     error: Option<String>,
+}
+
+#[derive(Default)]
+struct AssetMaintenanceUi {
+    scanning: bool,
+    report: Option<AssetHealthReport>,
+    show_report: bool,
+    relinking_asset: Option<AssetId>,
 }
 
 impl BookEditor {
@@ -98,6 +109,7 @@ pub(crate) struct LecternApp {
     import_progress: Option<ImportProgress>,
     import_summary: Option<ImportSummary>,
     show_import_summary: bool,
+    asset_maintenance: AssetMaintenanceUi,
     editor_loading: Option<BookId>,
     editor: Option<BookEditor>,
     benchmark: Option<DesktopBenchmark>,
@@ -132,6 +144,7 @@ impl LecternApp {
             import_progress: None,
             import_summary: None,
             show_import_summary: false,
+            asset_maintenance: AssetMaintenanceUi::default(),
             editor_loading: None,
             editor: None,
             benchmark,
@@ -226,29 +239,76 @@ impl LecternApp {
                         }
                     }
                 }
-                WorkerEvent::BookSaved { book, result } => match result {
-                    Ok(()) => {
-                        self.status = format!("Saved metadata for {}", book.title);
-                        if self.editor.as_ref().map(|editor| editor.original.id) == Some(book.id) {
-                            self.editor = Some(BookEditor::new(book));
-                        }
-                        self.refresh_library();
-                    }
-                    Err(error) => {
-                        self.status = format!("Could not save metadata: {error}");
-                        if let Some(editor) = &mut self.editor
-                            && editor.original.id == book.id
-                        {
-                            editor.saving = false;
-                            editor.error = Some(error);
-                        }
-                    }
-                },
+                WorkerEvent::BookSaved { book, result } => self.book_saved(book, result),
+                WorkerEvent::AssetHealthScanned(result) => self.asset_health_scanned(result),
+                WorkerEvent::AssetRelinked {
+                    book_id,
+                    asset_id,
+                    result,
+                } => self.asset_relinked(book_id, asset_id, result),
                 WorkerEvent::QueryFinished { .. } | WorkerEvent::BookLoaded { .. } => {}
                 WorkerEvent::Error(error) => self.status = format!("Background worker: {error}"),
             }
         }
         self.evict_covers();
+    }
+
+    fn book_saved(&mut self, book: Book, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.status = format!("Saved metadata for {}", book.title);
+                if self.editor.as_ref().map(|editor| editor.original.id) == Some(book.id) {
+                    self.editor = Some(BookEditor::new(book));
+                }
+                self.refresh_library();
+            }
+            Err(error) => {
+                self.status = format!("Could not save metadata: {error}");
+                if let Some(editor) = &mut self.editor
+                    && editor.original.id == book.id
+                {
+                    editor.saving = false;
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn asset_health_scanned(&mut self, result: Result<AssetHealthReport, String>) {
+        self.asset_maintenance.scanning = false;
+        match result {
+            Ok(report) => {
+                self.status = asset_health_status(report);
+                self.asset_maintenance.report = Some(report);
+                self.asset_maintenance.show_report = true;
+                self.refresh_library();
+                self.reload_selected_book_after_asset_change();
+            }
+            Err(error) => self.status = format!("Could not scan library files: {error}"),
+        }
+    }
+
+    fn asset_relinked(&mut self, book_id: BookId, asset_id: AssetId, result: Result<(), String>) {
+        if self.asset_maintenance.relinking_asset == Some(asset_id) {
+            self.asset_maintenance.relinking_asset = None;
+        }
+        match result {
+            Ok(()) => {
+                "Relinked book file".clone_into(&mut self.status);
+                self.refresh_library();
+                if self.selected == Some(book_id) {
+                    self.reload_selected_book_after_asset_change();
+                }
+            }
+            Err(error) => {
+                self.status = format!("Could not relink book file: {error}");
+                if let Some(editor) = &mut self.editor
+                    && editor.original.id == book_id
+                {
+                    editor.error = Some(error);
+                }
+            }
+        }
     }
 
     fn install_cover(&mut self, context: &egui::Context, id: BookId, cover: &DecodedCover) {
@@ -284,38 +344,7 @@ impl LecternApp {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let mut add_books = false;
-        let mut add_folder = false;
-        ui.horizontal(|ui| {
-            ui.heading(RichText::new("Lectern").size(26.0).strong());
-            ui.label(
-                RichText::new(format!("{} books", self.books.len()))
-                    .color(MUTED)
-                    .size(13.0),
-            );
-            if self.query_pending {
-                ui.spinner();
-            }
-            if self.importing {
-                ui.label(RichText::new("Importing…").color(ACCENT).size(12.0));
-            }
-            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                add_folder = ui
-                    .add_enabled(!self.importing, egui::Button::new("Add folder"))
-                    .clicked();
-                add_books = ui
-                    .add_enabled(!self.importing, egui::Button::new("Add books"))
-                    .clicked();
-                if self
-                    .import_summary
-                    .as_ref()
-                    .is_some_and(|summary| summary.failed > 0)
-                    && ui.button("Import report").clicked()
-                {
-                    self.show_import_summary = true;
-                }
-            });
-        });
+        let (add_books, add_folder, rescan_files) = self.toolbar_actions(ui);
         if add_books
             && let Some(paths) = rfd::FileDialog::new()
                 .set_title("Add books to Lectern")
@@ -330,6 +359,9 @@ impl LecternApp {
                 .pick_folder()
         {
             self.start_import(vec![path]);
+        }
+        if rescan_files {
+            self.start_asset_scan();
         }
         ui.add_space(10.0);
 
@@ -360,6 +392,8 @@ impl LecternApp {
                 });
             query_changed |= previous_format != self.query.format;
 
+            query_changed |= self.asset_health_filter(ui);
+
             let previous_sort = self.query.sort;
             egui::ComboBox::from_id_salt("library-sort")
                 .selected_text(self.query.sort.to_string())
@@ -377,12 +411,104 @@ impl LecternApp {
         }
     }
 
+    fn toolbar_actions(&mut self, ui: &mut egui::Ui) -> (bool, bool, bool) {
+        let mut add_books = false;
+        let mut add_folder = false;
+        let mut rescan_files = false;
+        let maintenance_busy =
+            self.asset_maintenance.scanning || self.asset_maintenance.relinking_asset.is_some();
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new("Lectern").size(26.0).strong());
+            ui.label(
+                RichText::new(format!("{} books", self.books.len()))
+                    .color(MUTED)
+                    .size(13.0),
+            );
+            if self.query_pending {
+                ui.spinner();
+            }
+            if self.importing {
+                ui.label(RichText::new("Importing…").color(ACCENT).size(12.0));
+            }
+            if self.asset_maintenance.scanning {
+                ui.label(RichText::new("Scanning files…").color(ACCENT).size(12.0));
+            }
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                add_folder = ui
+                    .add_enabled(
+                        !self.importing && !maintenance_busy,
+                        egui::Button::new("Add folder"),
+                    )
+                    .clicked();
+                add_books = ui
+                    .add_enabled(
+                        !self.importing && !maintenance_busy,
+                        egui::Button::new("Add books"),
+                    )
+                    .clicked();
+                rescan_files = ui
+                    .add_enabled(
+                        !self.importing && !maintenance_busy,
+                        egui::Button::new("Rescan files"),
+                    )
+                    .on_hover_text("Check the availability of referenced EPUB and PDF files")
+                    .clicked();
+                if self.asset_maintenance.report.is_some() && ui.button("File report").clicked() {
+                    self.asset_maintenance.show_report = true;
+                }
+                if self
+                    .import_summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.failed > 0)
+                    && ui.button("Import report").clicked()
+                {
+                    self.show_import_summary = true;
+                }
+            });
+        });
+        (add_books, add_folder, rescan_files)
+    }
+
+    fn asset_health_filter(&mut self, ui: &mut egui::Ui) -> bool {
+        let previous = self.query.asset_health;
+        egui::ComboBox::from_id_salt("asset-health-filter")
+            .selected_text(
+                self.query
+                    .asset_health
+                    .map_or_else(|| "All files".to_owned(), |health| health.to_string()),
+            )
+            .width(130.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.query.asset_health, None, "All files");
+                ui.selectable_value(
+                    &mut self.query.asset_health,
+                    Some(AssetHealth::Missing),
+                    "Missing files",
+                );
+                ui.selectable_value(
+                    &mut self.query.asset_health,
+                    Some(AssetHealth::Unreadable),
+                    "Unreadable files",
+                );
+                ui.selectable_value(
+                    &mut self.query.asset_health,
+                    Some(AssetHealth::Unknown),
+                    "Not checked",
+                );
+            });
+        previous != self.query.asset_health
+    }
+
     fn start_import(&mut self, roots: Vec<PathBuf>) {
         if roots.is_empty() {
             return;
         }
         if self.importing {
             "An import is already running".clone_into(&mut self.status);
+            return;
+        }
+        if self.asset_maintenance.scanning || self.asset_maintenance.relinking_asset.is_some() {
+            "Library file maintenance is already running".clone_into(&mut self.status);
             return;
         }
         if self.workers.import(ImportRequest { roots }) {
@@ -392,6 +518,22 @@ impl LecternApp {
             "Discovering book files…".clone_into(&mut self.status);
         } else {
             "Import worker is unavailable".clone_into(&mut self.status);
+        }
+    }
+
+    fn start_asset_scan(&mut self) {
+        if self.importing
+            || self.asset_maintenance.scanning
+            || self.asset_maintenance.relinking_asset.is_some()
+        {
+            "Library file maintenance is already running".clone_into(&mut self.status);
+            return;
+        }
+        if self.workers.rescan_reference_assets() {
+            self.asset_maintenance.scanning = true;
+            "Scanning referenced book files…".clone_into(&mut self.status);
+        } else {
+            "Library maintenance worker is unavailable".clone_into(&mut self.status);
         }
     }
 
@@ -450,6 +592,45 @@ impl LecternApp {
         self.show_import_summary = open;
     }
 
+    fn asset_health_report_window(&mut self, context: &egui::Context) {
+        let Some(report) = self.asset_maintenance.report else {
+            return;
+        };
+        let mut open = self.asset_maintenance.show_report;
+        let mut show_missing = false;
+        egui::Window::new("Library file report")
+            .open(&mut open)
+            .default_width(430.0)
+            .collapsible(false)
+            .show(context, |ui| {
+                ui.heading(format!("{} referenced files checked", report.checked));
+                ui.label(
+                    RichText::new(format!("{} available", report.available))
+                        .color(Color32::LIGHT_GREEN),
+                );
+                ui.label(
+                    RichText::new(format!("{} missing", report.missing)).color(Color32::LIGHT_RED),
+                );
+                ui.label(
+                    RichText::new(format!("{} unreadable", report.unreadable))
+                        .color(Color32::LIGHT_RED),
+                );
+                if report.missing > 0 {
+                    ui.add_space(8.0);
+                    show_missing = ui.button("Show missing files").clicked();
+                }
+                if report.changed == 0 {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("No stored file health changed.").color(MUTED));
+                }
+            });
+        self.asset_maintenance.show_report = open;
+        if show_missing {
+            self.query.asset_health = Some(AssetHealth::Missing);
+            self.refresh_library();
+        }
+    }
+
     fn select_book(&mut self, id: BookId) {
         self.selected = Some(id);
         self.editor = None;
@@ -467,10 +648,24 @@ impl LecternApp {
         self.editor = None;
     }
 
+    fn reload_selected_book_after_asset_change(&mut self) {
+        let has_unsaved_changes = self.editor.as_ref().is_some_and(BookEditor::changed);
+        if has_unsaved_changes {
+            return;
+        }
+        if let Some(id) = self.selected
+            && self.workers.load_book(id)
+        {
+            self.editor_loading = Some(id);
+            self.editor = None;
+        }
+    }
+
     fn metadata_panel(&mut self, ui: &mut egui::Ui) {
         let mut close = false;
         let mut reset = false;
         let mut save = false;
+        let mut relink = None;
         egui::Panel::right("metadata-editor")
             .default_size(370.0)
             .size_range(310.0..=520.0)
@@ -501,9 +696,10 @@ impl LecternApp {
                     ui.label(RichText::new("Metadata is unavailable.").color(MUTED));
                     return;
                 };
-                let actions = metadata_form(ui, editor);
+                let actions = metadata_form(ui, editor, self.asset_maintenance.relinking_asset);
                 save = actions.0;
                 reset = actions.1;
+                relink = actions.2;
             });
 
         save |= ui.input_mut(|input| {
@@ -520,6 +716,8 @@ impl LecternApp {
             }
         } else if save {
             self.save_editor();
+        } else if let Some((asset_id, format)) = relink {
+            self.choose_asset_replacement(asset_id, format);
         }
     }
 
@@ -537,6 +735,39 @@ impl LecternApp {
             "Saving metadata…".clone_into(&mut self.status);
         } else {
             "Metadata worker is unavailable".clone_into(&mut self.status);
+        }
+    }
+
+    fn choose_asset_replacement(&mut self, asset_id: AssetId, format: BookFormat) {
+        if self.asset_maintenance.relinking_asset.is_some() {
+            return;
+        }
+        let extension = match format {
+            BookFormat::Epub => "epub",
+            BookFormat::Pdf => "pdf",
+        };
+        let title = format!("Relink {format} file");
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(&title)
+            .add_filter(format.to_string(), &[extension])
+            .pick_file()
+        else {
+            return;
+        };
+        let Some(book_id) = self.selected else {
+            return;
+        };
+        if self
+            .workers
+            .relink_reference_asset(book_id, asset_id, format, path)
+        {
+            self.asset_maintenance.relinking_asset = Some(asset_id);
+            if let Some(editor) = &mut self.editor {
+                editor.error = None;
+            }
+            "Validating replacement file…".clone_into(&mut self.status);
+        } else {
+            "Library maintenance worker is unavailable".clone_into(&mut self.status);
         }
     }
 
@@ -630,6 +861,13 @@ impl LecternApp {
                     .selectable(false),
             )
             .on_hover_text(author);
+            if book.has_file_issue {
+                ui.label(
+                    RichText::new("File needs attention")
+                        .color(Color32::LIGHT_RED)
+                        .size(11.0),
+                );
+            }
         });
         let response = card
             .response
@@ -736,6 +974,7 @@ impl eframe::App for LecternApp {
             )
             .show(ui, |ui| self.library(ui));
         self.import_summary_window(ui.ctx());
+        self.asset_health_report_window(ui.ctx());
 
         if files_hovering {
             let rect = ui.max_rect().shrink(18.0);
@@ -826,15 +1065,27 @@ fn import_status(progress: ImportProgress) -> String {
     )
 }
 
+fn asset_health_status(report: AssetHealthReport) -> String {
+    format!(
+        "Checked {} referenced files · {} missing · {} unreadable",
+        report.checked, report.missing, report.unreadable
+    )
+}
+
 fn metadata_text_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.add_space(4.0);
     ui.label(RichText::new(label).strong());
     ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
 }
 
-fn metadata_form(ui: &mut egui::Ui, editor: &mut BookEditor) -> (bool, bool) {
+fn metadata_form(
+    ui: &mut egui::Ui,
+    editor: &mut BookEditor,
+    relinking_asset: Option<AssetId>,
+) -> (bool, bool, Option<(AssetId, BookFormat)>) {
     let mut save = false;
     let mut reset = false;
+    let mut relink = None;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -858,11 +1109,35 @@ fn metadata_form(ui: &mut egui::Ui, editor: &mut BookEditor) -> (bool, bool) {
             ui.add_space(8.0);
             ui.label(RichText::new("Files").strong());
             for asset in &editor.original.assets {
-                ui.label(
-                    RichText::new(format!("{} · {}", asset.format, asset.storage))
-                        .color(MUTED)
-                        .size(12.0),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{} · {}", asset.format, asset.storage))
+                            .color(MUTED)
+                            .size(12.0),
+                    );
+                    let health_color = match asset.health {
+                        AssetHealth::Available => Color32::LIGHT_GREEN,
+                        AssetHealth::Missing | AssetHealth::Unreadable => Color32::LIGHT_RED,
+                        AssetHealth::Unknown => MUTED,
+                    };
+                    ui.label(
+                        RichText::new(asset.health.to_string())
+                            .color(health_color)
+                            .size(12.0),
+                    );
+                    if asset.storage == lectern_core::AssetStorage::Reference
+                        && asset.health.has_issue()
+                    {
+                        let button = if relinking_asset == Some(asset.id) {
+                            egui::Button::new("Relinking…")
+                        } else {
+                            egui::Button::new("Relink…")
+                        };
+                        if ui.add_enabled(relinking_asset.is_none(), button).clicked() {
+                            relink = Some((asset.id, asset.format));
+                        }
+                    }
+                });
                 ui.add(
                     egui::Label::new(
                         RichText::new(asset.path.display().to_string())
@@ -897,7 +1172,7 @@ fn metadata_form(ui: &mut egui::Ui, editor: &mut BookEditor) -> (bool, bool) {
                 }
             });
         });
-    (save, reset)
+    (save, reset, relink)
 }
 
 fn optional_metadata(value: &str) -> Option<String> {
@@ -909,10 +1184,14 @@ fn optional_metadata(value: &str) -> Option<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use lectern_core::{AssetHealth, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId};
+    use lectern_core::{
+        AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId,
+    };
     use lectern_import::ImportProgress;
 
-    use super::{BookEditor, CARD_GAP, CARD_WIDTH, column_count, import_status};
+    use super::{
+        BookEditor, CARD_GAP, CARD_WIDTH, asset_health_status, column_count, import_status,
+    };
 
     #[test]
     fn grid_always_has_a_column() {
@@ -940,6 +1219,20 @@ mod tests {
                 failed: 1,
             }),
             "Importing 4/10 · 3 imported · 1 failed"
+        );
+    }
+
+    #[test]
+    fn asset_health_status_is_human_readable() {
+        assert_eq!(
+            asset_health_status(AssetHealthReport {
+                checked: 10,
+                available: 7,
+                missing: 2,
+                unreadable: 1,
+                changed: 3,
+            }),
+            "Checked 10 referenced files · 2 missing · 1 unreadable"
         );
     }
 

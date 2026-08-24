@@ -15,6 +15,8 @@ immediately searchable, renders a cover grid, and edits their metadata.
 - Browse a virtualized grid whose cover I/O, image decoding, and database queries stay off the UI
   thread.
 - Edit metadata in place and refresh the search index as soon as it is saved.
+- Rescan referenced book files, filter missing or unreadable assets, and safely relink a missing
+  EPUB or PDF without losing its logical-book metadata, cover, or asset identity.
 
 Bulk editing, device export, filesystem export, and Calibre-library import are not implemented yet.
 Password-protected PDFs also require a future password prompt. These remain product work rather

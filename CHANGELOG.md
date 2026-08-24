@@ -9,6 +9,8 @@ follow [Semantic Versioning](https://semver.org/) once releases begin.
 
 ### Added
 
+- Referenced-asset health scans, missing/unreadable file reporting and filtering, and validated
+  in-place relinking that preserves book metadata, covers, and stable asset IDs.
 - Logical books with stable EPUB/PDF assets, explicit managed/reference ownership, reversible paths,
   atomic grouped imports, and direct migration from the earlier single-file schemas.
 - Native desktop library browser with a virtualized cover grid and bounded texture cache.

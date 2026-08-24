@@ -38,9 +38,11 @@ them.
 
 The render loop creates widgets only for visible cover-grid rows. A persistent query worker
 coalesces superseded searches, a bounded worker pool loads and decodes cover thumbnails, a metadata
-worker serializes edits, and a dedicated import worker parses publications in parallel before
-committing bounded transactions. The UI retains at most 256 cover textures and requests repainting
-only when background work completes or interaction requires it.
+worker serializes edits, and dedicated import and asset-maintenance workers perform filesystem and
+write-heavy work off the UI thread. Asset scans check referenced paths with metadata and openability
+checks, then persist only changed health states in one transaction; relinking validates publication
+structure without regenerating thumbnails. The UI retains at most 256 cover textures and requests
+repainting only when background work completes or interaction requires it.
 
 SQLite runs in WAL mode for the persistent library. FTS5 triggers keep search data consistent with
 imports and metadata edits. Imports never extract archive members to disk, reject unsafe archive

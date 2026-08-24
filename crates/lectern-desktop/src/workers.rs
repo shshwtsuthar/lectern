@@ -7,8 +7,10 @@ use std::{
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use eframe::egui;
 use image::{ImageReader, Limits};
-use lectern_core::{Book, BookId, BookSummary, LibraryQuery};
-use lectern_import::{ImportProgress, ImportSummary, import_paths};
+use lectern_core::{
+    AssetHealthReport, AssetId, Book, BookFormat, BookId, BookSummary, LibraryQuery,
+};
+use lectern_import::{ImportProgress, ImportSummary, import_paths, validate_publication};
 use lectern_storage::LibraryDatabase;
 
 const COVER_QUEUE_CAPACITY: usize = 128;
@@ -29,6 +31,16 @@ pub(crate) struct ImportRequest {
 enum MetadataRequest {
     Load(BookId),
     Save(Book),
+}
+
+enum AssetMaintenanceRequest {
+    Scan,
+    Relink {
+        book_id: BookId,
+        asset_id: AssetId,
+        format: BookFormat,
+        replacement_path: PathBuf,
+    },
 }
 
 pub(crate) struct DecodedCover {
@@ -55,6 +67,12 @@ pub(crate) enum WorkerEvent {
         book: Book,
         result: Result<(), String>,
     },
+    AssetHealthScanned(Result<AssetHealthReport, String>),
+    AssetRelinked {
+        book_id: BookId,
+        asset_id: AssetId,
+        result: Result<(), String>,
+    },
     Error(String),
 }
 
@@ -63,6 +81,7 @@ pub(crate) struct WorkerSet {
     cover_sender: Sender<BookId>,
     import_sender: Sender<ImportRequest>,
     metadata_sender: Sender<MetadataRequest>,
+    asset_maintenance_sender: Sender<AssetMaintenanceRequest>,
     event_receiver: Receiver<WorkerEvent>,
 }
 
@@ -72,6 +91,7 @@ impl WorkerSet {
         let (cover_sender, cover_receiver) = bounded(COVER_QUEUE_CAPACITY);
         let (import_sender, import_receiver) = bounded(1);
         let (metadata_sender, metadata_receiver) = unbounded();
+        let (asset_maintenance_sender, asset_maintenance_receiver) = bounded(1);
         let (event_sender, event_receiver) = unbounded();
 
         spawn_query_worker(
@@ -102,6 +122,12 @@ impl WorkerSet {
         spawn_metadata_worker(
             database_path.to_path_buf(),
             metadata_receiver,
+            event_sender.clone(),
+            context.clone(),
+        );
+        spawn_asset_maintenance_worker(
+            database_path.to_path_buf(),
+            asset_maintenance_receiver,
             event_sender,
             context.clone(),
         );
@@ -111,6 +137,7 @@ impl WorkerSet {
             cover_sender,
             import_sender,
             metadata_sender,
+            asset_maintenance_sender,
             event_receiver,
         }
     }
@@ -137,6 +164,29 @@ impl WorkerSet {
     pub(crate) fn save_book(&self, book: Book) -> bool {
         self.metadata_sender
             .send(MetadataRequest::Save(book))
+            .is_ok()
+    }
+
+    pub(crate) fn rescan_reference_assets(&self) -> bool {
+        self.asset_maintenance_sender
+            .try_send(AssetMaintenanceRequest::Scan)
+            .is_ok()
+    }
+
+    pub(crate) fn relink_reference_asset(
+        &self,
+        book_id: BookId,
+        asset_id: AssetId,
+        format: BookFormat,
+        replacement_path: PathBuf,
+    ) -> bool {
+        self.asset_maintenance_sender
+            .try_send(AssetMaintenanceRequest::Relink {
+                book_id,
+                asset_id,
+                format,
+                replacement_path,
+            })
             .is_ok()
     }
 
@@ -188,6 +238,81 @@ fn metadata_worker(
             MetadataRequest::Save(book) => {
                 let result = database.save_book(&book).map_err(|error| error.to_string());
                 publish(events, context, WorkerEvent::BookSaved { book, result })
+            }
+        };
+        if !published {
+            break;
+        }
+    }
+}
+
+fn spawn_asset_maintenance_worker(
+    database_path: PathBuf,
+    receiver: Receiver<AssetMaintenanceRequest>,
+    events: Sender<WorkerEvent>,
+    context: egui::Context,
+) {
+    let failure_events = events.clone();
+    let failure_context = context.clone();
+    let result = thread::Builder::new()
+        .name("lectern-asset-maintenance".into())
+        .spawn(move || asset_maintenance_worker(&database_path, &receiver, &events, &context));
+    if let Err(error) = result {
+        publish(
+            &failure_events,
+            &failure_context,
+            WorkerEvent::Error(format!("Could not start asset maintenance worker: {error}")),
+        );
+    }
+}
+
+fn asset_maintenance_worker(
+    database_path: &PathBuf,
+    receiver: &Receiver<AssetMaintenanceRequest>,
+    events: &Sender<WorkerEvent>,
+    context: &egui::Context,
+) {
+    let mut database = match LibraryDatabase::open(database_path) {
+        Ok(database) => database,
+        Err(error) => {
+            publish(events, context, WorkerEvent::Error(error.to_string()));
+            return;
+        }
+    };
+
+    while let Ok(request) = receiver.recv() {
+        let published = match request {
+            AssetMaintenanceRequest::Scan => publish(
+                events,
+                context,
+                WorkerEvent::AssetHealthScanned(
+                    database
+                        .rescan_reference_assets()
+                        .map_err(|error| error.to_string()),
+                ),
+            ),
+            AssetMaintenanceRequest::Relink {
+                book_id,
+                asset_id,
+                format,
+                replacement_path,
+            } => {
+                let result = validate_publication(&replacement_path, format)
+                    .and_then(|()| {
+                        database
+                            .relink_reference_asset(asset_id, &replacement_path, format)
+                            .map_err(lectern_import::ImportError::from)
+                    })
+                    .map_err(|error| error.to_string());
+                publish(
+                    events,
+                    context,
+                    WorkerEvent::AssetRelinked {
+                        book_id,
+                        asset_id,
+                        result,
+                    },
+                )
             }
         };
         if !published {

@@ -16,7 +16,7 @@ use std::{
 };
 
 use image::{Rgb, RgbImage, codecs::jpeg::JpegEncoder};
-use lectern_core::{BookDraft, BookFormat, LibraryQuery, SortOrder};
+use lectern_core::{AssetHealth, BookDraft, BookFormat, LibraryQuery, SortOrder};
 use lectern_import::{ImportProgress, ImportSummary, discover_publications, import_paths};
 use lectern_storage::{ImportRecord, LibraryDatabase};
 use serde::Serialize;
@@ -543,6 +543,7 @@ struct QueryScenarioResult {
     name: &'static str,
     search: &'static str,
     format: Option<&'static str>,
+    asset_health: Option<&'static str>,
     sort: &'static str,
     result_count: usize,
     latency_ms: LatencySummary,
@@ -563,6 +564,7 @@ struct QueryScenario {
     name: &'static str,
     search: &'static str,
     format: Option<BookFormat>,
+    asset_health: Option<AssetHealth>,
     sort: SortOrder,
 }
 
@@ -571,7 +573,7 @@ impl QueryScenario {
         LibraryQuery {
             search: self.search.into(),
             format: self.format,
-            asset_health: None,
+            asset_health: self.asset_health,
             sort: self.sort,
         }
     }
@@ -621,6 +623,7 @@ fn run_query(options: &QueryOptions) -> Result<(), String> {
                 name: scenario.name,
                 search: scenario.search,
                 format: scenario.format.map(BookFormat::as_str),
+                asset_health: scenario.asset_health.map(AssetHealth::as_str),
                 sort: sort_name(scenario.sort),
                 result_count,
                 latency_ms: summarize_latency(&samples_ns),
@@ -986,43 +989,57 @@ fn query_scenarios() -> Vec<QueryScenario> {
             name: "search_title_prefix",
             search: "Amber",
             format: None,
+            asset_health: None,
             sort: SortOrder::Title,
         },
         QueryScenario {
             name: "search_author_prefix",
             search: "Author 0042",
             format: None,
+            asset_health: None,
             sort: SortOrder::Title,
         },
         QueryScenario {
             name: "filter_epub",
             search: "",
             format: Some(BookFormat::Epub),
+            asset_health: None,
             sort: SortOrder::Title,
         },
         QueryScenario {
             name: "sort_title",
             search: "",
             format: None,
+            asset_health: None,
             sort: SortOrder::Title,
         },
         QueryScenario {
             name: "sort_author",
             search: "",
             format: None,
+            asset_health: None,
             sort: SortOrder::Author,
         },
         QueryScenario {
             name: "sort_recently_added",
             search: "",
             format: None,
+            asset_health: None,
             sort: SortOrder::RecentlyAdded,
         },
         QueryScenario {
             name: "search_filter_sort",
             search: "Luminous",
             format: Some(BookFormat::Pdf),
+            asset_health: None,
             sort: SortOrder::Author,
+        },
+        QueryScenario {
+            name: "filter_unchecked_assets",
+            search: "",
+            format: None,
+            asset_health: Some(AssetHealth::Unknown),
+            sort: SortOrder::Title,
         },
     ]
 }
