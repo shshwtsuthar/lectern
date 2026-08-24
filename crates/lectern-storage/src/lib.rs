@@ -502,7 +502,11 @@ impl LibraryDatabase {
         u64::try_from(count).map_err(|_| StorageError::InvalidCount(count))
     }
 
-    /// Inserts or refreshes aggregate books in one transaction.
+    /// Inserts aggregate books or refreshes assets for already-known reference paths in one
+    /// transaction.
+    ///
+    /// Metadata belongs to the logical book after its first import. A later automatic import that
+    /// resolves to that book preserves its metadata so file contents cannot overwrite user edits.
     ///
     /// # Errors
     ///
@@ -531,7 +535,8 @@ impl LibraryDatabase {
         Ok(ids)
     }
 
-    /// Inserts or refreshes independent publication files in one transaction.
+    /// Inserts independent publication files or refreshes assets for already-known reference
+    /// paths in one transaction.
     ///
     /// This compatibility surface treats every record as a one-asset logical book. Aggregate
     /// importers should use [`Self::import_books`].
@@ -1225,7 +1230,6 @@ struct ReferenceAsset {
 struct ImportStatements<'connection> {
     find_reference_owner: Statement<'connection>,
     insert_book: Statement<'connection>,
-    update_book: Statement<'connection>,
     upsert_asset: Statement<'connection>,
     upsert_cover: Statement<'connection>,
 }
@@ -1242,13 +1246,6 @@ impl<'connection> ImportStatements<'connection> {
                      title, sort_title, authors, sort_authors, series, publisher, language, \
                      description \
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )?,
-            update_book: transaction.prepare(
-                "UPDATE books SET \
-                     title = ?1, sort_title = ?2, authors = ?3, sort_authors = ?4, \
-                     series = ?5, publisher = ?6, language = ?7, description = ?8, \
-                     modified_at = unixepoch() \
-                 WHERE id = ?9",
             )?,
             upsert_asset: transaction.prepare(
                 "INSERT INTO book_assets ( \
@@ -1293,31 +1290,21 @@ fn upsert_book<'a>(
         }
     }
 
-    let id = if let Some(id) = owner {
-        statements.update_book.execute(params![
-            metadata.title.trim(),
-            sortable(metadata.title),
-            metadata.authors.trim(),
-            sortable(metadata.authors),
-            optional_text(metadata.series),
-            optional_text(metadata.publisher),
-            optional_text(metadata.language),
-            optional_text(metadata.description),
-            id,
-        ])?;
-        id
-    } else {
-        statements.insert_book.execute(params![
-            metadata.title.trim(),
-            sortable(metadata.title),
-            metadata.authors.trim(),
-            sortable(metadata.authors),
-            optional_text(metadata.series),
-            optional_text(metadata.publisher),
-            optional_text(metadata.language),
-            optional_text(metadata.description),
-        ])?;
-        transaction.last_insert_rowid()
+    let id = match owner {
+        Some(id) => id,
+        None => {
+            statements.insert_book.execute(params![
+                metadata.title.trim(),
+                sortable(metadata.title),
+                metadata.authors.trim(),
+                sortable(metadata.authors),
+                optional_text(metadata.series),
+                optional_text(metadata.publisher),
+                optional_text(metadata.language),
+                optional_text(metadata.description),
+            ])?;
+            transaction.last_insert_rowid()
+        }
     };
 
     for asset in assets {
@@ -2301,9 +2288,9 @@ END;
     }
 
     #[test]
-    fn reimport_by_one_asset_preserves_book_assets_and_cover() {
+    fn reimport_by_known_path_preserves_user_metadata_assets_and_cover() {
         let mut database = LibraryDatabase::open_in_memory().expect("open library");
-        let mut first = BookImport {
+        let original_import = BookImport {
             book: metadata("Dune", "Frank Herbert"),
             assets: vec![
                 asset("/books/dune.epub", BookFormat::Epub),
@@ -2312,29 +2299,62 @@ END;
             cover_thumbnail: Some(vec![1, 2, 3]),
         };
         let id = database
-            .import_books(std::slice::from_ref(&first))
+            .import_books(std::slice::from_ref(&original_import))
             .expect("first import")[0];
-        let original_assets = database
+        let mut curated = database
             .get_book(id)
             .expect("load original")
-            .expect("original exists")
-            .assets;
+            .expect("original exists");
+        curated.title = "Dune: The Desert Planet".into();
+        curated.authors = "Frank Herbert; Curated Contributor".into();
+        curated.series = Some("The Dune Saga".into());
+        curated.publisher = Some("Curated Press".into());
+        curated.language = Some("en-AU".into());
+        curated.description = Some("A carefully edited library description.".into());
+        database.save_book(&curated).expect("save curated metadata");
 
-        first.book.title = "Dune: Deluxe Edition".into();
-        first.assets.truncate(1);
-        first.cover_thumbnail = None;
-        let replacement_id = database.import_books(&[first]).expect("second import")[0];
+        let mut reimport = original_import;
+        reimport.book = BookMetadataDraft {
+            title: "Embedded File Title".into(),
+            authors: "Embedded File Author".into(),
+            series: Some("Embedded Series".into()),
+            publisher: Some("Embedded Publisher".into()),
+            language: Some("fr".into()),
+            description: Some("Embedded file description.".into()),
+        };
+        reimport.assets.truncate(1);
+        reimport.cover_thumbnail = None;
+
+        let replacement_id = database.import_books(&[reimport]).expect("second import")[0];
         let updated = database
             .get_book(id)
             .expect("load updated")
             .expect("updated exists");
 
         assert_eq!(id, replacement_id);
-        assert_eq!(updated.title, "Dune: Deluxe Edition");
-        assert_eq!(updated.assets, original_assets);
+        assert_eq!(updated, curated);
         assert_eq!(
             database.load_cover(id).expect("load cover"),
             Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            database
+                .query(&LibraryQuery {
+                    search: "Desert Planet".into(),
+                    ..LibraryQuery::default()
+                })
+                .expect("search curated title")[0]
+                .id,
+            id
+        );
+        assert!(
+            database
+                .query(&LibraryQuery {
+                    search: "Embedded File Title".into(),
+                    ..LibraryQuery::default()
+                })
+                .expect("search incoming title")
+                .is_empty()
         );
     }
 
