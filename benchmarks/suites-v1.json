@@ -25,6 +25,10 @@
     {
       "name": "attach-format-v1",
       "budget": "benchmarks/attach-format-regression-v1.json"
+    },
+    {
+      "name": "reimport-known-path-v1",
+      "budget": "benchmarks/reimport-known-path-regression-v1.json"
     }
   ]
 }
