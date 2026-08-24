@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-query-regression-budget",
+  "workload": {
+    "query_mode": "replace",
+    "books": 50000,
+    "seed": 20260824,
+    "cover_every": 3,
+    "page_size": 128,
+    "source_payload_bytes": 8388608,
+    "warmup_iterations": 10,
+    "measured_iterations": 40,
+    "scenarios": [
+      "replace_validated_asset_and_refresh"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 1.0
+  },
+  "budgets": {
+    "replace_validated_asset_and_refresh": {
+      "max_p95_ms": 150
+    }
+  }
+}

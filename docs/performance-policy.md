@@ -52,6 +52,8 @@ python3 benchmarks/performance_regression.py \
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/detach-asset-regression-v1.json
 python3 benchmarks/performance_regression.py \
+  --budget benchmarks/replace-asset-regression-v1.json
+python3 benchmarks/performance_regression.py \
   --budget benchmarks/reimport-known-path-regression-v1.json
 ```
 

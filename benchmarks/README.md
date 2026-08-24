@@ -48,6 +48,12 @@ covered two-format logical book, detaches its PDF relationship, and refreshes bo
 page and PDF filter. It verifies the EPUB relationship, metadata, cover, and both source files remain
 unchanged before cleaning up the candidate outside the measured interval.
 
+The replacement lifecycle workload lives in
+[`replace-asset-regression-v1.json`](replace-asset-regression-v1.json). It validates a representative
+8 MiB PDF, deliberately replaces a healthy referenced PDF while retaining the asset ID, and
+refreshes the first library page. It verifies metadata, cover, identity, both source files, and the
+50,000-book library count before cleaning up each candidate outside the measured interval.
+
 Performance-sensitive pull requests additionally run the base and candidate revisions three times
 each on the same runner. The gate compares the median of their run-level p95 values and fails a
 scenario when it exceeds both the versioned percentage limit and minimum material latency delta.
@@ -71,6 +77,8 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/attach-format-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/detach-asset-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/replace-asset-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/reimport-known-path-regression-v1.json
 ```

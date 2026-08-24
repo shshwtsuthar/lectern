@@ -362,10 +362,21 @@ pub enum StorageError {
     /// An operation that requires a referenced asset was requested for a managed asset.
     #[error("asset {0} is managed and cannot be relinked as an external file")]
     AssetNotReference(AssetId),
+    /// Relink recovery was requested even though the current reference remains readable.
+    #[error("asset {0} is still available; use Replace file for a deliberate change")]
+    RelinkAssetAvailable(AssetId),
     /// The replacement file did not match the asset's stored format.
     #[error("replacement format {found} does not match the expected {expected}")]
     RelinkFormatMismatch {
         /// Format stored for the asset being relinked.
+        expected: BookFormat,
+        /// Format validated from the replacement file.
+        found: BookFormat,
+    },
+    /// A deliberate replacement did not match the asset's stored format.
+    #[error("replacement format {found} does not match the expected {expected}")]
+    ReplacementFormatMismatch {
+        /// Format stored for the asset being replaced.
         expected: BookFormat,
         /// Format validated from the replacement file.
         found: BookFormat,
@@ -443,6 +454,12 @@ pub struct ImportRecord {
     pub book: BookDraft,
     /// Optional JPEG thumbnail bytes.
     pub cover_thumbnail: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy)]
+enum ReferencePathUpdate {
+    Relink,
+    Replace,
 }
 
 /// Connection-scoped access to a Lectern library database.
@@ -938,7 +955,7 @@ impl LibraryDatabase {
         Ok(report)
     }
 
-    /// Replaces the external path for a validated reference asset without changing its identity.
+    /// Recovers an unavailable reference asset at a validated replacement path.
     ///
     /// Callers must validate the replacement publication before invoking this method. The supplied
     /// `replacement_format` is checked against the stored asset format inside the same immediate
@@ -947,15 +964,53 @@ impl LibraryDatabase {
     ///
     /// # Errors
     ///
-    /// Returns an error when the asset is absent or managed, the validated format differs, the
-    /// replacement is unavailable, or another reference asset already owns the replacement path.
+    /// Returns an error when the asset is absent, managed, or still available; the validated format
+    /// differs; the replacement is unavailable; or another asset owns the replacement path.
     pub fn relink_reference_asset(
         &mut self,
         id: AssetId,
         replacement_path: impl AsRef<Path>,
         replacement_format: BookFormat,
     ) -> Result<()> {
-        let replacement_path = replacement_path.as_ref();
+        self.update_reference_asset_path(
+            id,
+            replacement_path.as_ref(),
+            replacement_format,
+            ReferencePathUpdate::Relink,
+        )
+    }
+
+    /// Deliberately replaces the path of a validated, externally referenced asset.
+    ///
+    /// Unlike relink recovery, this operation is available regardless of current file health. It
+    /// retains the stable asset ID, logical book, metadata, and cover, and never modifies or deletes
+    /// the former or replacement file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the asset is absent or managed, the validated format differs, the
+    /// replacement is unavailable, another reference asset owns the path, or the transaction fails.
+    pub fn replace_reference_asset(
+        &mut self,
+        id: AssetId,
+        replacement_path: impl AsRef<Path>,
+        replacement_format: BookFormat,
+    ) -> Result<()> {
+        self.update_reference_asset_path(
+            id,
+            replacement_path.as_ref(),
+            replacement_format,
+            ReferencePathUpdate::Replace,
+        )
+    }
+
+    fn update_reference_asset_path(
+        &mut self,
+        id: AssetId,
+        replacement_path: &Path,
+        replacement_format: BookFormat,
+        operation: ReferencePathUpdate,
+    ) -> Result<()> {
         validate_asset_path(AssetStorage::Reference, replacement_path)?;
         let replacement_health = inspect_reference_asset(replacement_path);
         if replacement_health != AssetHealth::Available {
@@ -966,23 +1021,47 @@ impl LibraryDatabase {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (format, storage) = transaction
+        let (format, storage, current_path_encoding, current_path) = transaction
             .query_row(
-                "SELECT format, storage_mode FROM book_assets WHERE id = ?1",
+                "SELECT format, storage_mode, path_encoding, path \
+                 FROM book_assets WHERE id = ?1",
                 [id.value()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or(StorageError::AssetNotFound(id))?;
         let format = decode_format(&format)?;
         if format != replacement_format {
-            return Err(StorageError::RelinkFormatMismatch {
-                expected: format,
-                found: replacement_format,
+            return Err(match operation {
+                ReferencePathUpdate::Relink => StorageError::RelinkFormatMismatch {
+                    expected: format,
+                    found: replacement_format,
+                },
+                ReferencePathUpdate::Replace => StorageError::ReplacementFormatMismatch {
+                    expected: format,
+                    found: replacement_format,
+                },
             });
         }
         if decode_storage(&storage)? != AssetStorage::Reference {
             return Err(StorageError::AssetNotReference(id));
+        }
+        let current_path = decode_path(&current_path_encoding, current_path)?;
+        if matches!(operation, ReferencePathUpdate::Relink)
+            && inspect_reference_asset(&current_path) == AssetHealth::Available
+        {
+            return Err(StorageError::RelinkAssetAvailable(id));
+        }
+        let replacement_health = inspect_reference_asset(replacement_path);
+        if replacement_health != AssetHealth::Available {
+            return Err(StorageError::ReplacementUnavailable(replacement_health));
         }
 
         let owner = transaction
@@ -2109,6 +2188,80 @@ END;
             database.relink_reference_asset(relinked_asset, replacement.path(), BookFormat::Epub),
             Err(StorageError::ReferencePathInUse(id)) if id == owner_asset
         ));
+        assert!(matches!(
+            database.replace_reference_asset(
+                relinked_asset,
+                replacement.path(),
+                BookFormat::Epub,
+            ),
+            Err(StorageError::ReferencePathInUse(id)) if id == owner_asset
+        ));
+    }
+
+    #[test]
+    fn relinking_rejects_a_healthy_asset_but_replacement_preserves_identity_and_bytes() {
+        let original_source = TestAsset::file("replace-original");
+        let replacement_source = TestAsset::file("replace-new");
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let mut imported = record(
+            original_source.path().to_string_lossy().as_ref(),
+            "Dune",
+            "Frank Herbert",
+        );
+        imported.book.series = Some("Dune Chronicles".into());
+        imported.cover_thumbnail = Some(vec![7, 8, 9]);
+        let book_id = database.import_books(&[imported]).expect("import book")[0];
+        database
+            .rescan_reference_assets()
+            .expect("scan healthy asset");
+        let original = database
+            .get_book(book_id)
+            .expect("load original")
+            .expect("book exists");
+        let asset_id = original.assets[0].id;
+
+        assert!(matches!(
+            database.relink_reference_asset(
+                asset_id,
+                replacement_source.path(),
+                BookFormat::Epub,
+            ),
+            Err(StorageError::RelinkAssetAvailable(id)) if id == asset_id
+        ));
+        assert!(matches!(
+            database.replace_reference_asset(asset_id, replacement_source.path(), BookFormat::Pdf,),
+            Err(StorageError::ReplacementFormatMismatch {
+                expected: BookFormat::Epub,
+                found: BookFormat::Pdf,
+            })
+        ));
+        database
+            .replace_reference_asset(asset_id, replacement_source.path(), BookFormat::Epub)
+            .expect("replace healthy asset");
+
+        let replaced = database
+            .get_book(book_id)
+            .expect("load replaced book")
+            .expect("book remains");
+        assert_eq!(replaced.id, original.id);
+        assert_eq!(replaced.title, original.title);
+        assert_eq!(replaced.authors, original.authors);
+        assert_eq!(replaced.series, original.series);
+        assert_eq!(replaced.assets[0].id, asset_id);
+        assert_eq!(replaced.assets[0].path, replacement_source.path());
+        assert_eq!(replaced.assets[0].health, AssetHealth::Available);
+        assert_eq!(
+            database.load_cover(book_id).expect("load cover"),
+            Some(vec![7, 8, 9])
+        );
+        assert_eq!(
+            fs::read(original_source.path()).expect("read original source"),
+            b"publication"
+        );
+        assert_eq!(
+            fs::read(replacement_source.path()).expect("read replacement source"),
+            b"publication"
+        );
     }
 
     #[test]

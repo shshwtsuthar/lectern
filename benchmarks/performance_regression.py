@@ -92,6 +92,7 @@ def main(arguments: list[str]) -> int:
             "remove": "removals.json",
             "detach": "detaches.json",
             "attach": "attachments.json",
+            "replace": "replacements.json",
             "reimport": "reimports.json",
         }
         query_output = output / result_names[mode]
@@ -137,6 +138,7 @@ def main(arguments: list[str]) -> int:
                     "remove": "remove",
                     "detach": "detach",
                     "attach": "attach",
+                    "replace": "replace",
                     "reimport": "reimport",
                 }[mode],
                 "--database",
@@ -157,6 +159,8 @@ def main(arguments: list[str]) -> int:
             decisions = evaluate_detach_result(query_result, budget)
         elif mode == "attach":
             decisions = evaluate_attach_result(query_result, budget)
+        elif mode == "replace":
+            decisions = evaluate_replace_result(query_result, budget)
         elif mode == "reimport":
             decisions = evaluate_reimport_result(query_result, budget)
         else:
@@ -213,11 +217,12 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "remove",
         "detach",
         "attach",
+        "replace",
         "reimport",
     ):
         raise RegressionError(
             "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
-            "'remove', 'detach', 'attach', or 'reimport'"
+            "'remove', 'detach', 'attach', 'replace', or 'reimport'"
         )
     if query_mode == "full":
         scenario_names = workload.get("full_library_scenarios")
@@ -247,11 +252,11 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 "budget.workload.full_count_scenarios must not repeat names"
             )
     else:
-        if query_mode in ("remove", "detach", "attach"):
+        if query_mode in ("remove", "detach", "attach", "replace"):
             positive_or_zero_field(workload, "page_size", "budget.workload")
             if workload["page_size"] == 0:
                 raise RegressionError("budget.workload.page_size must be greater than zero")
-        if query_mode == "attach":
+        if query_mode in ("attach", "replace"):
             positive_or_zero_field(workload, "source_payload_bytes", "budget.workload")
             if workload["source_payload_bytes"] == 0:
                 raise RegressionError(
@@ -684,6 +689,80 @@ def evaluate_reimport_result(
     expected_names = set(workload["scenarios"])
     if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
         raise RegressionError("re-import scenarios do not match the versioned budget")
+    return evaluate_latency_budgets(by_name, budget)
+
+
+def evaluate_replace_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    books = workload["books"]
+    if positive_or_zero_field(result, "library_books", "replace result") != books:
+        raise RegressionError("replace workload initial library count does not match the budget")
+    if positive_or_zero_field(result, "final_library_books", "replace result") != books:
+        raise RegressionError("replace workload final library count does not reconcile")
+    warmup = positive_or_zero_field(result, "warmup_iterations", "replace result")
+    measured = positive_or_zero_field(result, "measured_iterations", "replace result")
+    if warmup != workload["warmup_iterations"] or measured != workload["measured_iterations"]:
+        raise RegressionError("replace iteration counts do not match the budget")
+    page_size = positive_or_zero_field(result, "page_size", "replace result")
+    if page_size != workload["page_size"]:
+        raise RegressionError("replace refresh page size does not match the budget")
+    payload_bytes = positive_or_zero_field(result, "source_payload_bytes", "replace result")
+    if payload_bytes != workload["source_payload_bytes"]:
+        raise RegressionError("replace source payload does not match the budget")
+    source_files = result.get("source_files")
+    if (
+        not isinstance(source_files, list)
+        or len(source_files) != 2
+        or not all(isinstance(path, str) and path for path in source_files)
+    ):
+        raise RegressionError("replace result must retain original and replacement paths")
+    verified_checks = result.get("verified_checks")
+    expected_checks = {"source_bytes", "metadata", "covers", "asset_identity"}
+    if (
+        not isinstance(verified_checks, list)
+        or len(verified_checks) != len(expected_checks)
+        or set(verified_checks) != expected_checks
+    ):
+        raise RegressionError("replace workload did not verify source bytes, metadata, cached covers, and asset identity")
+
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError("replace result must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, scenario in enumerate(scenarios):
+        context = f"replace scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{context}.name must be unique and non-empty")
+        validated = positive_or_zero_field(scenario, "validated_publications", context)
+        replaced = positive_or_zero_field(scenario, "successful_replacements", context)
+        if validated != warmup + measured or replaced != warmup + measured:
+            raise RegressionError(f"{context} operation counts do not reconcile")
+        refreshed_total = positive_or_zero_field(scenario, "refreshed_total", context)
+        if refreshed_total != books + 1:
+            raise RegressionError(f"{context} refreshed total does not reconcile")
+        expected_page = min(refreshed_total, page_size)
+        if positive_or_zero_field(scenario, "refreshed_result_count", context) != expected_page:
+            raise RegressionError(f"{context} refreshed page count does not reconcile")
+        samples = scenario.get("samples_ns")
+        if not isinstance(samples, list) or len(samples) != measured:
+            raise RegressionError(f"{context} sample count does not match the budget")
+        if any(
+            isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+            for sample in samples
+        ):
+            raise RegressionError(f"{context}.samples_ns must contain positive integers")
+        latency = object_field(scenario, "latency_ms", context)
+        positive_number_field(latency, "p95", f"{context}.latency_ms")
+        by_name[name] = scenario
+
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("replace scenarios do not match the versioned budget")
     return evaluate_latency_budgets(by_name, budget)
 
 

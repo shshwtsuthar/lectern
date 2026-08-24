@@ -31,6 +31,10 @@
       "budget": "benchmarks/detach-asset-regression-v1.json"
     },
     {
+      "name": "replace-asset-v1",
+      "budget": "benchmarks/replace-asset-regression-v1.json"
+    },
+    {
       "name": "reimport-known-path-v1",
       "budget": "benchmarks/reimport-known-path-regression-v1.json"
     }

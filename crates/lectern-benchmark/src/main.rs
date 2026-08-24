@@ -55,6 +55,7 @@ Usage:
   lectern-benchmark remove --database PATH --output PATH [OPTIONS]
   lectern-benchmark detach --database PATH --output PATH [OPTIONS]
   lectern-benchmark attach --database PATH --output PATH [OPTIONS]
+  lectern-benchmark replace --database PATH --output PATH [OPTIONS]
   lectern-benchmark reimport --database PATH --output PATH [OPTIONS]
   lectern-benchmark import --database PATH --corpus PATH --output PATH [OPTIONS]
 
@@ -78,6 +79,10 @@ Detach options:
 
 Attach options:
   --iterations N     Measured validate-attach-refresh iterations (default: 100)
+  --warmup N         Warmup iterations (default: 10)
+
+Replace options:
+  --iterations N     Measured validate-replace-refresh iterations (default: 100)
   --warmup N         Warmup iterations (default: 10)
 
 Re-import options:
@@ -119,6 +124,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         "remove" => run_remove(&QueryOptions::parse(&mut args)?),
         "detach" => run_detach(&QueryOptions::parse(&mut args)?),
         "attach" => run_attach(&QueryOptions::parse(&mut args)?),
+        "replace" => run_replace(&QueryOptions::parse(&mut args)?),
         "reimport" => run_reimport(&QueryOptions::parse(&mut args)?),
         "import" => run_import(&ImportOptions::parse(&mut args)?),
         _ => Err(format!(
@@ -1723,6 +1729,235 @@ fn book_metadata_matches(original: &Book, updated: &Book) -> bool {
         && original.publisher == updated.publisher
         && original.language == updated.language
         && original.description == updated.description
+}
+
+#[derive(Serialize)]
+struct ReplaceResult {
+    schema_version: u32,
+    kind: &'static str,
+    measured_at_unix_ms: u128,
+    database_path: String,
+    library_books: u64,
+    final_library_books: u64,
+    page_size: u32,
+    source_payload_bytes: usize,
+    source_files: Vec<String>,
+    verified_checks: [&'static str; 4],
+    warmup_iterations: usize,
+    measured_iterations: usize,
+    scenarios: Vec<ReplaceScenarioResult>,
+}
+
+#[derive(Serialize)]
+struct ReplaceScenarioResult {
+    name: &'static str,
+    validated_publications: usize,
+    successful_replacements: usize,
+    refreshed_total: u64,
+    refreshed_result_count: usize,
+    latency_ms: LatencySummary,
+    samples_ns: Vec<u64>,
+}
+
+fn run_replace(options: &QueryOptions) -> Result<(), String> {
+    ensure_distinct_paths("database", &options.database, "output", &options.output)?;
+    if !options.database.is_file() {
+        return Err(format!(
+            "benchmark database is not a file: {}",
+            options.database.display()
+        ));
+    }
+    let [original_source, replacement_source] = prepare_replacement_sources(&options.output)?;
+    let original_fingerprint = fingerprint_file(&original_source)?;
+    let replacement_fingerprint = fingerprint_file(&replacement_source)?;
+    let mut database = LibraryDatabase::open(&options.database).map_err(display_error)?;
+    let library_books = database.count().map_err(display_error)?;
+    if library_books == 0 {
+        return Err(format!(
+            "benchmark database contains no books: {}",
+            options.database.display()
+        ));
+    }
+    let cover = make_benchmark_cover()?;
+    let rounds = options.warmup + options.iterations;
+    let mut samples_ns = Vec::with_capacity(options.iterations);
+    let mut refreshed_total = 0;
+    let mut refreshed_result_count = 0;
+
+    for round in 0..rounds {
+        let measurement = replace_and_refresh(
+            &mut database,
+            round,
+            library_books,
+            &original_source,
+            &replacement_source,
+            original_fingerprint,
+            replacement_fingerprint,
+            cover.clone(),
+        )?;
+        refreshed_total = measurement.1;
+        refreshed_result_count = measurement.2;
+        if round >= options.warmup {
+            samples_ns.push(duration_ns(measurement.0)?);
+        }
+    }
+
+    let final_library_books = database.count().map_err(display_error)?;
+    if final_library_books != library_books {
+        return Err(format!(
+            "replacement benchmark final count mismatch: got {final_library_books}, expected {library_books}"
+        ));
+    }
+    let result = ReplaceResult {
+        schema_version: 1,
+        kind: "replace",
+        measured_at_unix_ms: unix_time_ms()?,
+        database_path: options.database.display().to_string(),
+        library_books,
+        final_library_books,
+        page_size: QUERY_PAGE_SIZE,
+        source_payload_bytes: ATTACHMENT_SOURCE_PAYLOAD_BYTES,
+        source_files: vec![
+            original_source.display().to_string(),
+            replacement_source.display().to_string(),
+        ],
+        verified_checks: ["source_bytes", "metadata", "covers", "asset_identity"],
+        warmup_iterations: options.warmup,
+        measured_iterations: options.iterations,
+        scenarios: vec![ReplaceScenarioResult {
+            name: "replace_validated_asset_and_refresh",
+            validated_publications: rounds,
+            successful_replacements: rounds,
+            refreshed_total,
+            refreshed_result_count,
+            latency_ms: summarize_latency(&samples_ns),
+            samples_ns,
+        }],
+    };
+    write_json(&options.output, &result)?;
+    println!(
+        "Measured {} validate-replace-refresh iterations over {} books",
+        options.iterations, library_books
+    );
+    Ok(())
+}
+
+fn prepare_replacement_sources(output: &Path) -> Result<[PathBuf; 2], String> {
+    let sources = [
+        output.with_extension("replacement-original.pdf"),
+        output.with_extension("replacement-new.pdf"),
+    ];
+    for source in &sources {
+        create_attachment_pdf(source, ATTACHMENT_SOURCE_PAYLOAD_BYTES)?;
+    }
+    Ok(sources)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_and_refresh(
+    database: &mut LibraryDatabase,
+    round: usize,
+    library_books: u64,
+    original_source: &Path,
+    replacement_source: &Path,
+    original_fingerprint: FileFingerprint,
+    replacement_fingerprint: FileFingerprint,
+    cover_thumbnail: Vec<u8>,
+) -> Result<(Duration, u64, usize), String> {
+    let id = database
+        .import_books(&[replacement_candidate(
+            round,
+            original_source,
+            cover_thumbnail,
+        )])
+        .map_err(display_error)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "replacement benchmark did not import its candidate".to_owned())?;
+    let original = database
+        .get_book(id)
+        .map_err(display_error)?
+        .ok_or_else(|| format!("replacement candidate {id} disappeared"))?;
+    let asset_id = original.assets[0].id;
+    let original_cover = database
+        .load_cover(id)
+        .map_err(display_error)?
+        .ok_or_else(|| format!("replacement candidate {id} lost its cover"))?;
+
+    let started = Instant::now();
+    validate_publication(replacement_source, BookFormat::Pdf).map_err(display_error)?;
+    database
+        .replace_reference_asset(asset_id, replacement_source, BookFormat::Pdf)
+        .map_err(display_error)?;
+    let page = database
+        .query_page(
+            &LibraryQuery {
+                sort: SortOrder::RecentlyAdded,
+                ..LibraryQuery::default()
+            },
+            0,
+            QUERY_PAGE_SIZE,
+        )
+        .map_err(display_error)?;
+    let elapsed = started.elapsed();
+
+    let expected_total = library_books + 1;
+    let expected_page = usize::try_from(expected_total.min(u64::from(QUERY_PAGE_SIZE)))
+        .expect("bounded page count fits usize");
+    if page.total != expected_total || page.books.len() != expected_page {
+        return Err(format!(
+            "replacement refresh did not reconcile for book {id}"
+        ));
+    }
+    let updated = database
+        .get_book(id)
+        .map_err(display_error)?
+        .ok_or_else(|| format!("replaced book {id} disappeared"))?;
+    if !book_metadata_matches(&original, &updated)
+        || updated.assets.len() != 1
+        || updated.assets[0].id != asset_id
+        || updated.assets[0].format != BookFormat::Pdf
+        || updated.assets[0].storage != AssetStorage::Reference
+        || updated.assets[0].health != AssetHealth::Available
+        || updated.assets[0].path != replacement_source
+    {
+        return Err(format!(
+            "replacement changed book identity or metadata for {id}"
+        ));
+    }
+    if database.load_cover(id).map_err(display_error)?.as_deref() != Some(&original_cover) {
+        return Err(format!("replacement changed the cover for book {id}"));
+    }
+    if fingerprint_file(original_source)? != original_fingerprint
+        || fingerprint_file(replacement_source)? != replacement_fingerprint
+    {
+        return Err("replacement changed original or replacement source bytes".into());
+    }
+    if !database.remove_book(id).map_err(display_error)? {
+        return Err(format!(
+            "replacement benchmark could not clean up book {id}"
+        ));
+    }
+    Ok((elapsed, page.total, page.books.len()))
+}
+
+fn replacement_candidate(round: usize, source: &Path, cover_thumbnail: Vec<u8>) -> BookImport {
+    BookImport {
+        book: BookMetadataDraft {
+            title: format!("Lectern Replacement Candidate {round}"),
+            authors: "Benchmark Author".into(),
+            series: Some("Replacement Regression".into()),
+            publisher: Some("Lectern Benchmark".into()),
+            language: Some("en".into()),
+            description: Some("Deterministic asset replaced after validation.".into()),
+        },
+        assets: vec![BookAssetDraft {
+            format: BookFormat::Pdf,
+            storage: AssetStorage::Reference,
+            path: source.into(),
+        }],
+        cover_thumbnail: Some(cover_thumbnail),
+    }
 }
 
 #[derive(Serialize)]

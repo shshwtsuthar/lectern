@@ -287,6 +287,54 @@ def reimport_budget() -> dict:
     }
 
 
+def replace_budget() -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "lectern-query-regression-budget",
+        "workload": {
+            "query_mode": "replace",
+            "books": 50,
+            "seed": 7,
+            "cover_every": 3,
+            "page_size": 8,
+            "source_payload_bytes": 8_388_608,
+            "warmup_iterations": 2,
+            "measured_iterations": 3,
+            "scenarios": ["replace_validated_asset_and_refresh"],
+        },
+        "comparison": {
+            "paired_runs": 3,
+            "max_p95_regression_percent": 10,
+            "minimum_p95_delta_ms": 1.0,
+        },
+        "budgets": {"replace_validated_asset_and_refresh": {"max_p95_ms": 150}},
+    }
+
+
+def replace_result() -> dict:
+    return {
+        "library_books": 50,
+        "final_library_books": 50,
+        "page_size": 8,
+        "source_payload_bytes": 8_388_608,
+        "warmup_iterations": 2,
+        "measured_iterations": 3,
+        "source_files": ["original.pdf", "replacement.pdf"],
+        "verified_checks": ["source_bytes", "metadata", "covers", "asset_identity"],
+        "scenarios": [
+            {
+                "name": "replace_validated_asset_and_refresh",
+                "validated_publications": 5,
+                "successful_replacements": 5,
+                "refreshed_total": 51,
+                "refreshed_result_count": 8,
+                "latency_ms": {"p95": 12.0},
+                "samples_ns": [1_000_000, 2_000_000, 3_000_000],
+            }
+        ],
+    }
+
+
 def reimport_result() -> dict:
     return {
         "library_books": 50,
@@ -372,6 +420,14 @@ class PerformanceRegressionTests(unittest.TestCase):
 
         self.assertEqual(checked_in["workload"]["query_mode"], "reimport")
         self.assertEqual(checked_in["budgets"]["reimport_known_path"]["max_p95_ms"], 25)
+
+    def test_checked_in_replace_budget_is_valid(self) -> None:
+        checked_in = REGRESSION.load_budget(
+            pathlib.Path(__file__).with_name("replace-asset-regression-v1.json")
+        )
+
+        self.assertEqual(checked_in["workload"]["query_mode"], "replace")
+        self.assertEqual(checked_in["workload"]["source_payload_bytes"], 8_388_608)
 
     def test_load_budget_rejects_unpaired_ratio_fields(self) -> None:
         invalid = budget()
@@ -485,6 +541,18 @@ class PerformanceRegressionTests(unittest.TestCase):
         )
 
         self.assertTrue(all(decision["passed"] for decision in decisions))
+
+    def test_evaluate_replace_result_accepts_reconciled_workload(self) -> None:
+        decisions = REGRESSION.evaluate_replace_result(replace_result(), replace_budget())
+
+        self.assertTrue(all(decision["passed"] for decision in decisions))
+
+    def test_evaluate_replace_result_requires_stable_asset_identity(self) -> None:
+        invalid = replace_result()
+        invalid["verified_checks"].remove("asset_identity")
+
+        with self.assertRaisesRegex(REGRESSION.RegressionError, "asset identity"):
+            REGRESSION.evaluate_replace_result(invalid, replace_budget())
 
     def test_evaluate_reimport_result_requires_preserved_metadata(self) -> None:
         invalid = reimport_result()
