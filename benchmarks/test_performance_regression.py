@@ -186,6 +186,55 @@ def attach_budget() -> dict:
     }
 
 
+def detach_budget() -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "lectern-query-regression-budget",
+        "workload": {
+            "query_mode": "detach",
+            "books": 50,
+            "seed": 7,
+            "cover_every": 3,
+            "page_size": 8,
+            "warmup_iterations": 2,
+            "measured_iterations": 3,
+            "scenarios": ["detach_asset_and_refresh"],
+        },
+        "comparison": {
+            "paired_runs": 3,
+            "max_p95_regression_percent": 10,
+            "minimum_p95_delta_ms": 1.0,
+        },
+        "budgets": {"detach_asset_and_refresh": {"max_p95_ms": 100}},
+    }
+
+
+def detach_result() -> dict:
+    return {
+        "library_books": 50,
+        "final_library_books": 50,
+        "page_size": 8,
+        "warmup_iterations": 2,
+        "measured_iterations": 3,
+        "source_files": ["candidate.epub", "candidate.pdf"],
+        "source_bytes_unchanged": True,
+        "metadata_preserved": True,
+        "covers_preserved": True,
+        "scenarios": [
+            {
+                "name": "detach_asset_and_refresh",
+                "successful_detaches": 5,
+                "refreshed_total": 51,
+                "refreshed_result_count": 8,
+                "format_total": 10,
+                "format_result_count": 8,
+                "latency_ms": {"p95": 12.0},
+                "samples_ns": [1_000_000, 2_000_000, 3_000_000],
+            }
+        ],
+    }
+
+
 def attach_result() -> dict:
     return {
         "library_books": 50,
@@ -308,6 +357,14 @@ class PerformanceRegressionTests(unittest.TestCase):
         self.assertEqual(checked_in["workload"]["query_mode"], "attach")
         self.assertEqual(checked_in["workload"]["source_payload_bytes"], 8_388_608)
 
+    def test_checked_in_detach_budget_is_valid(self) -> None:
+        checked_in = REGRESSION.load_budget(
+            pathlib.Path(__file__).with_name("detach-asset-regression-v1.json")
+        )
+
+        self.assertEqual(checked_in["workload"]["query_mode"], "detach")
+        self.assertEqual(checked_in["workload"]["books"], 50_000)
+
     def test_checked_in_reimport_budget_is_valid(self) -> None:
         checked_in = REGRESSION.load_budget(
             pathlib.Path(__file__).with_name("reimport-known-path-regression-v1.json")
@@ -395,6 +452,18 @@ class PerformanceRegressionTests(unittest.TestCase):
         decisions = REGRESSION.evaluate_attach_result(attach_result(), attach_budget())
 
         self.assertTrue(all(decision["passed"] for decision in decisions))
+
+    def test_evaluate_detach_result_accepts_reconciled_workload(self) -> None:
+        decisions = REGRESSION.evaluate_detach_result(detach_result(), detach_budget())
+
+        self.assertTrue(all(decision["passed"] for decision in decisions))
+
+    def test_evaluate_detach_result_requires_untouched_sources(self) -> None:
+        invalid = detach_result()
+        invalid["source_bytes_unchanged"] = False
+
+        with self.assertRaisesRegex(REGRESSION.RegressionError, "source bytes"):
+            REGRESSION.evaluate_detach_result(invalid, detach_budget())
 
     def test_evaluate_attach_result_requires_preserved_book_data(self) -> None:
         invalid = attach_result()

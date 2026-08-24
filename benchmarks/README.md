@@ -42,6 +42,12 @@ books from a 50,000-book library, validates a distinct 8 MiB PDF for each iterat
 attaches it, and refreshes the first PDF-filtered page. It verifies the logical-book count, metadata,
 cover, existing asset identity, unique filtered result, and source bytes after every attachment.
 
+The detach lifecycle workload lives in
+[`detach-asset-regression-v1.json`](detach-asset-regression-v1.json). It repeatedly installs a
+covered two-format logical book, detaches its PDF relationship, and refreshes both the first library
+page and PDF filter. It verifies the EPUB relationship, metadata, cover, and both source files remain
+unchanged before cleaning up the candidate outside the measured interval.
+
 Performance-sensitive pull requests additionally run the base and candidate revisions three times
 each on the same runner. The gate compares the median of their run-level p95 values and fails a
 scenario when it exceeds both the versioned percentage limit and minimum material latency delta.
@@ -63,6 +69,10 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/remove-book-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/attach-format-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/detach-asset-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/reimport-known-path-regression-v1.json
 ```
 
 Use `--output-dir PATH` to choose a new artifact directory, or `--budget PATH` to evaluate a

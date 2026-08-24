@@ -343,6 +343,14 @@ pub enum StorageError {
     /// The requested file asset no longer exists.
     #[error("asset {0} was not found")]
     AssetNotFound(AssetId),
+    /// Detaching the selected asset would leave its logical book without a file.
+    #[error("asset {asset} is the last file for book {book} and cannot be detached")]
+    LastAssetDetach {
+        /// Asset whose relationship must be retained.
+        asset: AssetId,
+        /// Logical book that would otherwise have no assets.
+        book: BookId,
+    },
     /// The selected logical book already has a file in the requested format.
     #[error("book {book} already has a {format} asset")]
     BookAlreadyHasFormat {
@@ -803,6 +811,46 @@ impl LibraryDatabase {
         let asset = AssetId::new(transaction.last_insert_rowid());
         transaction.commit()?;
         Ok(asset)
+    }
+
+    /// Detaches exactly one file asset from its logical book.
+    ///
+    /// The immediate transaction resolves the owning book and enforces the one-or-more-assets
+    /// invariant before deleting the relationship. Publication bytes, book metadata, and the
+    /// cached cover are never modified or deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the asset is absent, it is the book's last asset, or the transaction
+    /// cannot be committed.
+    pub fn detach_asset(&mut self, id: AssetId) -> Result<BookId> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let book = transaction
+            .query_row(
+                "SELECT book_id FROM book_assets WHERE id = ?1",
+                [id.value()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(BookId::new)
+            .ok_or(StorageError::AssetNotFound(id))?;
+        let asset_count: i64 = transaction.query_row(
+            "SELECT count(*) FROM book_assets WHERE book_id = ?1",
+            [book.value()],
+            |row| row.get(0),
+        )?;
+        if asset_count <= 1 {
+            return Err(StorageError::LastAssetDetach { asset: id, book });
+        }
+
+        let changed = transaction.execute("DELETE FROM book_assets WHERE id = ?1", [id.value()])?;
+        if changed != 1 {
+            return Err(StorageError::AssetNotFound(id));
+        }
+        transaction.commit()?;
+        Ok(book)
     }
 
     /// Removes one logical book and its stored library data.
@@ -1559,8 +1607,8 @@ mod tests {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
     use lectern_core::{
-        AssetHealth, AssetHealthReport, AssetStorage, Book, BookAssetDraft, BookFormat, BookId,
-        BookMetadataDraft, LibraryQuery, SortOrder,
+        AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAssetDraft, BookFormat,
+        BookId, BookMetadataDraft, LibraryQuery, SortOrder,
     };
     use rusqlite::Connection;
 
@@ -2516,6 +2564,94 @@ END;
         assert_eq!(filtered[0].id, id);
         assert_eq!(
             fs::read(source.path()).expect("read attached source"),
+            b"publication"
+        );
+    }
+
+    #[test]
+    fn detaching_one_of_two_assets_preserves_book_cover_and_source_bytes() {
+        let epub = TestAsset::file("detach-epub");
+        let pdf = TestAsset::file("detach-pdf");
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let mut imported = BookImport {
+            book: metadata("Dune", "Frank Herbert"),
+            assets: vec![
+                asset(epub.path(), BookFormat::Epub),
+                asset(pdf.path(), BookFormat::Pdf),
+            ],
+            cover_thumbnail: Some(vec![4, 5, 6]),
+        };
+        imported.book.series = Some("Dune Chronicles".into());
+        let id = database.import_books(&[imported]).expect("import book")[0];
+        let original = database
+            .get_book(id)
+            .expect("load original")
+            .expect("book exists");
+        let detached = original
+            .assets
+            .iter()
+            .find(|asset| asset.format == BookFormat::Pdf)
+            .expect("PDF asset")
+            .id;
+
+        assert_eq!(database.detach_asset(detached).expect("detach PDF"), id);
+
+        let updated = database
+            .get_book(id)
+            .expect("load updated")
+            .expect("book remains");
+        assert_eq!(updated.title, original.title);
+        assert_eq!(updated.authors, original.authors);
+        assert_eq!(updated.series, original.series);
+        assert_eq!(updated.assets.len(), 1);
+        assert_eq!(updated.assets[0].format, BookFormat::Epub);
+        assert_eq!(updated.assets[0].id, original.assets[0].id);
+        assert_eq!(
+            database.load_cover(id).expect("load cover"),
+            Some(vec![4, 5, 6])
+        );
+        assert_eq!(fs::read(epub.path()).expect("read EPUB"), b"publication");
+        assert_eq!(fs::read(pdf.path()).expect("read PDF"), b"publication");
+    }
+
+    #[test]
+    fn detaching_rejects_the_last_asset_and_a_stale_asset_id() {
+        let source = TestAsset::file("last-detach");
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let id = database
+            .import_books(&[record(
+                source.path().to_string_lossy().as_ref(),
+                "Dune",
+                "Frank Herbert",
+            )])
+            .expect("import book")[0];
+        let asset_id = database
+            .get_book(id)
+            .expect("load book")
+            .expect("book exists")
+            .assets[0]
+            .id;
+
+        assert!(matches!(
+            database.detach_asset(asset_id),
+            Err(StorageError::LastAssetDetach { asset, book })
+                if asset == asset_id && book == id
+        ));
+        assert!(matches!(
+            database.detach_asset(AssetId::new(i64::MAX)),
+            Err(StorageError::AssetNotFound(asset)) if asset == AssetId::new(i64::MAX)
+        ));
+        assert_eq!(
+            database
+                .get_book(id)
+                .expect("reload book")
+                .expect("book remains")
+                .assets
+                .len(),
+            1
+        );
+        assert_eq!(
+            fs::read(source.path()).expect("read source"),
             b"publication"
         );
     }

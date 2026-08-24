@@ -42,6 +42,7 @@ const BENCHMARK_COVER_WIDTH: u32 = 320;
 const BENCHMARK_COVER_HEIGHT: u32 = 480;
 const BENCHMARK_ADDED_AT_UNIX_SECONDS: i64 = 1_700_000_000;
 const REMOVAL_SOURCE_CONTENTS: &[u8] = b"Lectern removal benchmark source bytes\n";
+const DETACH_SOURCE_CONTENTS: &[u8] = b"Lectern detach benchmark source bytes\n";
 const ATTACHMENT_SOURCE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 
 const USAGE: &str = "Lectern exploratory performance harness
@@ -52,6 +53,7 @@ Usage:
   lectern-benchmark query-page --database PATH --output PATH [OPTIONS]
   lectern-benchmark query-page-covered --database PATH --output PATH [OPTIONS]
   lectern-benchmark remove --database PATH --output PATH [OPTIONS]
+  lectern-benchmark detach --database PATH --output PATH [OPTIONS]
   lectern-benchmark attach --database PATH --output PATH [OPTIONS]
   lectern-benchmark reimport --database PATH --output PATH [OPTIONS]
   lectern-benchmark import --database PATH --corpus PATH --output PATH [OPTIONS]
@@ -68,6 +70,10 @@ Query options:
 
 Remove options:
   --iterations N     Measured remove-and-refresh iterations (default: 100)
+  --warmup N         Warmup iterations (default: 10)
+
+Detach options:
+  --iterations N     Measured detach-and-refresh iterations (default: 100)
   --warmup N         Warmup iterations (default: 10)
 
 Attach options:
@@ -111,6 +117,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         "query-page" => run_query_page(&QueryOptions::parse(&mut args)?),
         "query-page-covered" => run_query_page_covered(&QueryOptions::parse(&mut args)?),
         "remove" => run_remove(&QueryOptions::parse(&mut args)?),
+        "detach" => run_detach(&QueryOptions::parse(&mut args)?),
         "attach" => run_attach(&QueryOptions::parse(&mut args)?),
         "reimport" => run_reimport(&QueryOptions::parse(&mut args)?),
         "import" => run_import(&ImportOptions::parse(&mut args)?),
@@ -1059,6 +1066,250 @@ fn removal_candidate(
         ],
         cover_thumbnail: Some(cover_thumbnail),
     }
+}
+
+#[derive(Serialize)]
+struct DetachResult {
+    schema_version: u32,
+    kind: &'static str,
+    measured_at_unix_ms: u128,
+    database_path: String,
+    library_books: u64,
+    final_library_books: u64,
+    page_size: u32,
+    warmup_iterations: usize,
+    measured_iterations: usize,
+    source_files: Vec<String>,
+    source_bytes_unchanged: bool,
+    metadata_preserved: bool,
+    covers_preserved: bool,
+    scenarios: Vec<DetachScenarioResult>,
+}
+
+#[derive(Serialize)]
+struct DetachScenarioResult {
+    name: &'static str,
+    successful_detaches: usize,
+    refreshed_total: u64,
+    refreshed_result_count: usize,
+    format_total: u64,
+    format_result_count: usize,
+    latency_ms: LatencySummary,
+    samples_ns: Vec<u64>,
+}
+
+fn run_detach(options: &QueryOptions) -> Result<(), String> {
+    ensure_distinct_paths("database", &options.database, "output", &options.output)?;
+    if !options.database.is_file() {
+        return Err(format!(
+            "benchmark database is not a file: {}",
+            options.database.display()
+        ));
+    }
+    let [source_epub, source_pdf] = prepare_detach_sources(&options.output)?;
+
+    let mut database = LibraryDatabase::open(&options.database).map_err(display_error)?;
+    let library_books = database.count().map_err(display_error)?;
+    if library_books == 0 {
+        return Err(format!(
+            "benchmark database contains no books: {}",
+            options.database.display()
+        ));
+    }
+    let initial_pdf_books = database
+        .query_page(
+            &LibraryQuery {
+                format: Some(BookFormat::Pdf),
+                ..LibraryQuery::default()
+            },
+            0,
+            QUERY_PAGE_SIZE,
+        )
+        .map_err(display_error)?
+        .total;
+    let cover = make_benchmark_cover()?;
+    let rounds = options.warmup + options.iterations;
+    let mut samples_ns = Vec::with_capacity(options.iterations);
+    let mut successful_detaches = 0;
+    let mut refreshed_total = 0;
+    let mut refreshed_result_count = 0;
+    let mut format_total = 0;
+    let mut format_result_count = 0;
+
+    for round in 0..rounds {
+        let measurement = detach_and_refresh(
+            &mut database,
+            round,
+            library_books,
+            initial_pdf_books,
+            &source_epub,
+            &source_pdf,
+            cover.clone(),
+        )?;
+        successful_detaches += 1;
+        refreshed_total = measurement.first_page.total;
+        refreshed_result_count = measurement.first_page.books.len();
+        format_total = measurement.format_page.total;
+        format_result_count = measurement.format_page.books.len();
+        if round >= options.warmup {
+            samples_ns.push(duration_ns(measurement.elapsed)?);
+        }
+    }
+
+    let final_library_books = database.count().map_err(display_error)?;
+    if final_library_books != library_books {
+        return Err(format!(
+            "detach benchmark final count mismatch: got {final_library_books}, expected {library_books}"
+        ));
+    }
+    let source_bytes_unchanged = [&source_epub, &source_pdf]
+        .into_iter()
+        .all(|source| fs::read(source).is_ok_and(|bytes| bytes == DETACH_SOURCE_CONTENTS));
+    let result = DetachResult {
+        schema_version: 1,
+        kind: "detach",
+        measured_at_unix_ms: unix_time_ms()?,
+        database_path: options.database.display().to_string(),
+        library_books,
+        final_library_books,
+        page_size: QUERY_PAGE_SIZE,
+        warmup_iterations: options.warmup,
+        measured_iterations: options.iterations,
+        source_files: vec![
+            source_epub.display().to_string(),
+            source_pdf.display().to_string(),
+        ],
+        source_bytes_unchanged,
+        metadata_preserved: true,
+        covers_preserved: true,
+        scenarios: vec![DetachScenarioResult {
+            name: "detach_asset_and_refresh",
+            successful_detaches,
+            refreshed_total,
+            refreshed_result_count,
+            format_total,
+            format_result_count,
+            latency_ms: summarize_latency(&samples_ns),
+            samples_ns,
+        }],
+    };
+    write_json(&options.output, &result)?;
+    println!(
+        "Measured {} detach-and-refresh iterations over {} books",
+        options.iterations, library_books
+    );
+    Ok(())
+}
+
+fn prepare_detach_sources(output: &Path) -> Result<[PathBuf; 2], String> {
+    let sources = [
+        output.with_extension("detach-source.epub"),
+        output.with_extension("detach-source.pdf"),
+    ];
+    for source in &sources {
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(source)
+            .and_then(|mut file| file.write_all(DETACH_SOURCE_CONTENTS))
+            .map_err(display_error)?;
+    }
+    Ok(sources)
+}
+
+struct DetachMeasurement {
+    elapsed: Duration,
+    first_page: lectern_core::LibraryPage,
+    format_page: lectern_core::LibraryPage,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn detach_and_refresh(
+    database: &mut LibraryDatabase,
+    round: usize,
+    library_books: u64,
+    initial_pdf_books: u64,
+    source_epub: &Path,
+    source_pdf: &Path,
+    cover_thumbnail: Vec<u8>,
+) -> Result<DetachMeasurement, String> {
+    let record = removal_candidate(round, source_epub, source_pdf, cover_thumbnail);
+    let id = database
+        .import_books(&[record])
+        .map_err(display_error)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "detach benchmark did not import its candidate".to_owned())?;
+    let original = database
+        .get_book(id)
+        .map_err(display_error)?
+        .ok_or_else(|| format!("detach candidate {id} disappeared"))?;
+    let detached = original
+        .assets
+        .iter()
+        .find(|asset| asset.format == BookFormat::Pdf)
+        .ok_or_else(|| format!("detach candidate {id} did not have two formats"))?
+        .id;
+
+    let started = Instant::now();
+    let owner = database.detach_asset(detached).map_err(display_error)?;
+    let first_page = database
+        .query_page(
+            &LibraryQuery {
+                sort: SortOrder::RecentlyAdded,
+                ..LibraryQuery::default()
+            },
+            0,
+            QUERY_PAGE_SIZE,
+        )
+        .map_err(display_error)?;
+    let format_page = database
+        .query_page(
+            &LibraryQuery {
+                format: Some(BookFormat::Pdf),
+                ..LibraryQuery::default()
+            },
+            0,
+            QUERY_PAGE_SIZE,
+        )
+        .map_err(display_error)?;
+    let elapsed = started.elapsed();
+
+    if owner != id
+        || first_page.total != library_books + 1
+        || format_page.total != initial_pdf_books
+    {
+        return Err("detach benchmark refresh did not reconcile".into());
+    }
+    let updated = database
+        .get_book(id)
+        .map_err(display_error)?
+        .ok_or_else(|| format!("detached book {id} disappeared"))?;
+    if updated.title != original.title
+        || updated.authors != original.authors
+        || updated.series != original.series
+        || updated.assets.len() != 1
+        || updated.assets[0].format != BookFormat::Epub
+        || updated.assets.iter().any(|asset| asset.id == detached)
+    {
+        return Err(format!("detach changed book data for {id}"));
+    }
+    if database.load_cover(id).map_err(display_error)?.is_none() {
+        return Err(format!("detach removed the cover for {id}"));
+    }
+    for source in [source_epub, source_pdf] {
+        if fs::read(source).map_err(display_error)? != DETACH_SOURCE_CONTENTS {
+            return Err(format!("detach changed source file {}", source.display()));
+        }
+    }
+    if !database.remove_book(id).map_err(display_error)? {
+        return Err(format!("detach benchmark could not clean up book {id}"));
+    }
+    Ok(DetachMeasurement {
+        elapsed,
+        first_page,
+        format_page,
+    })
 }
 
 #[derive(Serialize)]

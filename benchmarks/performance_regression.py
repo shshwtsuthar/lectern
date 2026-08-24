@@ -90,6 +90,7 @@ def main(arguments: list[str]) -> int:
             "page": "queries.json",
             "page-covered": "queries.json",
             "remove": "removals.json",
+            "detach": "detaches.json",
             "attach": "attachments.json",
             "reimport": "reimports.json",
         }
@@ -134,6 +135,7 @@ def main(arguments: list[str]) -> int:
                     "page": "query-page",
                     "page-covered": "query-page-covered",
                     "remove": "remove",
+                    "detach": "detach",
                     "attach": "attach",
                     "reimport": "reimport",
                 }[mode],
@@ -151,6 +153,8 @@ def main(arguments: list[str]) -> int:
         query_result = read_json(query_output)
         if mode == "remove":
             decisions = evaluate_remove_result(query_result, budget)
+        elif mode == "detach":
+            decisions = evaluate_detach_result(query_result, budget)
         elif mode == "attach":
             decisions = evaluate_attach_result(query_result, budget)
         elif mode == "reimport":
@@ -207,12 +211,13 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "page",
         "page-covered",
         "remove",
+        "detach",
         "attach",
         "reimport",
     ):
         raise RegressionError(
             "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
-            "'remove', 'attach', or 'reimport'"
+            "'remove', 'detach', 'attach', or 'reimport'"
         )
     if query_mode == "full":
         scenario_names = workload.get("full_library_scenarios")
@@ -242,7 +247,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 "budget.workload.full_count_scenarios must not repeat names"
             )
     else:
-        if query_mode in ("remove", "attach"):
+        if query_mode in ("remove", "detach", "attach"):
             positive_or_zero_field(workload, "page_size", "budget.workload")
             if workload["page_size"] == 0:
                 raise RegressionError("budget.workload.page_size must be greater than zero")
@@ -468,6 +473,78 @@ def evaluate_remove_result(
     expected_names = set(workload["scenarios"])
     if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
         raise RegressionError("remove scenarios do not match the versioned budget")
+    return evaluate_latency_budgets(by_name, budget)
+
+
+def evaluate_detach_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    books = workload["books"]
+    if positive_or_zero_field(result, "library_books", "detach result") != books:
+        raise RegressionError("detach workload initial library count does not match the budget")
+    if positive_or_zero_field(result, "final_library_books", "detach result") != books:
+        raise RegressionError("detach workload final library count does not reconcile")
+    warmup = positive_or_zero_field(result, "warmup_iterations", "detach result")
+    measured = positive_or_zero_field(result, "measured_iterations", "detach result")
+    if warmup != workload["warmup_iterations"] or measured != workload["measured_iterations"]:
+        raise RegressionError("detach iteration counts do not match the budget")
+    page_size = positive_or_zero_field(result, "page_size", "detach result")
+    if page_size != workload["page_size"]:
+        raise RegressionError("detach refresh page size does not match the budget")
+    source_files = result.get("source_files")
+    if (
+        not isinstance(source_files, list)
+        or len(source_files) != 2
+        or not all(isinstance(path, str) and path for path in source_files)
+    ):
+        raise RegressionError("detach result must retain two source-file paths")
+    if result.get("source_bytes_unchanged") is not True:
+        raise RegressionError("detach workload did not preserve source bytes")
+    if result.get("metadata_preserved") is not True:
+        raise RegressionError("detach workload did not preserve logical-book metadata")
+    if result.get("covers_preserved") is not True:
+        raise RegressionError("detach workload did not preserve cached covers")
+
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError("detach result must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, scenario in enumerate(scenarios):
+        context = f"detach scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{context}.name must be unique and non-empty")
+        successful = positive_or_zero_field(scenario, "successful_detaches", context)
+        if successful != warmup + measured:
+            raise RegressionError(f"{context} successful detach count does not reconcile")
+        refreshed_total = positive_or_zero_field(scenario, "refreshed_total", context)
+        if refreshed_total != books + 1:
+            raise RegressionError(f"{context} refreshed total does not reconcile")
+        expected_page = min(refreshed_total, page_size)
+        if positive_or_zero_field(scenario, "refreshed_result_count", context) != expected_page:
+            raise RegressionError(f"{context} refreshed page count does not reconcile")
+        format_total = positive_or_zero_field(scenario, "format_total", context)
+        expected_format_page = min(format_total, page_size)
+        if positive_or_zero_field(scenario, "format_result_count", context) != expected_format_page:
+            raise RegressionError(f"{context} format page count does not reconcile")
+        samples = scenario.get("samples_ns")
+        if not isinstance(samples, list) or len(samples) != measured:
+            raise RegressionError(f"{context} sample count does not match the budget")
+        if any(
+            isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+            for sample in samples
+        ):
+            raise RegressionError(f"{context}.samples_ns must contain positive integers")
+        latency = object_field(scenario, "latency_ms", context)
+        positive_number_field(latency, "p95", f"{context}.latency_ms")
+        by_name[name] = scenario
+
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("detach scenarios do not match the versioned budget")
     return evaluate_latency_budgets(by_name, budget)
 
 
