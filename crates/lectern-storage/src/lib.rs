@@ -25,7 +25,7 @@ use thiserror::Error;
 #[cfg(not(any(unix, windows)))]
 compile_error!("Lectern's lossless path codec currently supports Unix and Windows targets");
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = r"
 CREATE TABLE books (
@@ -38,6 +38,8 @@ CREATE TABLE books (
     publisher    TEXT,
     language     TEXT,
     description  TEXT,
+    has_cover    INTEGER NOT NULL DEFAULT 0 CHECK (has_cover IN (0, 1)),
+    has_file_issue INTEGER NOT NULL DEFAULT 0 CHECK (has_file_issue IN (0, 1)),
     added_at     INTEGER NOT NULL DEFAULT (unixepoch()),
     modified_at  INTEGER NOT NULL DEFAULT (unixepoch())
 ) STRICT;
@@ -78,6 +80,46 @@ CREATE TABLE book_covers (
     book_id INTEGER PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
     jpeg    BLOB NOT NULL
 ) STRICT;
+
+CREATE TRIGGER book_covers_after_insert_summary
+AFTER INSERT ON book_covers BEGIN
+    UPDATE books SET has_cover = 1 WHERE id = new.book_id;
+END;
+
+CREATE TRIGGER book_covers_after_delete_summary
+AFTER DELETE ON book_covers BEGIN
+    UPDATE books SET has_cover = 0 WHERE id = old.book_id;
+END;
+
+CREATE TRIGGER book_assets_after_insert_summary
+AFTER INSERT ON book_assets
+WHEN new.health IN ('missing', 'unreadable')
+BEGIN
+    UPDATE books SET has_file_issue = 1 WHERE id = new.book_id;
+END;
+
+CREATE TRIGGER book_assets_after_health_update_summary
+AFTER UPDATE OF health ON book_assets
+WHEN old.health IS NOT new.health
+BEGIN
+    UPDATE books
+    SET has_file_issue = EXISTS(
+        SELECT 1 FROM book_assets
+        WHERE book_id = new.book_id AND health IN ('missing', 'unreadable')
+    )
+    WHERE id = new.book_id;
+END;
+
+CREATE TRIGGER book_assets_after_delete_summary
+AFTER DELETE ON book_assets
+BEGIN
+    UPDATE books
+    SET has_file_issue = EXISTS(
+        SELECT 1 FROM book_assets
+        WHERE book_id = old.book_id AND health IN ('missing', 'unreadable')
+    )
+    WHERE id = old.book_id;
+END;
 
 CREATE VIRTUAL TABLE books_fts USING fts5(
     title,
@@ -224,6 +266,63 @@ const MIGRATE_3_TO_4: &str = r"
 ALTER TABLE book_assets ADD COLUMN health TEXT NOT NULL DEFAULT 'unknown'
     CHECK (health IN ('unknown', 'available', 'missing', 'unreadable'));
 CREATE INDEX book_assets_health_book_idx ON book_assets(health, book_id);
+";
+
+const MIGRATE_4_TO_5: &str = r"
+ALTER TABLE books ADD COLUMN has_cover INTEGER NOT NULL DEFAULT 0
+    CHECK (has_cover IN (0, 1));
+ALTER TABLE books ADD COLUMN has_file_issue INTEGER NOT NULL DEFAULT 0
+    CHECK (has_file_issue IN (0, 1));
+
+UPDATE books
+SET has_cover = EXISTS(
+    SELECT 1 FROM book_covers WHERE book_id = books.id
+);
+UPDATE books
+SET has_file_issue = EXISTS(
+    SELECT 1 FROM book_assets
+    WHERE book_id = books.id AND health IN ('missing', 'unreadable')
+);
+
+CREATE TRIGGER book_covers_after_insert_summary
+AFTER INSERT ON book_covers BEGIN
+    UPDATE books SET has_cover = 1 WHERE id = new.book_id;
+END;
+
+CREATE TRIGGER book_covers_after_delete_summary
+AFTER DELETE ON book_covers BEGIN
+    UPDATE books SET has_cover = 0 WHERE id = old.book_id;
+END;
+
+CREATE TRIGGER book_assets_after_insert_summary
+AFTER INSERT ON book_assets
+WHEN new.health IN ('missing', 'unreadable')
+BEGIN
+    UPDATE books SET has_file_issue = 1 WHERE id = new.book_id;
+END;
+
+CREATE TRIGGER book_assets_after_health_update_summary
+AFTER UPDATE OF health ON book_assets
+WHEN old.health IS NOT new.health
+BEGIN
+    UPDATE books
+    SET has_file_issue = EXISTS(
+        SELECT 1 FROM book_assets
+        WHERE book_id = new.book_id AND health IN ('missing', 'unreadable')
+    )
+    WHERE id = new.book_id;
+END;
+
+CREATE TRIGGER book_assets_after_delete_summary
+AFTER DELETE ON book_assets
+BEGIN
+    UPDATE books
+    SET has_file_issue = EXISTS(
+        SELECT 1 FROM book_assets
+        WHERE book_id = old.book_id AND health IN ('missing', 'unreadable')
+    )
+    WHERE id = old.book_id;
+END;
 ";
 
 /// Failure returned by the persistence adapter.
@@ -470,9 +569,7 @@ impl LibraryDatabase {
         let plan = LibraryQueryPlan::new(query);
         let sql = format!(
             "SELECT b.id, b.title, b.authors, b.series, \
-             EXISTS(SELECT 1 FROM book_covers c WHERE c.book_id = b.id), \
-             EXISTS(SELECT 1 FROM book_assets a \
-                    WHERE a.book_id = b.id AND a.health IN ('missing', 'unreadable')) \
+             b.has_cover, b.has_file_issue \
              FROM books b {} {where_clause} ORDER BY {order}",
             plan.joins,
             where_clause = plan.where_clause,
@@ -906,7 +1003,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
     let observed = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match observed {
         SCHEMA_VERSION => return Ok(()),
-        0..=3 => {}
+        0..=4 => {}
         unsupported => return Err(StorageError::UnsupportedSchema(unsupported)),
     }
 
@@ -936,10 +1033,16 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
         1 | 2 => {
             transaction.execute_batch(MIGRATE_1_OR_2_TO_3)?;
             transaction.execute_batch(MIGRATE_3_TO_4)?;
+            transaction.execute_batch(MIGRATE_4_TO_5)?;
             true
         }
         3 => {
             transaction.execute_batch(MIGRATE_3_TO_4)?;
+            transaction.execute_batch(MIGRATE_4_TO_5)?;
+            true
+        }
+        4 => {
+            transaction.execute_batch(MIGRATE_4_TO_5)?;
             true
         }
         SCHEMA_VERSION => false,
@@ -974,6 +1077,27 @@ fn validate_schema(transaction: &Transaction<'_>) -> Result<()> {
     if missing_asset {
         return Err(StorageError::Integrity(
             "schema migration left a book without an asset".into(),
+        ));
+    }
+
+    let stale_summary = transaction.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM books b \
+             WHERE b.has_cover IS NOT EXISTS( \
+                       SELECT 1 FROM book_covers c WHERE c.book_id = b.id \
+                   ) \
+                OR b.has_file_issue IS NOT EXISTS( \
+                       SELECT 1 FROM book_assets a \
+                       WHERE a.book_id = b.id \
+                         AND a.health IN ('missing', 'unreadable') \
+                   ) \
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if stale_summary {
+        return Err(StorageError::Integrity(
+            "schema migration left stale book summary state".into(),
         ));
     }
 
@@ -1397,9 +1521,7 @@ fn query_window_with_plan(
     }
     let sql = format!(
         "SELECT b.id, b.title, b.authors, b.series, \
-         EXISTS(SELECT 1 FROM book_covers c WHERE c.book_id = b.id), \
-         EXISTS(SELECT 1 FROM book_assets a \
-                WHERE a.book_id = b.id AND a.health IN ('missing', 'unreadable')) \
+         b.has_cover, b.has_file_issue \
          FROM books b {} {} ORDER BY {} LIMIT ?{} OFFSET ?{}",
         plan.joins,
         plan.where_clause,
@@ -1548,6 +1670,62 @@ mod tests {
             assets: vec![asset(path, format)],
             cover_thumbnail: None,
         }
+    }
+
+    fn schema_without_book_summary_state() -> String {
+        SCHEMA
+            .replace(
+                "    has_cover    INTEGER NOT NULL DEFAULT 0 CHECK (has_cover IN (0, 1)),\n",
+                "",
+            )
+            .replace(
+                "    has_file_issue INTEGER NOT NULL DEFAULT 0 CHECK (has_file_issue IN (0, 1)),\n",
+                "",
+            )
+            .replace(
+                r"CREATE TRIGGER book_covers_after_insert_summary
+AFTER INSERT ON book_covers BEGIN
+    UPDATE books SET has_cover = 1 WHERE id = new.book_id;
+END;
+
+CREATE TRIGGER book_covers_after_delete_summary
+AFTER DELETE ON book_covers BEGIN
+    UPDATE books SET has_cover = 0 WHERE id = old.book_id;
+END;
+
+CREATE TRIGGER book_assets_after_insert_summary
+AFTER INSERT ON book_assets
+WHEN new.health IN ('missing', 'unreadable')
+BEGIN
+    UPDATE books SET has_file_issue = 1 WHERE id = new.book_id;
+END;
+
+CREATE TRIGGER book_assets_after_health_update_summary
+AFTER UPDATE OF health ON book_assets
+WHEN old.health IS NOT new.health
+BEGIN
+    UPDATE books
+    SET has_file_issue = EXISTS(
+        SELECT 1 FROM book_assets
+        WHERE book_id = new.book_id AND health IN ('missing', 'unreadable')
+    )
+    WHERE id = new.book_id;
+END;
+
+CREATE TRIGGER book_assets_after_delete_summary
+AFTER DELETE ON book_assets
+BEGIN
+    UPDATE books
+    SET has_file_issue = EXISTS(
+        SELECT 1 FROM book_assets
+        WHERE book_id = old.book_id AND health IN ('missing', 'unreadable')
+    )
+    WHERE id = old.book_id;
+END;
+
+",
+                "",
+            )
     }
 
     fn create_legacy_library(path: &Path, version: i64, format: BookFormat) {
@@ -1951,6 +2129,12 @@ mod tests {
                 database.load_cover(book.id).expect("load migrated cover"),
                 Some(vec![1, 2, 3])
             );
+            assert!(
+                database
+                    .query(&LibraryQuery::default())
+                    .expect("query migrated summary")[0]
+                    .has_cover
+            );
             assert_eq!(
                 database
                     .query(&LibraryQuery {
@@ -1975,7 +2159,7 @@ mod tests {
     #[test]
     fn migrates_version_three_libraries_with_unknown_asset_health() {
         let database_file = TestDatabase::new("migration-v3");
-        let version_three_schema = SCHEMA
+        let version_three_schema = schema_without_book_summary_state()
             .replace(
                 "    health        TEXT NOT NULL DEFAULT 'unknown'\n                  CHECK (health IN ('unknown', 'available', 'missing', 'unreadable')),\n",
                 "",
@@ -2011,6 +2195,56 @@ mod tests {
             .expect("migrated book exists");
 
         assert_eq!(book.assets[0].health, AssetHealth::Unknown);
+        let version: i64 = database
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated version");
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrates_version_four_cover_and_health_summaries() {
+        let database_file = TestDatabase::new("migration-v4");
+        let connection = Connection::open(database_file.path()).expect("open v4 database");
+        connection
+            .execute_batch(&schema_without_book_summary_state())
+            .expect("create v4 schema");
+        connection
+            .execute(
+                "INSERT INTO books (id, title, sort_title, authors, sort_authors) \
+                 VALUES (7, 'Dune', 'dune', 'Frank Herbert', 'frank herbert')",
+                [],
+            )
+            .expect("insert v4 book");
+        connection
+            .execute(
+                "INSERT INTO book_assets ( \
+                     id, book_id, format, storage_mode, health, path_encoding, path \
+                 ) VALUES ( \
+                     9, 7, 'epub', 'reference', 'missing', 'utf8', \
+                     x'2F626F6F6B732F64756E652E65707562' \
+                 )",
+                [],
+            )
+            .expect("insert v4 asset");
+        connection
+            .execute(
+                "INSERT INTO book_covers(book_id, jpeg) VALUES (7, x'010203')",
+                [],
+            )
+            .expect("insert v4 cover");
+        connection
+            .pragma_update(None, "user_version", 4)
+            .expect("mark v4 schema");
+        drop(connection);
+
+        let database = LibraryDatabase::open(database_file.path()).expect("migrate database");
+        let summary = &database
+            .query(&LibraryQuery::default())
+            .expect("query migrated summary")[0];
+
+        assert!(summary.has_cover);
+        assert!(summary.has_file_issue);
         let version: i64 = database
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -2481,6 +2715,107 @@ mod tests {
                 detail.contains("SEARCH book_assets USING COVERING INDEX")
                     && detail.contains("book_assets_health_book_idx")
                     && detail.contains("health=?)")
+            }),
+            "unexpected query plan: {details:?}"
+        );
+    }
+
+    #[test]
+    fn book_summary_state_tracks_cover_and_asset_health_changes() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let imported = BookImport {
+            book: metadata("Dune", "Frank Herbert"),
+            assets: vec![
+                asset("/books/dune.epub", BookFormat::Epub),
+                asset("/books/dune.pdf", BookFormat::Pdf),
+            ],
+            cover_thumbnail: Some(vec![1, 2, 3]),
+        };
+        let book_id = database.import_books(&[imported]).expect("import book")[0];
+        let assets = database
+            .get_book(book_id)
+            .expect("load book")
+            .expect("book exists")
+            .assets;
+        let summary = || {
+            database
+                .query(&LibraryQuery::default())
+                .expect("query summary")
+                .into_iter()
+                .next()
+                .expect("summary exists")
+        };
+
+        assert!(summary().has_cover);
+        assert!(!summary().has_file_issue);
+
+        database
+            .connection
+            .execute(
+                "UPDATE book_assets SET health = 'missing' WHERE id = ?1",
+                [assets[0].id.value()],
+            )
+            .expect("mark first asset missing");
+        database
+            .connection
+            .execute(
+                "UPDATE book_assets SET health = 'unreadable' WHERE id = ?1",
+                [assets[1].id.value()],
+            )
+            .expect("mark second asset unreadable");
+        assert!(summary().has_file_issue);
+
+        database
+            .connection
+            .execute(
+                "UPDATE book_assets SET health = 'available' WHERE id = ?1",
+                [assets[0].id.value()],
+            )
+            .expect("restore first asset");
+        assert!(summary().has_file_issue);
+
+        database
+            .connection
+            .execute(
+                "DELETE FROM book_assets WHERE id = ?1",
+                [assets[1].id.value()],
+            )
+            .expect("delete remaining issue");
+        assert!(!summary().has_file_issue);
+
+        database
+            .connection
+            .execute(
+                "DELETE FROM book_covers WHERE book_id = ?1",
+                [book_id.value()],
+            )
+            .expect("delete cover");
+        assert!(!summary().has_cover);
+    }
+
+    #[test]
+    fn book_summary_projection_does_not_probe_asset_tables() {
+        let database = LibraryDatabase::open_in_memory().expect("open library");
+        let mut statement = database
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN \
+                 SELECT b.id, b.title, b.authors, b.series, \
+                        b.has_cover, b.has_file_issue \
+                 FROM books b ORDER BY b.sort_title, b.id",
+            )
+            .expect("prepare query plan");
+        let details = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("explain query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect query plan");
+
+        assert!(
+            details.iter().all(|detail| {
+                !detail.contains("book_covers")
+                    && !detail.contains("book_assets")
+                    && !detail.contains("CORRELATED")
             }),
             "unexpected query plan: {details:?}"
         );
