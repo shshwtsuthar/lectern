@@ -1,6 +1,7 @@
 name: Performance regression
 
 on:
+  pull_request:
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -9,33 +10,80 @@ permissions:
   contents: read
 
 concurrency:
-  group: performance-regression-${{ github.repository }}
-  cancel-in-progress: false
+  group: performance-regression-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  query:
-    name: 50k release-query regressions
+  classify:
+    name: Classify performance impact
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 5
+    outputs:
+      required: ${{ steps.impact.outputs.required }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify changed paths
+        id: impact
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            python3 benchmarks/performance_impact.py \
+              --base "$BASE_SHA" \
+              --head "$HEAD_SHA" \
+              --github-output "$GITHUB_OUTPUT"
+          else
+            echo "required=true" >> "$GITHUB_OUTPUT"
+            echo "Scheduled and manual runs execute every registered suite."
+          fi
+
+  benchmark:
+    name: Run performance suites
+    needs: classify
+    if: ${{ needs.classify.outputs.required == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/lectern-cargo-target
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
-      - name: Measure full-result query performance
+      - name: Prepare pull-request base worktree
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: >-
-          python3 benchmarks/performance_regression.py
-          --output-dir "$RUNNER_TEMP/lectern-performance-regression/full"
-      - name: Measure paged query performance
+          git worktree add --detach
+          "$RUNNER_TEMP/lectern-performance-base"
+          "$BASE_SHA"
+      - name: Run paired base-versus-candidate suites
+        if: ${{ github.event_name == 'pull_request' }}
         run: >-
-          python3 benchmarks/performance_regression.py
-          --budget benchmarks/query-page-regression-v1.json
-          --output-dir "$RUNNER_TEMP/lectern-performance-regression/page"
+          python3 benchmarks/ci_performance.py
+          --base-repository "$RUNNER_TEMP/lectern-performance-base"
+          --output-dir "$RUNNER_TEMP/lectern-performance-regression"
+          --github-summary "$GITHUB_STEP_SUMMARY"
+      - name: Run absolute scheduled or manual suites
+        if: ${{ github.event_name != 'pull_request' }}
+        run: >-
+          python3 benchmarks/ci_performance.py
+          --output-dir "$RUNNER_TEMP/lectern-performance-regression"
+          --github-summary "$GITHUB_STEP_SUMMARY"
       - name: Upload performance artifacts
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -43,4 +91,28 @@ jobs:
           name: performance-regression-${{ github.run_id }}
           path: ${{ runner.temp }}/lectern-performance-regression
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 90
+
+  gate:
+    name: Performance gate
+    needs: [classify, benchmark]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Enforce classification and benchmark result
+        shell: bash
+        env:
+          CLASSIFICATION_RESULT: ${{ needs.classify.result }}
+          PERFORMANCE_REQUIRED: ${{ needs.classify.outputs.required }}
+          BENCHMARK_RESULT: ${{ needs.benchmark.result }}
+        run: |
+          if [[ "$CLASSIFICATION_RESULT" != "success" ]]; then
+            echo "Performance-impact classification failed."
+            exit 1
+          fi
+          if [[ "$PERFORMANCE_REQUIRED" == "true" && "$BENCHMARK_RESULT" != "success" ]]; then
+            echo "A performance-sensitive change did not pass its required benchmark."
+            exit 1
+          fi
+          echo "Performance policy satisfied."

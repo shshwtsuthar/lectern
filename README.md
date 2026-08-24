@@ -78,9 +78,10 @@ measurements for cold launch, import throughput, scrolling, and memory; see
 
 Every pull request is expected to pass formatting, Clippy with warnings denied, tests on Linux,
 macOS, and Windows, documentation checks, an MSRV build, the benchmark-runner contract tests, and
-the dependency policy in `deny.toml`. The deterministic release-query regression suites run weekly
-on a pinned GitHub runner and are manually dispatchable. CI definitions live in
-`.github/workflows/`.
+the dependency policy in `deny.toml`. Performance-sensitive pull requests run three paired
+base/candidate release-query measurements and compare their median run-level p95 values. The same
+absolute suites run weekly on a pinned GitHub runner and are manually dispatchable. CI definitions
+live in `.github/workflows/`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and
 [docs/architecture.md](docs/architecture.md) for dependency rules. Performance-sensitive changes

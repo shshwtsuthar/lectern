@@ -48,7 +48,7 @@ under `target/benchmarks/query-regression/`, and the final status is in
 SQLite database.
 
 GitHub Actions runs the same command every Monday at 03:17 UTC on `ubuntu-24.04`; it is also
-available through **Run workflow**. The artifact is retained for 30 days even if a budget fails.
+available through **Run workflow**. The artifact is retained for 90 days even if a budget fails.
 Hosted runners have unavoidable variance, so adjust a limit only after comparing retained raw
 artifacts from several runs and understanding the change. Do not raise a threshold merely to make
 a failure disappear.
@@ -56,6 +56,11 @@ a failure disappear.
 The `Performance gate` check also runs on pull requests selected by the conservative changed-path
 classifier. It always reports a stable pass/fail status for branch protection; documentation-only
 changes pass without building the release benchmark.
+
+Registered CI suites live in [`suites-v1.json`](suites-v1.json). Add a versioned budget there when a
+new deterministic gate is introduced; the orchestration runner executes registered suites rather
+than duplicating their commands in workflow YAML. Repository administrators must configure
+`Performance gate` as a required branch-protection check.
 
 ## Exploratory study
 
