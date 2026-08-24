@@ -30,6 +30,11 @@ single-asset export without adding another parser or deleting externally referen
 rules, sequence, performance evidence, and exclusions are defined in
 [`docs/asset-management-scope.md`](docs/asset-management-scope.md).
 
+The first broad library-management slice is **Organisation**: normalized contributors and series,
+flat tags, safe multi-selection and bulk tagging, exact filters, fielded search, and saved searches.
+Its end-to-end workflow, data contracts, query grammar, budgets, and implementation sequence are
+defined in [`docs/organisation-scope.md`](docs/organisation-scope.md).
+
 ## Quick start
 
 Install Rust with [rustup](https://rustup.rs/). The workspace supports Rust 1.97 or newer and uses
