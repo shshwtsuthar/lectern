@@ -109,6 +109,8 @@ than duplicating their commands in workflow YAML. Repository administrators must
   samples after a warmup window.
 - Forty round-robin title, author, and recently-added refreshes, measuring each request through the
   first presented sorted frame against a 50 ms p95 product budget.
+- Forty Open and Reveal dispatches through the desktop's injected no-op platform adapter, measuring
+  each request through the next painted frame against the same 50 ms p95 product budget.
 - A byte-pinned 10,000-file corpus containing 7,000 EPUB and 3,000 PDF files for production-path
   discovery, parsing, cover generation, and persistence.
 
@@ -176,6 +178,9 @@ inspected. These generated artifacts are ignored by Git.
   as a sort selection and ends on the app frame after the matching first page was installed. This
   ensures one populated frame has been presented. Each sort retains 40 samples and must remain at
   or below 50 ms p95.
+- Asset-action-to-first-painted-frame begins when the compositor workload queues an Open or Reveal
+  request through a no-op platform adapter and ends after the following frame. It excludes external
+  application startup; each action retains 40 samples and must remain at or below 50 ms p95.
 - Startup, post-population idle-window, sorting, scrolling, and import memory are Linux process RSS.
   RSS is sampled every 20 ms and excludes dedicated GPU memory.
 - Percentiles use the nearest-rank method and every underlying sample remains in JSON.

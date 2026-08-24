@@ -17,6 +17,8 @@ use eframe::egui;
 use lectern_core::{BookSummary, SortOrder};
 use serde::Serialize;
 
+use crate::platform::PlatformAction;
+
 const OUTPUT_ENV: &str = "LECTERN_BENCHMARK_OUTPUT";
 const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(20);
 const STARTUP_PHASE: usize = 0;
@@ -30,6 +32,8 @@ const SORT_SCENARIOS: [SortOrder; 3] = [
     SortOrder::Title,
 ];
 const SORT_TO_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
+const ASSET_ACTION_TO_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
+const ASSET_ACTIONS: [PlatformAction; 2] = [PlatformAction::Open, PlatformAction::Reveal];
 
 pub(crate) struct BenchmarkFrame {
     pub(crate) viewport_width: f32,
@@ -48,6 +52,7 @@ struct BenchmarkConfig {
     timeout: Duration,
     scroll_pixels_per_second: f32,
     sort_iterations: usize,
+    asset_action_iterations: usize,
 }
 
 impl BenchmarkConfig {
@@ -62,6 +67,10 @@ impl BenchmarkConfig {
                 1_500.0,
             )?,
             sort_iterations: usize_from_env("LECTERN_BENCHMARK_SORT_ITERATIONS", 0)?,
+            asset_action_iterations: usize_from_env(
+                "LECTERN_BENCHMARK_ASSET_ACTION_ITERATIONS",
+                0,
+            )?,
         };
         if config.scroll.is_zero() && !config.scroll_warmup.is_zero() {
             return Err(
@@ -97,6 +106,10 @@ enum Phase {
         completed: usize,
         pending: Option<PendingSort>,
     },
+    AssetActions {
+        completed: usize,
+        pending: Option<PendingAssetAction>,
+    },
     Scroll {
         started: Instant,
     },
@@ -107,6 +120,12 @@ struct PendingSort {
     sort: SortOrder,
     started: Instant,
     paint_frames_remaining: Option<u8>,
+}
+
+struct PendingAssetAction {
+    action: PlatformAction,
+    started: Instant,
+    paint_frames_remaining: u8,
 }
 
 pub(crate) struct DesktopBenchmark {
@@ -128,6 +147,7 @@ pub(crate) struct DesktopBenchmark {
     cpu_frame_times_ns: Vec<u64>,
     sort_to_paint_samples_ns: [Vec<u64>; SORT_SCENARIOS.len()],
     sort_first_book_ids: [Option<i64>; SORT_SCENARIOS.len()],
+    asset_action_to_paint_samples_ns: [Vec<u64>; ASSET_ACTIONS.len()],
     validation_failure: Option<String>,
     memory: Option<PhaseMemorySampler>,
 }
@@ -160,6 +180,7 @@ impl DesktopBenchmark {
             cpu_frame_times_ns: Vec::new(),
             sort_to_paint_samples_ns: array::from_fn(|_| Vec::new()),
             sort_first_book_ids: [None; SORT_SCENARIOS.len()],
+            asset_action_to_paint_samples_ns: array::from_fn(|_| Vec::new()),
             validation_failure: None,
             memory: Some(memory),
         }))
@@ -233,6 +254,28 @@ impl DesktopBenchmark {
         Some(sort)
     }
 
+    pub(crate) fn next_asset_action_request(&mut self) -> Option<PlatformAction> {
+        let Phase::AssetActions { completed, pending } = &mut self.phase else {
+            return None;
+        };
+        if pending.is_some()
+            || *completed >= self.config.asset_action_iterations * ASSET_ACTIONS.len()
+        {
+            return None;
+        }
+        let action = ASSET_ACTIONS[*completed % ASSET_ACTIONS.len()];
+        *pending = Some(PendingAssetAction {
+            action,
+            started: Instant::now(),
+            paint_frames_remaining: 1,
+        });
+        Some(action)
+    }
+
+    pub(crate) fn asset_action_dispatch_failed(&mut self) {
+        self.validation_failure = Some("no-op platform action could not be queued".to_owned());
+    }
+
     pub(crate) fn frame_started(&mut self, cpu_usage_seconds: Option<f32>, unstable_dt: f32) {
         let now = Instant::now();
         let interval = self
@@ -274,8 +317,10 @@ impl DesktopBenchmark {
         let now = Instant::now();
         let mut begin_idle = false;
         let mut begin_sort = false;
+        let mut begin_asset_actions = false;
         let mut begin_scroll = false;
         let mut sort_finished = false;
+        let mut asset_actions_finished = false;
         let mut finish = false;
         let mut failure = None;
         let mut observed_scroll_duration = None;
@@ -304,6 +349,9 @@ impl DesktopBenchmark {
             Phase::Sort { .. } if timed_out => {
                 failure = Some("desktop benchmark timed out during sort interactions".to_owned());
             }
+            Phase::AssetActions { .. } if timed_out => {
+                failure = Some("desktop benchmark timed out during asset actions".to_owned());
+            }
             Phase::Scroll { started } if timed_out => {
                 observed_scroll_duration = Some(now.duration_since(*started));
                 failure = Some("desktop benchmark timed out during scrolling".to_owned());
@@ -311,6 +359,8 @@ impl DesktopBenchmark {
             Phase::Idle { started } if now.duration_since(*started) >= self.config.idle => {
                 if self.config.sort_iterations > 0 {
                     begin_sort = true;
+                } else if self.config.asset_action_iterations > 0 {
+                    begin_asset_actions = true;
                 } else if self.config.scroll.is_zero() {
                     self.idle_end_rss_bytes = current_rss_bytes();
                     observed_scroll_duration = Some(Duration::ZERO);
@@ -335,6 +385,32 @@ impl DesktopBenchmark {
                 sort_finished = *completed >= self.config.sort_iterations * SORT_SCENARIOS.len();
                 context.request_repaint();
             }
+            Phase::AssetActions { completed, pending }
+                if pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.paint_frames_remaining == 0) =>
+            {
+                let completed_action = pending.take().expect("completed asset action is present");
+                let index = asset_action_index(completed_action.action);
+                if let Some(latency) = elapsed_ns(now.duration_since(completed_action.started)) {
+                    self.asset_action_to_paint_samples_ns[index].push(latency);
+                } else {
+                    failure = Some(
+                        "asset-action-to-paint latency exceeded the supported range".to_owned(),
+                    );
+                }
+                *completed += 1;
+                asset_actions_finished =
+                    *completed >= self.config.asset_action_iterations * ASSET_ACTIONS.len();
+                context.request_repaint();
+            }
+            Phase::AssetActions {
+                pending: Some(pending),
+                ..
+            } if pending.paint_frames_remaining > 0 => {
+                pending.paint_frames_remaining -= 1;
+                context.request_repaint();
+            }
             Phase::Sort {
                 pending:
                     Some(PendingSort {
@@ -346,7 +422,10 @@ impl DesktopBenchmark {
                 *remaining -= 1;
                 context.request_repaint();
             }
-            Phase::Startup { .. } | Phase::Idle { .. } | Phase::Sort { .. } => {
+            Phase::Startup { .. }
+            | Phase::Idle { .. }
+            | Phase::Sort { .. }
+            | Phase::AssetActions { .. } => {
                 context.request_repaint_after(MEMORY_SAMPLE_INTERVAL);
             }
             Phase::Scroll { started } if now.duration_since(*started) >= self.config.scroll => {
@@ -379,6 +458,30 @@ impl DesktopBenchmark {
             };
             context.request_repaint();
         } else if sort_finished {
+            if self.config.asset_action_iterations > 0 {
+                begin_asset_actions = true;
+            } else if self.config.scroll.is_zero() {
+                observed_scroll_duration = Some(Duration::ZERO);
+                finish = true;
+            } else {
+                begin_scroll = true;
+            }
+        }
+
+        if begin_asset_actions {
+            if self.idle_end_rss_bytes.is_none() {
+                self.idle_end_rss_bytes = current_rss_bytes();
+                if let Some(memory) = &self.memory {
+                    memory.record_sample(IDLE_PHASE, self.idle_end_rss_bytes);
+                    memory.set_phase(SORT_PHASE);
+                }
+            }
+            self.phase = Phase::AssetActions {
+                completed: 0,
+                pending: None,
+            };
+            context.request_repaint();
+        } else if asset_actions_finished {
             if self.config.scroll.is_zero() {
                 observed_scroll_duration = Some(Duration::ZERO);
                 finish = true;
@@ -404,7 +507,7 @@ impl DesktopBenchmark {
             self.phase = Phase::Finished;
             let budget_failure = failure
                 .is_none()
-                .then(|| self.sort_budget_failure())
+                .then(|| self.interaction_budget_failure())
                 .flatten();
             if let Err(error) =
                 self.write_result(failure.as_deref().or(budget_failure.as_deref()), frame)
@@ -426,7 +529,7 @@ impl DesktopBenchmark {
             .ok_or_else(|| "memory sampler was already consumed".to_owned())?
             .finish()?;
         let result = DesktopBenchmarkResult {
-            schema_version: 2,
+            schema_version: 3,
             kind: "desktop",
             status: if failure.is_some() {
                 "failed"
@@ -467,6 +570,10 @@ impl DesktopBenchmark {
                 &self.sort_to_paint_samples_ns,
                 self.sort_first_book_ids,
             ),
+            asset_actions: AssetActionsResult::new(
+                self.config.asset_action_iterations,
+                &self.asset_action_to_paint_samples_ns,
+            ),
             scrolling: ScrollingResult::new(
                 self.config,
                 self.observed_scroll_duration_ns,
@@ -499,31 +606,55 @@ impl DesktopBenchmark {
         write_json(&self.output_path, &result)
     }
 
-    fn sort_budget_failure(&self) -> Option<String> {
-        if self.config.sort_iterations == 0 {
-            return None;
-        }
-        for (index, samples) in self.sort_to_paint_samples_ns.iter().enumerate() {
-            if samples.len() != self.config.sort_iterations {
-                return Some(format!(
-                    "sort {} retained {} samples; expected {}",
-                    sort_name(SORT_SCENARIOS[index]),
-                    samples.len(),
-                    self.config.sort_iterations,
-                ));
-            }
-            let summary = summarize_samples(samples).expect("non-empty sort samples");
-            if summary.p95_ns > SORT_TO_PAINT_P95_BUDGET_NS {
-                return Some(format!(
-                    "sort {} p95 was {:.3} ms, above the {:.3} ms budget",
-                    sort_name(SORT_SCENARIOS[index]),
-                    summary.p95_ns as f64 / 1_000_000.0,
-                    SORT_TO_PAINT_P95_BUDGET_NS as f64 / 1_000_000.0,
-                ));
-            }
-        }
-        None
+    fn interaction_budget_failure(&self) -> Option<String> {
+        interaction_budget_failure(
+            "sort",
+            self.config.sort_iterations,
+            &self.sort_to_paint_samples_ns,
+            |index| sort_name(SORT_SCENARIOS[index]),
+            SORT_TO_PAINT_P95_BUDGET_NS,
+        )
+        .or_else(|| {
+            interaction_budget_failure(
+                "asset action",
+                self.config.asset_action_iterations,
+                &self.asset_action_to_paint_samples_ns,
+                |index| asset_action_name(ASSET_ACTIONS[index]),
+                ASSET_ACTION_TO_PAINT_P95_BUDGET_NS,
+            )
+        })
     }
+}
+
+fn interaction_budget_failure<const N: usize>(
+    kind: &str,
+    expected_samples: usize,
+    samples_by_scenario: &[Vec<u64>; N],
+    name: impl Fn(usize) -> &'static str,
+    p95_budget_ns: u64,
+) -> Option<String> {
+    if expected_samples == 0 {
+        return None;
+    }
+    for (index, samples) in samples_by_scenario.iter().enumerate() {
+        if samples.len() != expected_samples {
+            return Some(format!(
+                "{kind} {} retained {} samples; expected {expected_samples}",
+                name(index),
+                samples.len(),
+            ));
+        }
+        let summary = summarize_samples(samples).expect("non-empty interaction samples");
+        if summary.p95_ns > p95_budget_ns {
+            return Some(format!(
+                "{kind} {} p95 was {:.3} ms, above the {:.3} ms budget",
+                name(index),
+                summary.p95_ns as f64 / 1_000_000.0,
+                p95_budget_ns as f64 / 1_000_000.0,
+            ));
+        }
+    }
+    None
 }
 
 struct ScrollingSamples<'a> {
@@ -561,6 +692,30 @@ impl<'a> SortInteractionsResult<'a> {
     }
 }
 
+impl<'a> AssetActionsResult<'a> {
+    fn new(iterations_per_action: usize, samples: &'a [Vec<u64>; ASSET_ACTIONS.len()]) -> Self {
+        Self {
+            endpoint: "request dispatch through an injected no-op platform adapter to the next fully rendered frame",
+            iterations_per_action,
+            max_p95_ns: ASSET_ACTION_TO_PAINT_P95_BUDGET_NS,
+            scenarios: array::from_fn(|index| {
+                let latency = summarize_samples(&samples[index]);
+                let passed = iterations_per_action == 0
+                    || (samples[index].len() == iterations_per_action
+                        && latency.as_ref().is_some_and(|summary| {
+                            summary.p95_ns <= ASSET_ACTION_TO_PAINT_P95_BUDGET_NS
+                        }));
+                AssetActionScenario {
+                    name: asset_action_name(ASSET_ACTIONS[index]),
+                    latency,
+                    samples_ns: &samples[index],
+                    passed,
+                }
+            }),
+        }
+    }
+}
+
 fn sort_for_interaction(completed: usize) -> SortOrder {
     SORT_SCENARIOS[completed % SORT_SCENARIOS.len()]
 }
@@ -578,6 +733,20 @@ const fn sort_name(sort: SortOrder) -> &'static str {
         SortOrder::Author => "author",
         SortOrder::RecentlyAdded => "recently_added",
         SortOrder::Title => "title",
+    }
+}
+
+const fn asset_action_index(action: PlatformAction) -> usize {
+    match action {
+        PlatformAction::Open => 0,
+        PlatformAction::Reveal => 1,
+    }
+}
+
+const fn asset_action_name(action: PlatformAction) -> &'static str {
+    match action {
+        PlatformAction::Open => "open",
+        PlatformAction::Reveal => "reveal",
     }
 }
 
@@ -633,6 +802,7 @@ struct DesktopBenchmarkResult<'a> {
     startup: Option<StartupResult>,
     idle: IdleResult,
     sort_interactions: SortInteractionsResult<'a>,
+    asset_actions: AssetActionsResult<'a>,
     scrolling: ScrollingResult<'a>,
     memory: MemoryResult,
     final_frame: FinalFrameResult,
@@ -654,6 +824,7 @@ struct ConfigurationResult {
     timeout_ns: Option<u64>,
     scroll_pixels_per_second: f32,
     sort_iterations: usize,
+    asset_action_iterations: usize,
 }
 
 impl From<BenchmarkConfig> for ConfigurationResult {
@@ -665,6 +836,7 @@ impl From<BenchmarkConfig> for ConfigurationResult {
             timeout_ns: elapsed_ns(config.timeout),
             scroll_pixels_per_second: config.scroll_pixels_per_second,
             sort_iterations: config.sort_iterations,
+            asset_action_iterations: config.asset_action_iterations,
         }
     }
 }
@@ -701,6 +873,22 @@ struct SortInteractionsResult<'a> {
 struct SortInteractionScenario<'a> {
     name: &'static str,
     first_book_id: Option<i64>,
+    latency: Option<SampleSummary>,
+    samples_ns: &'a [u64],
+    passed: bool,
+}
+
+#[derive(Serialize)]
+struct AssetActionsResult<'a> {
+    endpoint: &'static str,
+    iterations_per_action: usize,
+    max_p95_ns: u64,
+    scenarios: [AssetActionScenario<'a>; ASSET_ACTIONS.len()],
+}
+
+#[derive(Serialize)]
+struct AssetActionScenario<'a> {
+    name: &'static str,
     latency: Option<SampleSummary>,
     samples_ns: &'a [u64],
     passed: bool,
@@ -1005,6 +1193,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             scroll_pixels_per_second: 1_500.0,
             sort_iterations: 40,
+            asset_action_iterations: 40,
         };
         let result = ScrollingResult::new(
             config,

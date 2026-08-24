@@ -2,6 +2,7 @@
 
 mod app;
 mod benchmark;
+mod platform;
 mod workers;
 
 use std::{io, time::Instant};

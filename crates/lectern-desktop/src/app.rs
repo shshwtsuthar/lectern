@@ -14,6 +14,7 @@ use lectern_storage::LibraryDatabase;
 
 use crate::{
     benchmark::{BenchmarkFrame, DesktopBenchmark},
+    platform::{NoopAssetPlatform, PlatformAction, PlatformWorker, SystemAssetPlatform},
     workers::{
         DecodedCover, ImportRequest, QueryQueueResult, QueryRequest, WorkerEvent, WorkerSet,
     },
@@ -48,6 +49,8 @@ struct CachedPage {
 struct MetadataActions {
     save: bool,
     reset: bool,
+    open: Option<(AssetId, PathBuf)>,
+    reveal: Option<(AssetId, PathBuf)>,
     relink: Option<(AssetId, BookFormat)>,
     detach: Option<AssetDetachConfirmation>,
     attach: Option<BookFormat>,
@@ -92,6 +95,16 @@ struct AssetDetachConfirmation {
     asset_id: AssetId,
     format: BookFormat,
     path: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+struct MetadataOperationState {
+    relinking_asset: Option<AssetId>,
+    detaching_asset: Option<AssetId>,
+    platform_busy: Option<(AssetId, PlatformAction)>,
+    attaching_format: Option<BookFormat>,
+    removal_busy: bool,
+    library_operation_busy: bool,
 }
 
 #[derive(Clone)]
@@ -165,6 +178,8 @@ pub(crate) struct LecternApp {
     import_summary: Option<ImportSummary>,
     show_import_summary: bool,
     asset_maintenance: AssetMaintenanceUi,
+    platform_worker: PlatformWorker,
+    platform_busy: Option<(AssetId, PlatformAction)>,
     book_removal: BookRemovalUi,
     editor_loading: Option<BookId>,
     editor: Option<BookEditor>,
@@ -183,6 +198,11 @@ impl LecternApp {
             Err(error) => format!("Could not open library: {error}"),
         };
         let workers = WorkerSet::spawn(&database_path, &creation_context.egui_ctx);
+        let platform_worker = if benchmark.is_some() {
+            PlatformWorker::spawn(NoopAssetPlatform, &creation_context.egui_ctx)
+        } else {
+            PlatformWorker::spawn(SystemAssetPlatform::default(), &creation_context.egui_ctx)
+        };
         let mut app = Self {
             database_path,
             workers,
@@ -203,6 +223,8 @@ impl LecternApp {
             import_summary: None,
             show_import_summary: false,
             asset_maintenance: AssetMaintenanceUi::default(),
+            platform_worker,
+            platform_busy: None,
             book_removal: BookRemovalUi::default(),
             editor_loading: None,
             editor: None,
@@ -342,6 +364,34 @@ impl LecternApp {
                 WorkerEvent::Error(error) => self.status = format!("Background worker: {error}"),
             }
         }
+        while let Some(event) = self.platform_worker.next_event() {
+            if self.platform_busy == Some((event.asset_id, event.action)) {
+                self.platform_busy = None;
+            }
+            match event.result {
+                Ok(()) => {
+                    self.status = match event.action {
+                        PlatformAction::Open => "Opened book file".to_owned(),
+                        PlatformAction::Reveal => "Revealed book file".to_owned(),
+                    };
+                }
+                Err(error) => {
+                    self.status = format!(
+                        "Could not {} book file: {error}. Relink the asset if it moved.",
+                        event.action
+                    );
+                    if let Some(editor) = &mut self.editor
+                        && editor
+                            .original
+                            .assets
+                            .iter()
+                            .any(|asset| asset.id == event.asset_id)
+                    {
+                        editor.error = Some(error);
+                    }
+                }
+            }
+        }
         self.retry_initial_page_if_needed();
         self.evict_covers();
     }
@@ -405,6 +455,23 @@ impl LecternApp {
             debug_assert_ne!(self.query.sort, sort);
             self.query.sort = sort;
             self.refresh_library();
+        }
+    }
+
+    fn apply_benchmark_asset_action_request(&mut self) {
+        let action = self
+            .benchmark
+            .as_mut()
+            .and_then(DesktopBenchmark::next_asset_action_request);
+        if let Some(action) = action {
+            let queued = self.platform_worker.dispatch(
+                AssetId::new(i64::MIN),
+                action,
+                PathBuf::from("/lectern-benchmark/no-op 'asset'.epub"),
+            );
+            if !queued && let Some(benchmark) = &mut self.benchmark {
+                benchmark.asset_action_dispatch_failed();
+            }
         }
     }
 
@@ -956,6 +1023,8 @@ impl LecternApp {
         let mut close = false;
         let mut reset = false;
         let mut save = false;
+        let mut open = None;
+        let mut reveal = None;
         let mut relink = None;
         let mut detach = None;
         let mut attach = None;
@@ -995,14 +1064,19 @@ impl LecternApp {
                 let actions = metadata_form(
                     ui,
                     editor,
-                    self.asset_maintenance.relinking_asset,
-                    self.asset_maintenance.detaching_asset,
-                    self.asset_maintenance.attaching_format,
-                    removal_busy,
-                    library_operation_busy,
+                    MetadataOperationState {
+                        relinking_asset: self.asset_maintenance.relinking_asset,
+                        detaching_asset: self.asset_maintenance.detaching_asset,
+                        platform_busy: self.platform_busy,
+                        attaching_format: self.asset_maintenance.attaching_format,
+                        removal_busy,
+                        library_operation_busy,
+                    },
                 );
                 save = actions.save;
                 reset = actions.reset;
+                open = actions.open;
+                reveal = actions.reveal;
                 relink = actions.relink;
                 detach = actions.detach;
                 attach = actions.attach;
@@ -1025,6 +1099,10 @@ impl LecternApp {
             }
         } else if save {
             self.save_editor();
+        } else if let Some((asset_id, path)) = open {
+            self.start_platform_action(asset_id, PlatformAction::Open, path);
+        } else if let Some((asset_id, path)) = reveal {
+            self.start_platform_action(asset_id, PlatformAction::Reveal, path);
         } else if let Some((asset_id, format)) = relink {
             self.choose_asset_replacement(asset_id, format);
         } else if let Some(confirmation) = detach {
@@ -1033,6 +1111,21 @@ impl LecternApp {
             self.choose_format_attachment(format);
         } else if remove {
             self.request_book_removal();
+        }
+    }
+
+    fn start_platform_action(&mut self, asset_id: AssetId, action: PlatformAction, path: PathBuf) {
+        if self.platform_busy.is_some() {
+            return;
+        }
+        if self.platform_worker.dispatch(asset_id, action, path) {
+            self.platform_busy = Some((asset_id, action));
+            self.status = match action {
+                PlatformAction::Open => "Opening book file…".to_owned(),
+                PlatformAction::Reveal => "Revealing book file…".to_owned(),
+            };
+        } else {
+            "Another file action is still starting".clone_into(&mut self.status);
         }
     }
 
@@ -1457,6 +1550,7 @@ impl eframe::App for LecternApp {
         }
         self.poll_workers(ui.ctx());
         self.apply_benchmark_sort_request();
+        self.apply_benchmark_asset_action_request();
         self.accept_dropped_files(ui);
         let files_hovering = ui.input(|input| !input.raw.hovered_files.is_empty());
 
@@ -1607,14 +1701,10 @@ fn metadata_text_field(ui: &mut egui::Ui, label: &str, value: &mut String, enabl
 fn metadata_form(
     ui: &mut egui::Ui,
     editor: &mut BookEditor,
-    relinking_asset: Option<AssetId>,
-    detaching_asset: Option<AssetId>,
-    attaching_format: Option<BookFormat>,
-    removal_busy: bool,
-    library_operation_busy: bool,
+    state: MetadataOperationState,
 ) -> MetadataActions {
     let mut actions = MetadataActions::default();
-    let editing_enabled = !editor.saving && !removal_busy && !library_operation_busy;
+    let editing_enabled = !editor.saving && !state.removal_busy && !state.library_operation_busy;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -1641,16 +1731,17 @@ fn metadata_form(
             asset_rows(
                 ui,
                 &editor.original,
-                relinking_asset,
-                detaching_asset,
-                !editor.saving && !library_operation_busy && !removal_busy,
+                state.relinking_asset,
+                state.detaching_asset,
+                state.platform_busy,
+                !editor.saving && !state.library_operation_busy && !state.removal_busy,
                 &mut actions,
             );
             actions.attach = format_attachment_controls(
                 ui,
                 editor,
-                attaching_format,
-                library_operation_busy || removal_busy,
+                state.attaching_format,
+                state.library_operation_busy || state.removal_busy,
             );
 
             if let Some(error) = &editor.error {
@@ -1666,9 +1757,9 @@ fn metadata_form(
             actions.remove = book_removal_controls(
                 ui,
                 editor,
-                relinking_asset,
-                removal_busy,
-                library_operation_busy,
+                state.relinking_asset,
+                state.removal_busy,
+                state.library_operation_busy,
             );
         });
     actions
@@ -1679,6 +1770,7 @@ fn asset_rows(
     book: &Book,
     relinking_asset: Option<AssetId>,
     detaching_asset: Option<AssetId>,
+    platform_busy: Option<(AssetId, PlatformAction)>,
     action_enabled: bool,
     actions: &mut MetadataActions,
 ) {
@@ -1699,25 +1791,63 @@ fn asset_rows(
                     .color(health_color)
                     .size(12.0),
             );
+            let platform_enabled =
+                platform_busy.is_none() && asset.storage == lectern_core::AssetStorage::Reference;
+            let open_text = if platform_busy == Some((asset.id, PlatformAction::Open)) {
+                "Opening…"
+            } else {
+                "Open"
+            };
+            if ui
+                .add_enabled(platform_enabled, egui::Button::new(open_text))
+                .on_disabled_hover_text("Managed file locations are not available yet")
+                .clicked()
+            {
+                actions.open = Some((asset.id, asset.path.clone()));
+            }
             let menu_text = if detaching_asset == Some(asset.id) {
                 "Detaching…"
             } else {
                 "File actions"
             };
             ui.add_enabled_ui(
-                action_enabled && relinking_asset.is_none() && detaching_asset.is_none(),
+                platform_enabled
+                    || (action_enabled && relinking_asset.is_none() && detaching_asset.is_none()),
                 |ui| {
                     ui.menu_button(menu_text, |ui| {
+                        let reveal_text =
+                            if platform_busy == Some((asset.id, PlatformAction::Reveal)) {
+                                "Revealing…"
+                            } else {
+                                "Reveal in file manager"
+                            };
+                        if ui
+                            .add_enabled(platform_enabled, egui::Button::new(reveal_text))
+                            .clicked()
+                        {
+                            actions.reveal = Some((asset.id, asset.path.clone()));
+                            ui.close();
+                        }
                         if asset.storage == lectern_core::AssetStorage::Reference
                             && asset.health.has_issue()
-                            && ui.button("Relink").clicked()
+                            && ui
+                                .add_enabled(
+                                    action_enabled
+                                        && relinking_asset.is_none()
+                                        && detaching_asset.is_none(),
+                                    egui::Button::new("Relink"),
+                                )
+                                .clicked()
                         {
                             actions.relink = Some((asset.id, asset.format));
                             ui.close();
                         }
                         let detach = ui
                             .add_enabled(
-                                book.assets.len() > 1,
+                                book.assets.len() > 1
+                                    && action_enabled
+                                    && relinking_asset.is_none()
+                                    && detaching_asset.is_none(),
                                 egui::Button::new("Detach from book"),
                             )
                             .on_disabled_hover_text("A logical book must retain at least one file");

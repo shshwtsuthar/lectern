@@ -63,6 +63,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(options.query_iterations, 5)
         self.assertEqual(options.startup_runs, 1)
         self.assertEqual(options.sort_iterations, 3)
+        self.assertEqual(options.asset_action_iterations, 3)
 
     def test_command_timeout_is_recorded_before_failing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -94,6 +95,7 @@ class RunnerTests(unittest.TestCase):
             scroll_warmup_seconds=1.0,
             scroll_pixels_per_second=1_500.0,
             sort_iterations=40,
+            asset_action_iterations=30,
             timeout_seconds=20.0,
         )
 
@@ -104,6 +106,10 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(
             calls[0][1]["environment"]["LECTERN_BENCHMARK_SORT_ITERATIONS"],
             "40",
+        )
+        self.assertEqual(
+            calls[0][1]["environment"]["LECTERN_BENCHMARK_ASSET_ACTION_ITERATIONS"],
+            "30",
         )
 
     def test_integrity_validators_accept_reconciled_counts(self) -> None:
@@ -135,8 +141,20 @@ class RunnerTests(unittest.TestCase):
                         )
                     ],
                 },
+                "asset_actions": {
+                    "iterations_per_action": 2,
+                    "scenarios": [
+                        {
+                            "name": name,
+                            "samples_ns": [8_000_000, 9_000_000],
+                            "passed": True,
+                        }
+                        for name in ("open", "reveal")
+                    ],
+                },
             },
             50_000,
+            2,
             2,
         )
         RUN.validate_query_result(
