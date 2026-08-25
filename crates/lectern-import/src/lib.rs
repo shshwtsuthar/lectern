@@ -12,12 +12,14 @@ use hayro::{
 };
 use image::{ImageReader, Limits, codecs::jpeg::JpegEncoder};
 use lectern_core::{
-    AssetStorage, BookAssetDraft, BookFormat, BookMetadataDraft,
+    AssetStorage, BookAssetDraft, BookFormat, BookImport, BookMetadataDraft,
+    ReimportMetadataPolicy,
     organisation::{
         ContributorRole, ImportedContributorCredit, ImportedOrganisation, SeriesIndex, identity_key,
     },
 };
-use lectern_storage::{BookImport, LibraryDatabase};
+pub use lectern_core::{ImportFailure, ImportProgress, ImportSummary};
+use lectern_storage::LibraryDatabase;
 use lopdf::Document;
 use percent_encoding::percent_decode_str;
 use quick_xml::{Reader, XmlVersion, events::BytesStart, events::Event};
@@ -104,41 +106,6 @@ pub enum ImportError {
 /// Result type returned by import operations.
 pub type Result<T> = std::result::Result<T, ImportError>;
 
-/// One publication that could not be imported.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ImportFailure {
-    /// Source path that failed.
-    pub path: PathBuf,
-    /// Human-readable cause.
-    pub message: String,
-}
-
-/// Monotonic progress emitted by an import job.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ImportProgress {
-    /// Number of supported publication files found before parsing began.
-    pub discovered: usize,
-    /// Number of files parsed or rejected so far.
-    pub processed: usize,
-    /// Number of files committed to the library.
-    pub imported: usize,
-    /// Number of files that could not be parsed.
-    pub failed: usize,
-}
-
-/// Final outcome of a completed import job.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ImportSummary {
-    /// Number of supported publication files found.
-    pub discovered: usize,
-    /// Number of files committed to the library.
-    pub imported: usize,
-    /// Number of files that could not be parsed.
-    pub failed: usize,
-    /// Per-file parse failures.
-    pub failures: Vec<ImportFailure>,
-}
-
 /// Recursively discovers supported publications below `roots` without following symlinks.
 ///
 /// # Errors
@@ -183,6 +150,24 @@ pub fn discover_publications(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
 pub fn import_paths(
     database_path: impl AsRef<Path>,
     roots: &[PathBuf],
+    report_progress: impl FnMut(ImportProgress),
+) -> Result<ImportSummary> {
+    let mut database = LibraryDatabase::open(database_path)?;
+    import_paths_into(&mut database, roots, report_progress)
+}
+
+/// Imports discovered EPUB and PDF files through an already-open storage adapter.
+///
+/// This is the composition hook used by the application service so a frontend never has to open
+/// or coordinate a database connection itself.
+///
+/// # Errors
+///
+/// Returns an error when discovery, parsing, or a bounded persistence batch fails. Individual
+/// malformed publications are returned in [`ImportSummary::failures`].
+pub fn import_paths_into(
+    database: &mut LibraryDatabase,
+    roots: &[PathBuf],
     mut report_progress: impl FnMut(ImportProgress),
 ) -> Result<ImportSummary> {
     let publications = discover_publications(roots)?;
@@ -193,7 +178,6 @@ pub fn import_paths(
     };
     report_progress(progress);
 
-    let mut database = LibraryDatabase::open(database_path)?;
     let mut failures = Vec::new();
 
     for batch in publications.chunks(IMPORT_BATCH_SIZE) {
@@ -214,7 +198,8 @@ pub fn import_paths(
         }
 
         if !records.is_empty() {
-            database.import_books(&records)?;
+            database
+                .import_books_with_policy(&records, ReimportMetadataPolicy::PreserveExisting)?;
         }
 
         progress.processed += batch.len();

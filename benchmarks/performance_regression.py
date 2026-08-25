@@ -99,6 +99,7 @@ def main(arguments: list[str]) -> int:
             "organisation-migration": "migrations.json",
             "organisation-query": "organisation-queries.json",
             "organisation-vocabulary": "organisation-vocabulary.json",
+            "maintenance": "maintenance.json",
         }
         query_output = output / result_names[mode]
         run_command(seed_command(mode, database, seed_output, workload), commands)
@@ -130,6 +131,8 @@ def main(arguments: list[str]) -> int:
             decisions = evaluate_organisation_query_result(query_result, budget)
         elif mode == "organisation-vocabulary":
             decisions = evaluate_organisation_vocabulary_result(query_result, budget)
+        elif mode == "maintenance":
+            decisions = evaluate_maintenance_result(query_result, budget)
         else:
             decisions = evaluate_query_result(query_result, budget)
         report["seed"] = seed
@@ -209,6 +212,7 @@ def workload_command(
                 "replace": "replace",
                 "export": "export",
                 "reimport": "reimport",
+                "maintenance": "maintenance",
             }[mode],
         ]
     return command + [
@@ -274,12 +278,13 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "organisation-migration",
         "organisation-query",
         "organisation-vocabulary",
+        "maintenance",
     ):
         raise RegressionError(
             "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
             "'remove', 'detach', 'attach', 'replace', 'export', 'reimport', "
-            "'organisation-migration', 'organisation-query', or "
-            "'organisation-vocabulary'"
+            "'organisation-migration', 'organisation-query', "
+            "'organisation-vocabulary', or 'maintenance'"
         )
     if query_mode == "full":
         scenario_names = workload.get("full_library_scenarios")
@@ -804,6 +809,74 @@ def evaluate_reimport_result(
     expected_names = set(workload["scenarios"])
     if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
         raise RegressionError("re-import scenarios do not match the versioned budget")
+    return evaluate_latency_budgets(by_name, budget)
+
+
+def evaluate_maintenance_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "maintenance result"
+    books = workload["books"]
+    if positive_or_zero_field(result, "library_books", context) != books:
+        raise RegressionError("maintenance library count does not match the budget")
+    if positive_or_zero_field(result, "library_assets", context) != books:
+        raise RegressionError("maintenance seeded asset count does not reconcile")
+    warmup = positive_or_zero_field(result, "warmup_iterations", context)
+    measured = positive_or_zero_field(result, "measured_iterations", context)
+    if warmup != workload["warmup_iterations"] or measured != workload["measured_iterations"]:
+        raise RegressionError("maintenance iteration counts do not match the budget")
+    minimum_bytes = positive_or_zero_field(result, "minimum_backup_bytes", context)
+    maximum_bytes = positive_or_zero_field(result, "maximum_backup_bytes", context)
+    if minimum_bytes == 0 or maximum_bytes < minimum_bytes:
+        raise RegressionError("maintenance backup sizes do not reconcile")
+    if positive_or_zero_field(result, "referenced_files_checked", context) != books:
+        raise RegressionError("maintenance referenced-file count does not reconcile")
+    expected_checks = {
+        "sqlite_integrity",
+        "foreign_keys",
+        "fts_consistency",
+        "asset_relationships",
+        "referenced_file_partition",
+        "backup_snapshot_count",
+        "backup_snapshot_integrity",
+        "backup_collision_preserved",
+    }
+    checks = result.get("verified_checks")
+    if not isinstance(checks, list) or set(checks) != expected_checks:
+        raise RegressionError("maintenance correctness checks did not reconcile")
+
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError("maintenance result must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, scenario in enumerate(scenarios):
+        scenario_context = f"maintenance scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{scenario_context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{scenario_context}.name must be unique and non-empty")
+        operations = positive_or_zero_field(
+            scenario, "successful_operations", scenario_context
+        )
+        if operations != warmup + measured:
+            raise RegressionError(f"{scenario_context} operation count does not reconcile")
+        samples = scenario.get("samples_ns")
+        if not isinstance(samples, list) or len(samples) != measured:
+            raise RegressionError(f"{scenario_context} sample count does not match the budget")
+        if any(
+            isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+            for sample in samples
+        ):
+            raise RegressionError(f"{scenario_context}.samples_ns must contain positive integers")
+        latency = object_field(scenario, "latency_ms", scenario_context)
+        positive_number_field(latency, "p95", f"{scenario_context}.latency_ms")
+        by_name[name] = scenario
+
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("maintenance scenarios do not match the versioned budget")
     return evaluate_latency_budgets(by_name, budget)
 
 

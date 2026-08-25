@@ -6,7 +6,11 @@
 
 pub mod organisation;
 
-use std::{fmt, path::PathBuf};
+use std::{
+    error::Error,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 /// Compile-time information about the running Lectern build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -357,6 +361,142 @@ pub struct AssetHealthReport {
     pub changed: usize,
 }
 
+/// One publication that could not be imported.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportFailure {
+    /// Source path that failed.
+    pub path: PathBuf,
+    /// Human-readable cause.
+    pub message: String,
+}
+
+/// Monotonic progress emitted by a publication import workflow.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ImportProgress {
+    /// Number of supported publication files found before parsing began.
+    pub discovered: usize,
+    /// Number of files parsed or rejected so far.
+    pub processed: usize,
+    /// Number of files committed to the library.
+    pub imported: usize,
+    /// Number of files that could not be parsed.
+    pub failed: usize,
+}
+
+/// Final outcome of a completed publication import workflow.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ImportSummary {
+    /// Number of supported publication files found.
+    pub discovered: usize,
+    /// Number of files committed to the library.
+    pub imported: usize,
+    /// Number of files that could not be parsed.
+    pub failed: usize,
+    /// Per-file parse failures.
+    pub failures: Vec<ImportFailure>,
+}
+
+/// File-health observations made by a read-only library diagnostic.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReferencedFileDiagnostics {
+    /// Number of externally referenced assets checked.
+    pub checked: u64,
+    /// Number of references that resolved to readable regular files.
+    pub available: u64,
+    /// Number of references whose paths did not exist.
+    pub missing: u64,
+    /// Number of references that existed but could not be read as regular files.
+    pub unreadable: u64,
+    /// Number of stored paths that could not be decoded.
+    pub invalid_paths: u64,
+    /// Number of observations that disagree with the last stored health state.
+    pub stale_health: u64,
+}
+
+/// Read-only integrity and relationship checks for one library.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LibraryDiagnostics {
+    /// Schema version recorded by the database.
+    pub schema_version: i64,
+    /// Newest schema version supported by this build.
+    pub supported_schema_version: i64,
+    /// Messages returned by `SQLite`'s physical integrity check; empty means healthy.
+    pub sqlite_integrity_errors: Vec<String>,
+    /// Number of rows returned by `SQLite`'s foreign-key check.
+    pub foreign_key_violations: u64,
+    /// Error returned by the FTS5 integrity check, if any.
+    pub fts_error: Option<String>,
+    /// Number of logical books without a file asset.
+    pub books_without_assets: u64,
+    /// Number of repeated `(book, format)` relationships.
+    pub duplicate_book_formats: u64,
+    /// Number of repeated externally referenced paths.
+    pub duplicate_reference_paths: u64,
+    /// Number of asset rows whose owner, format, storage mode, health, or path is invalid.
+    pub invalid_asset_relationships: u64,
+    /// Current observations for externally referenced files.
+    pub referenced_files: ReferencedFileDiagnostics,
+    /// Managed assets not checked until managed storage and hashes are implemented.
+    pub unchecked_managed_assets: u64,
+}
+
+impl LibraryDiagnostics {
+    /// Returns whether every implemented diagnostic check passed.
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        self.schema_version == self.supported_schema_version
+            && self.sqlite_integrity_errors.is_empty()
+            && self.foreign_key_violations == 0
+            && self.fts_error.is_none()
+            && self.books_without_assets == 0
+            && self.duplicate_book_formats == 0
+            && self.duplicate_reference_paths == 0
+            && self.invalid_asset_relationships == 0
+            && self.referenced_files.missing == 0
+            && self.referenced_files.unreadable == 0
+            && self.referenced_files.invalid_paths == 0
+            && self.referenced_files.stale_health == 0
+    }
+}
+
+/// Compact operational counts for one library.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LibraryStats {
+    /// Number of logical books.
+    pub books: u64,
+    /// Number of attached file assets.
+    pub assets: u64,
+    /// Number of cached book covers.
+    pub covers: u64,
+    /// Number of EPUB assets.
+    pub epub_assets: u64,
+    /// Number of PDF assets.
+    pub pdf_assets: u64,
+    /// Number of externally referenced assets.
+    pub referenced_assets: u64,
+    /// Number of Lectern-managed assets.
+    pub managed_assets: u64,
+    /// Number of assets not checked since import or migration.
+    pub unknown_assets: u64,
+    /// Number of assets last observed as available.
+    pub available_assets: u64,
+    /// Number of assets last observed as missing.
+    pub missing_assets: u64,
+    /// Number of assets last observed as unreadable.
+    pub unreadable_assets: u64,
+}
+
+/// Outcome of a consistent library database snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackupReport {
+    /// Final backup path.
+    pub destination: PathBuf,
+    /// Snapshot size after durable publication.
+    pub bytes: u64,
+    /// Logical-book count captured in the snapshot.
+    pub books: u64,
+}
+
 /// Complete editable metadata for a library entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Book {
@@ -426,6 +566,150 @@ pub struct BookDraft {
     pub format: BookFormat,
     /// Original ebook path.
     pub source_path: PathBuf,
+}
+
+/// Logical book and assets ready for transactional import.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BookImport {
+    /// Metadata shared by every file representation.
+    pub book: BookMetadataDraft,
+    /// One or more file representations to attach to the book.
+    pub assets: Vec<BookAssetDraft>,
+    /// Optional JPEG thumbnail bytes shared by the logical book.
+    pub cover_thumbnail: Option<Vec<u8>>,
+}
+
+/// Single-publication compatibility input for transactional import.
+///
+/// New import adapters that know several files represent one book should use [`BookImport`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportRecord {
+    /// Parsed metadata, format, and source path.
+    pub book: BookDraft,
+    /// Optional JPEG thumbnail bytes.
+    pub cover_thumbnail: Option<Vec<u8>>,
+}
+
+/// Product policy applied when an import resolves to an already-known referenced path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReimportMetadataPolicy {
+    /// Keep user-edited metadata and refresh only assets and cover data.
+    #[default]
+    PreserveExisting,
+    /// Replace stored metadata with the newly parsed publication metadata.
+    ReplaceExisting,
+}
+
+/// Workflow-level application boundary used by Lectern frontends.
+///
+/// Implementations compose domain policy with persistence, publication parsing, and filesystem
+/// adapters. Desktop and command-line frontends should depend on this boundary instead of invoking
+/// a database adapter directly.
+#[allow(clippy::missing_errors_doc)]
+pub trait LibraryService {
+    /// Failure returned by the composed workflow implementation.
+    type Error: Error + Send + Sync + 'static;
+
+    /// Returns all compact results matching a library projection.
+    fn query_library(&mut self, query: &LibraryQuery) -> Result<Vec<BookSummary>, Self::Error>;
+
+    /// Returns a bounded result page and its matching count.
+    fn query_library_page(
+        &mut self,
+        query: &LibraryQuery,
+        offset: u64,
+        limit: u32,
+    ) -> Result<LibraryPage, Self::Error>;
+
+    /// Returns a bounded result window without recounting the projection.
+    fn query_library_window(
+        &mut self,
+        query: &LibraryQuery,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<BookSummary>, Self::Error>;
+
+    /// Loads complete metadata and assets for one book.
+    fn get_book(&mut self, id: BookId) -> Result<Option<Book>, Self::Error>;
+
+    /// Persists normalized editable metadata without changing asset relationships.
+    fn update_metadata(&mut self, edit: &organisation::BookEdit) -> Result<(), Self::Error>;
+
+    /// Returns bounded contributor suggestions, prioritizing selected values.
+    fn autocomplete_contributors(
+        &mut self,
+        prefix: &str,
+        selected: &[organisation::ContributorId],
+        limit: u32,
+    ) -> Result<Vec<organisation::ContributorUsage>, Self::Error>;
+
+    /// Returns bounded series suggestions, prioritizing selected values.
+    fn autocomplete_series(
+        &mut self,
+        prefix: &str,
+        selected: &[organisation::SeriesId],
+        limit: u32,
+    ) -> Result<Vec<organisation::SeriesUsage>, Self::Error>;
+
+    /// Returns bounded tag suggestions, prioritizing selected values.
+    fn autocomplete_tags(
+        &mut self,
+        prefix: &str,
+        selected: &[organisation::TagId],
+        limit: u32,
+    ) -> Result<Vec<organisation::TagUsage>, Self::Error>;
+
+    /// Discovers, parses, and imports publications using the application's merge policy.
+    fn import_publications(
+        &mut self,
+        roots: &[PathBuf],
+        report_progress: &mut dyn FnMut(ImportProgress),
+    ) -> Result<ImportSummary, Self::Error>;
+
+    /// Validates and attaches a referenced publication to a logical book.
+    fn attach_asset(
+        &mut self,
+        book: BookId,
+        format: BookFormat,
+        path: &Path,
+    ) -> Result<AssetId, Self::Error>;
+
+    /// Detaches one non-final asset relationship.
+    fn detach_asset(&mut self, asset: AssetId) -> Result<BookId, Self::Error>;
+
+    /// Relinks an unavailable referenced asset after validating its replacement.
+    fn relink_asset(
+        &mut self,
+        asset: AssetId,
+        format: BookFormat,
+        replacement_path: &Path,
+    ) -> Result<(), Self::Error>;
+
+    /// Deliberately replaces a referenced asset after validating its replacement.
+    fn replace_asset(
+        &mut self,
+        asset: AssetId,
+        format: BookFormat,
+        replacement_path: &Path,
+    ) -> Result<(), Self::Error>;
+
+    /// Removes one logical book while leaving publication files untouched.
+    fn remove_book(&mut self, id: BookId) -> Result<bool, Self::Error>;
+
+    /// Rechecks externally referenced files and stores changed health observations.
+    fn scan_assets(&mut self) -> Result<AssetHealthReport, Self::Error>;
+
+    /// Creates a consistent database snapshot at a new destination.
+    fn backup(&mut self, destination: &Path) -> Result<BackupReport, Self::Error>;
+
+    /// Runs read-only integrity, relationship, index, and referenced-file checks.
+    fn doctor(&mut self) -> Result<LibraryDiagnostics, Self::Error>;
+
+    /// Returns compact library and asset counts.
+    fn stats(&mut self) -> Result<LibraryStats, Self::Error>;
+
+    /// Loads a cached JPEG cover thumbnail.
+    fn load_cover(&mut self, id: BookId) -> Result<Option<Vec<u8>>, Self::Error>;
 }
 
 #[cfg(test)]

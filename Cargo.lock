@@ -2044,6 +2044,7 @@ dependencies = [
  "lectern-core",
  "lectern-desktop",
  "lectern-import",
+ "lectern-service",
  "lectern-storage",
  "lopdf",
  "rusqlite",
@@ -2056,6 +2057,7 @@ name = "lectern-cli"
 version = "0.1.0"
 dependencies = [
  "lectern-core",
+ "lectern-service",
 ]
 
 [[package]]
@@ -2071,12 +2073,10 @@ name = "lectern-desktop"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
- "directories",
  "eframe",
  "image",
  "lectern-core",
- "lectern-import",
- "lectern-storage",
+ "lectern-service",
  "rfd",
  "serde",
  "serde_json",
@@ -2100,10 +2100,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lectern-service"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "lectern-core",
+ "lectern-import",
+ "lectern-storage",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "lectern-storage"
 version = "0.1.0"
 dependencies = [
  "lectern-core",
+ "rayon",
  "rusqlite",
  "thiserror 2.0.20",
 ]

@@ -18,8 +18,8 @@ use std::{
 use image::{Rgb, RgbImage, codecs::jpeg::JpegEncoder};
 use lectern_core::organisation::ExactFacets;
 use lectern_core::{
-    AssetHealth, AssetId, AssetStorage, Book, BookAssetDraft, BookDraft, BookFormat,
-    BookMetadataDraft, BookSummary, LibraryQuery, SortOrder,
+    AssetHealth, AssetId, AssetStorage, Book, BookAssetDraft, BookDraft, BookFormat, BookImport,
+    BookMetadataDraft, BookSummary, ImportRecord, LibraryQuery, LibraryService, SortOrder,
 };
 use lectern_desktop::export::{
     EXPORT_BUFFER_BYTES, ExportControl, ExportError, OverwritePolicy, export_file,
@@ -27,7 +27,8 @@ use lectern_desktop::export::{
 use lectern_import::{
     ImportProgress, ImportSummary, discover_publications, import_paths, validate_publication,
 };
-use lectern_storage::{BookImport, ImportRecord, LibraryDatabase};
+use lectern_service::{LibraryServiceError, SqliteLibraryService};
+use lectern_storage::{LibraryDatabase, StorageError};
 use lopdf::{
     Document, Object, Stream,
     content::{Content, Operation},
@@ -66,6 +67,7 @@ Usage:
   lectern-benchmark replace --database PATH --output PATH [OPTIONS]
   lectern-benchmark export --database PATH --output PATH [OPTIONS]
   lectern-benchmark reimport --database PATH --output PATH [OPTIONS]
+  lectern-benchmark maintenance --database PATH --output PATH [OPTIONS]
   lectern-benchmark import --database PATH --corpus PATH --output PATH [OPTIONS]
 
 Seed options:
@@ -100,6 +102,10 @@ Export options:
 
 Re-import options:
   --iterations N     Measured known-path re-imports (default: 100)
+  --warmup N         Warmup iterations (default: 10)
+
+Maintenance options:
+  --iterations N     Measured doctor and backup iterations (default: 100)
   --warmup N         Warmup iterations (default: 10)
 
 Import options:
@@ -140,6 +146,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         "replace" => run_replace(&QueryOptions::parse(&mut args)?),
         "export" => run_export(&QueryOptions::parse(&mut args)?),
         "reimport" => run_reimport(&QueryOptions::parse(&mut args)?),
+        "maintenance" => run_maintenance(&QueryOptions::parse(&mut args)?),
         "import" => run_import(&ImportOptions::parse(&mut args)?),
         _ => Err(format!(
             "unknown command '{command}'. Run 'lectern-benchmark --help' for usage"
@@ -2439,6 +2446,217 @@ fn validate_reimported_book(
         return Err(format!(
             "re-import changed the cover for book {}",
             candidate.original.id
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct MaintenanceResult {
+    schema_version: u32,
+    kind: &'static str,
+    measured_at_unix_ms: u128,
+    database_path: String,
+    library_books: u64,
+    library_assets: u64,
+    warmup_iterations: usize,
+    measured_iterations: usize,
+    minimum_backup_bytes: u64,
+    maximum_backup_bytes: u64,
+    referenced_files_checked: u64,
+    verified_checks: Vec<&'static str>,
+    scenarios: Vec<MaintenanceScenarioResult>,
+}
+
+#[derive(Serialize)]
+struct MaintenanceScenarioResult {
+    name: &'static str,
+    successful_operations: usize,
+    latency_ms: LatencySummary,
+    samples_ns: Vec<u64>,
+}
+
+struct MaintenanceMeasurements {
+    rounds: usize,
+    doctor_samples: Vec<u64>,
+    backup_samples: Vec<u64>,
+    backup_sizes: Vec<u64>,
+    referenced_files_checked: u64,
+}
+
+fn run_maintenance(options: &QueryOptions) -> Result<(), String> {
+    ensure_distinct_paths("database", &options.database, "output", &options.output)?;
+    if !options.database.is_file() {
+        return Err(format!(
+            "benchmark database is not a file: {}",
+            options.database.display()
+        ));
+    }
+    let workload = options
+        .output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| "maintenance output must have a parent directory".to_owned())?
+        .join("maintenance-workload");
+    fs::create_dir(&workload).map_err(display_error)?;
+
+    let mut service =
+        SqliteLibraryService::open_existing(&options.database).map_err(display_error)?;
+    let stats = service.stats().map_err(display_error)?;
+    if stats.books == 0 || stats.assets == 0 {
+        return Err("maintenance benchmark requires a populated library".into());
+    }
+    let measurements = measure_maintenance(&mut service, options, &workload, stats)?;
+    verify_backup_collision(&mut service, &workload)?;
+    let minimum_backup_bytes = *measurements
+        .backup_sizes
+        .iter()
+        .min()
+        .ok_or_else(|| "maintenance benchmark produced no backup sizes".to_owned())?;
+    let maximum_backup_bytes = *measurements
+        .backup_sizes
+        .iter()
+        .max()
+        .ok_or_else(|| "maintenance benchmark produced no backup sizes".to_owned())?;
+    let result = MaintenanceResult {
+        schema_version: 1,
+        kind: "maintenance",
+        measured_at_unix_ms: unix_time_ms()?,
+        database_path: options.database.display().to_string(),
+        library_books: stats.books,
+        library_assets: stats.assets,
+        warmup_iterations: options.warmup,
+        measured_iterations: options.iterations,
+        minimum_backup_bytes,
+        maximum_backup_bytes,
+        referenced_files_checked: measurements.referenced_files_checked,
+        verified_checks: vec![
+            "sqlite_integrity",
+            "foreign_keys",
+            "fts_consistency",
+            "asset_relationships",
+            "referenced_file_partition",
+            "backup_snapshot_count",
+            "backup_snapshot_integrity",
+            "backup_collision_preserved",
+        ],
+        scenarios: vec![
+            MaintenanceScenarioResult {
+                name: "backup_snapshot",
+                successful_operations: measurements.rounds,
+                latency_ms: summarize_latency(&measurements.backup_samples),
+                samples_ns: measurements.backup_samples,
+            },
+            MaintenanceScenarioResult {
+                name: "doctor_library",
+                successful_operations: measurements.rounds,
+                latency_ms: summarize_latency(&measurements.doctor_samples),
+                samples_ns: measurements.doctor_samples,
+            },
+        ],
+    };
+    write_json(&options.output, &result)?;
+    println!(
+        "Measured backup and doctor over {} books: backup p95 {:.3} ms, doctor p95 {:.3} ms",
+        result.library_books,
+        result.scenarios[0].latency_ms.p95,
+        result.scenarios[1].latency_ms.p95,
+    );
+    Ok(())
+}
+
+fn measure_maintenance(
+    service: &mut SqliteLibraryService,
+    options: &QueryOptions,
+    workload: &Path,
+    stats: lectern_core::LibraryStats,
+) -> Result<MaintenanceMeasurements, String> {
+    let rounds = options
+        .warmup
+        .checked_add(options.iterations)
+        .ok_or_else(|| "maintenance iteration count overflowed".to_owned())?;
+    let mut doctor_samples = Vec::with_capacity(options.iterations);
+    let mut backup_samples = Vec::with_capacity(options.iterations);
+    let mut backup_sizes = Vec::with_capacity(rounds);
+    let mut referenced_files_checked = 0;
+
+    for round in 0..rounds {
+        let doctor_started = Instant::now();
+        let diagnostics = service.doctor().map_err(display_error)?;
+        let doctor_elapsed = doctor_started.elapsed();
+        validate_maintenance_diagnostics(&diagnostics, stats.referenced_assets)?;
+        referenced_files_checked = diagnostics.referenced_files.checked;
+
+        let destination = workload.join(format!("snapshot-{round:03}.sqlite3"));
+        let backup_started = Instant::now();
+        let backup = service.backup(&destination).map_err(display_error)?;
+        let backup_elapsed = backup_started.elapsed();
+        if backup.destination != destination || backup.books != stats.books || backup.bytes == 0 {
+            return Err(format!(
+                "maintenance backup did not reconcile: {}",
+                destination.display()
+            ));
+        }
+        backup_sizes.push(backup.bytes);
+        fs::remove_file(&destination).map_err(display_error)?;
+
+        if round >= options.warmup {
+            doctor_samples.push(duration_ns(doctor_elapsed)?);
+            backup_samples.push(duration_ns(backup_elapsed)?);
+        }
+    }
+    Ok(MaintenanceMeasurements {
+        rounds,
+        doctor_samples,
+        backup_samples,
+        backup_sizes,
+        referenced_files_checked,
+    })
+}
+
+fn verify_backup_collision(
+    service: &mut SqliteLibraryService,
+    workload: &Path,
+) -> Result<(), String> {
+    let collision = workload.join("existing.sqlite3");
+    fs::write(&collision, b"existing backup destination").map_err(display_error)?;
+    let rejected = matches!(
+        service.backup(&collision),
+        Err(LibraryServiceError::Storage(
+            StorageError::BackupDestinationExists(_)
+        ))
+    ) && fs::read(&collision).map_err(display_error)?
+        == b"existing backup destination";
+    if !rejected {
+        return Err("maintenance backup overwrote or accepted an existing destination".into());
+    }
+    Ok(())
+}
+
+fn validate_maintenance_diagnostics(
+    diagnostics: &lectern_core::LibraryDiagnostics,
+    referenced_assets: u64,
+) -> Result<(), String> {
+    let files = diagnostics.referenced_files;
+    let partitioned_files = files
+        .available
+        .checked_add(files.missing)
+        .and_then(|count| count.checked_add(files.unreadable))
+        .and_then(|count| count.checked_add(files.invalid_paths))
+        .ok_or_else(|| "maintenance file-health counts overflowed".to_owned())?;
+    if diagnostics.schema_version != diagnostics.supported_schema_version
+        || !diagnostics.sqlite_integrity_errors.is_empty()
+        || diagnostics.foreign_key_violations != 0
+        || diagnostics.fts_error.is_some()
+        || diagnostics.books_without_assets != 0
+        || diagnostics.duplicate_book_formats != 0
+        || diagnostics.duplicate_reference_paths != 0
+        || diagnostics.invalid_asset_relationships != 0
+        || files.checked != referenced_assets
+        || partitioned_files != files.checked
+    {
+        return Err(format!(
+            "maintenance diagnostics did not reconcile: {diagnostics:#?}"
         ));
     }
     Ok(())

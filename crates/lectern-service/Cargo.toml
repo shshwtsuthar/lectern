@@ -1,15 +1,16 @@
 [package]
-name = "lectern-storage"
-description = "SQLite persistence adapter for Lectern"
+name = "lectern-service"
+description = "Workflow-level application service for Lectern"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+directories.workspace = true
 lectern-core.workspace = true
-rayon.workspace = true
-rusqlite.workspace = true
+lectern-import.workspace = true
+lectern-storage.workspace = true
 thiserror.workspace = true
 
 [lints]

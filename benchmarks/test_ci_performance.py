@@ -20,15 +20,36 @@ class CiPerformanceTests(unittest.TestCase):
     def test_checked_in_registry_is_valid(self) -> None:
         registry = CI_PERFORMANCE.load_registry(CI_PERFORMANCE.DEFAULT_REGISTRY)
 
-        self.assertEqual(registry["suites"][0]["name"], "query-full-v1")
-        self.assertEqual(registry["suites"][1]["name"], "query-full-covered-v1")
-        self.assertEqual(registry["suites"][3]["name"], "query-page-covered-v1")
-        self.assertEqual(registry["suites"][4]["name"], "remove-book-v1")
-        self.assertEqual(registry["suites"][5]["name"], "attach-format-v1")
+        self.assertEqual(
+            [suite["name"] for suite in registry["suites"]],
+            [
+                "maintenance-v1",
+                "query-full-v1",
+                "query-full-covered-v1",
+                "query-page-v1",
+                "query-page-covered-v1",
+                "remove-book-v1",
+                "attach-format-v1",
+                "detach-asset-v1",
+                "replace-asset-v1",
+                "export-asset-v1",
+                "reimport-known-path-v1",
+                "organisation-migration-v1",
+                "organisation-query-v1",
+                "organisation-vocabulary-v1",
+            ],
+        )
         self.assertIn(
             {
                 "name": "reimport-known-path-v1",
                 "budget": "benchmarks/reimport-known-path-regression-v1.json",
+            },
+            registry["suites"],
+        )
+        self.assertIn(
+            {
+                "name": "maintenance-v1",
+                "budget": "benchmarks/maintenance-regression-v1.json",
             },
             registry["suites"],
         )

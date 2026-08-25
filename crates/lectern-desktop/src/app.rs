@@ -7,11 +7,10 @@ use std::{
     },
 };
 
-use directories::ProjectDirs;
 use eframe::egui::{self, Align, Color32, FontId, RichText, Sense, Stroke, StrokeKind, Vec2};
 use lectern_core::{
     AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookFormat, BookId, BookSummary,
-    LibraryQuery, SortOrder,
+    ImportProgress, ImportSummary, LibraryQuery, SortOrder,
     organisation::{
         BookEdit, ContributorFacet, ContributorId, ContributorRole, ContributorUsage, ExactFacets,
         SearchExpression, SearchParseError, SeriesId, SeriesIndex, SeriesUsage, TagId, TagUsage,
@@ -19,8 +18,7 @@ use lectern_core::{
     },
 };
 use lectern_desktop::export::{ExportError, ExportProgress, OverwritePolicy};
-use lectern_import::{ImportProgress, ImportSummary};
-use lectern_storage::LibraryDatabase;
+use lectern_service::{SqliteLibraryService, default_database_path};
 
 use crate::{
     benchmark::{BenchmarkFrame, DesktopBenchmark},
@@ -371,7 +369,7 @@ impl LecternApp {
     ) -> Self {
         configure_style(&creation_context.egui_ctx);
         let database_path = default_database_path();
-        let status = match LibraryDatabase::open(&database_path) {
+        let status = match SqliteLibraryService::open(&database_path) {
             Ok(_) => "Library ready".to_owned(),
             Err(error) => format!("Could not open library: {error}"),
         };
@@ -2672,16 +2670,6 @@ fn cover_image(texture: impl Into<egui::load::SizedTexture>) -> egui::Image<'sta
         .corner_radius(7)
 }
 
-fn default_database_path() -> PathBuf {
-    if let Some(directory) = std::env::var_os("LECTERN_DATA_DIR") {
-        return PathBuf::from(directory).join("library.sqlite3");
-    }
-    ProjectDirs::from("com", "Lectern", "Lectern").map_or_else(
-        || PathBuf::from("lectern-library.sqlite3"),
-        |directories| directories.data_dir().join("library.sqlite3"),
-    )
-}
-
 fn configure_style(context: &egui::Context) {
     context.set_theme(egui::Theme::Dark);
     let mut visuals = egui::Visuals::dark();
@@ -3551,12 +3539,12 @@ mod tests {
     use std::path::PathBuf;
 
     use eframe::egui;
+    use lectern_core::ImportProgress;
     use lectern_core::{
         AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId,
         LibraryQuery,
     };
     use lectern_desktop::export::ExportProgress;
-    use lectern_import::ImportProgress;
 
     use super::{
         BookEditor, CARD_GAP, CARD_WIDTH, COVER_SIZE, QUERY_PAGE_SIZE, apply_search_input,

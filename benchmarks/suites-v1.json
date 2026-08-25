@@ -3,6 +3,10 @@
   "kind": "lectern-performance-suite-registry",
   "suites": [
     {
+      "name": "maintenance-v1",
+      "budget": "benchmarks/maintenance-regression-v1.json"
+    },
+    {
       "name": "query-full-v1",
       "budget": "benchmarks/query-regression-v1.json"
     },

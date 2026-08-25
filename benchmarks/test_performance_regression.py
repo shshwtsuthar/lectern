@@ -412,6 +412,67 @@ def reimport_result() -> dict:
     }
 
 
+def maintenance_budget() -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "lectern-query-regression-budget",
+        "workload": {
+            "query_mode": "maintenance",
+            "books": 50,
+            "seed": 7,
+            "cover_every": 3,
+            "warmup_iterations": 2,
+            "measured_iterations": 3,
+            "scenarios": ["backup_snapshot", "doctor_library"],
+        },
+        "comparison": {
+            "paired_runs": 3,
+            "max_p95_regression_percent": 15,
+            "minimum_p95_delta_ms": 25,
+        },
+        "budgets": {
+            "backup_snapshot": {"max_p95_ms": 3000},
+            "doctor_library": {"max_p95_ms": 2000},
+        },
+    }
+
+
+def maintenance_result() -> dict:
+    checks = [
+        "sqlite_integrity",
+        "foreign_keys",
+        "fts_consistency",
+        "asset_relationships",
+        "referenced_file_partition",
+        "backup_snapshot_count",
+        "backup_snapshot_integrity",
+        "backup_collision_preserved",
+    ]
+
+    def scenario(name: str, p95: float) -> dict:
+        return {
+            "name": name,
+            "successful_operations": 5,
+            "latency_ms": {"p95": p95},
+            "samples_ns": [1_000_000, 2_000_000, 3_000_000],
+        }
+
+    return {
+        "library_books": 50,
+        "library_assets": 50,
+        "warmup_iterations": 2,
+        "measured_iterations": 3,
+        "minimum_backup_bytes": 4096,
+        "maximum_backup_bytes": 4096,
+        "referenced_files_checked": 50,
+        "verified_checks": checks,
+        "scenarios": [
+            scenario("backup_snapshot", 80.0),
+            scenario("doctor_library", 40.0),
+        ],
+    }
+
+
 class PerformanceRegressionTests(unittest.TestCase):
     def test_checked_in_budget_is_valid(self) -> None:
         checked_in = REGRESSION.load_budget(REGRESSION.DEFAULT_BUDGET)
@@ -493,6 +554,14 @@ class PerformanceRegressionTests(unittest.TestCase):
 
         self.assertEqual(checked_in["workload"]["query_mode"], "export")
         self.assertEqual(checked_in["workload"]["source_bytes"], 268_435_456)
+
+    def test_checked_in_maintenance_budget_is_valid(self) -> None:
+        checked_in = REGRESSION.load_budget(
+            pathlib.Path(__file__).with_name("maintenance-regression-v1.json")
+        )
+
+        self.assertEqual(checked_in["workload"]["query_mode"], "maintenance")
+        self.assertEqual(checked_in["budgets"]["backup_snapshot"]["max_p95_ms"], 3000)
 
     def test_load_budget_rejects_unpaired_ratio_fields(self) -> None:
         invalid = budget()
@@ -606,6 +675,20 @@ class PerformanceRegressionTests(unittest.TestCase):
         )
 
         self.assertTrue(all(decision["passed"] for decision in decisions))
+
+    def test_evaluate_maintenance_result_accepts_reconciled_workload(self) -> None:
+        decisions = REGRESSION.evaluate_maintenance_result(
+            maintenance_result(), maintenance_budget()
+        )
+
+        self.assertTrue(all(decision["passed"] for decision in decisions))
+
+    def test_evaluate_maintenance_result_requires_all_correctness_checks(self) -> None:
+        invalid = maintenance_result()
+        invalid["verified_checks"].remove("backup_snapshot_integrity")
+
+        with self.assertRaisesRegex(REGRESSION.RegressionError, "correctness checks"):
+            REGRESSION.evaluate_maintenance_result(invalid, maintenance_budget())
 
     def test_evaluate_replace_result_accepts_reconciled_workload(self) -> None:
         decisions = REGRESSION.evaluate_replace_result(replace_result(), replace_budget())

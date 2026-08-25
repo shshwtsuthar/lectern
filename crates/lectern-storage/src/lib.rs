@@ -5,8 +5,9 @@ mod organisation;
 use std::{
     cell::Cell,
     ffi::OsString,
-    fs::File,
+    fs::{File, OpenOptions},
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -22,10 +23,12 @@ use lectern_core::organisation::{
     TagReference, TagUsage, TextMatch, VocabularyMutationResult, identity_key, normalize_name,
 };
 use lectern_core::{
-    AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookAssetDraft,
-    BookDraft, BookFormat, BookId, BookMetadataDraft, BookSummary, LibraryPage, LibraryQuery,
-    SortOrder,
+    AssetHealth, AssetHealthReport, AssetId, AssetStorage, BackupReport, Book, BookAsset,
+    BookAssetDraft, BookDraft, BookFormat, BookId, BookImport, BookMetadataDraft, BookSummary,
+    ImportRecord, LibraryDiagnostics, LibraryPage, LibraryQuery, LibraryStats,
+    ReferencedFileDiagnostics, ReimportMetadataPolicy, SortOrder,
 };
+use rayon::prelude::*;
 use rusqlite::{
     Connection, OptionalExtension, Statement, Transaction, TransactionBehavior, params,
 };
@@ -35,6 +38,8 @@ use thiserror::Error;
 compile_error!("Lectern's lossless path codec currently supports Unix and Windows targets");
 
 const SCHEMA_VERSION: i64 = 6;
+const BACKUP_PAGES_PER_STEP: i32 = 2_048;
+static NEXT_BACKUP_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 const SCHEMA: &str = r"
 CREATE TABLE books (
@@ -447,32 +452,16 @@ pub enum StorageError {
     /// A structured library search was invalid and must not be dispatched.
     #[error("invalid structured search: {0}")]
     InvalidSearch(#[from] SearchParseError),
+    /// A backup refused to replace an existing destination.
+    #[error("backup destination already exists: {0}")]
+    BackupDestinationExists(PathBuf),
+    /// A backup destination did not name a file.
+    #[error("backup destination must name a file: {0}")]
+    InvalidBackupDestination(PathBuf),
 }
 
 /// Result type returned by storage operations.
 pub type Result<T> = std::result::Result<T, StorageError>;
-
-/// Logical book and assets ready for transactional import.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BookImport {
-    /// Metadata shared by every file representation.
-    pub book: BookMetadataDraft,
-    /// One or more file representations to attach to the book.
-    pub assets: Vec<BookAssetDraft>,
-    /// Optional JPEG thumbnail bytes shared by the logical book.
-    pub cover_thumbnail: Option<Vec<u8>>,
-}
-
-/// Single-publication compatibility input for transactional import.
-///
-/// New import adapters that know several files represent one book should use [`BookImport`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ImportRecord {
-    /// Parsed metadata, format, and source path.
-    pub book: BookDraft,
-    /// Optional JPEG thumbnail bytes.
-    pub cover_thumbnail: Option<Vec<u8>>,
-}
 
 #[derive(Clone, Copy)]
 enum ReferencePathUpdate {
@@ -557,6 +546,20 @@ impl LibraryDatabase {
     /// Returns an error when an aggregate is invalid, its existing paths resolve to different
     /// books, or the transaction cannot be committed.
     pub fn import_books(&mut self, records: &[BookImport]) -> Result<Vec<BookId>> {
+        self.import_books_with_policy(records, ReimportMetadataPolicy::PreserveExisting)
+    }
+
+    /// Inserts aggregate books using an application-selected metadata merge policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an aggregate is invalid, its existing paths resolve to different
+    /// books, or the transaction cannot be committed.
+    pub fn import_books_with_policy(
+        &mut self,
+        records: &[BookImport],
+        metadata_policy: ReimportMetadataPolicy,
+    ) -> Result<Vec<BookId>> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -571,6 +574,7 @@ impl LibraryDatabase {
                         MetadataInput::from(&record.book),
                         record.assets.iter().map(AssetInput::from),
                         record.cover_thumbnail.as_deref(),
+                        metadata_policy,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -591,6 +595,20 @@ impl LibraryDatabase {
     /// Returns an error when the transaction cannot be started, a record cannot be written, or
     /// the transaction cannot be committed.
     pub fn import_batch(&mut self, records: &[ImportRecord]) -> Result<Vec<BookId>> {
+        self.import_batch_with_policy(records, ReimportMetadataPolicy::PreserveExisting)
+    }
+
+    /// Imports compatibility records using an application-selected metadata merge policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction cannot be started, a record cannot be written, or
+    /// the transaction cannot be committed.
+    pub fn import_batch_with_policy(
+        &mut self,
+        records: &[ImportRecord],
+        metadata_policy: ReimportMetadataPolicy,
+    ) -> Result<Vec<BookId>> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -610,6 +628,7 @@ impl LibraryDatabase {
                         MetadataInput::from(&record.book),
                         std::iter::once(asset),
                         record.cover_thumbnail.as_deref(),
+                        metadata_policy,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -662,6 +681,16 @@ impl LibraryDatabase {
         let offset = i64::try_from(offset).map_err(|_| StorageError::InvalidPageOffset(offset))?;
         let plan = LibraryQueryPlan::new(query)?;
         let transaction = self.connection.transaction()?;
+
+        if offset == 0 && limit > 0 && plan.has_full_text_search {
+            let (total, books) = query_first_page_with_total(&transaction, &plan, limit)?;
+            transaction.commit()?;
+            return Ok(LibraryPage {
+                total,
+                offset: page_offset,
+                books,
+            });
+        }
 
         let total = {
             let count_sql = format!(
@@ -1635,6 +1664,227 @@ impl LibraryDatabase {
         result
     }
 
+    /// Creates a transactionally consistent database snapshot at a new path.
+    ///
+    /// The online `SQLite` backup API includes committed pages that remain in an active WAL without
+    /// copying WAL or shared-memory sidecars. The snapshot is built and checked in a reserved
+    /// sibling file, synced, and then published without replacing an existing destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the destination already exists, its parent cannot be created, `SQLite`
+    /// cannot finish or validate the snapshot, or the completed file cannot be published.
+    pub fn backup(&self, destination: impl AsRef<Path>) -> Result<BackupReport> {
+        let destination = destination.as_ref();
+        let file_name = destination
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| StorageError::InvalidBackupDestination(destination.to_path_buf()))?;
+        if destination.exists() {
+            return Err(StorageError::BackupDestinationExists(
+                destination.to_path_buf(),
+            ));
+        }
+
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let temporary = TemporaryBackup::reserve(parent, file_name)?;
+
+        let mut snapshot = Connection::open(temporary.path())?;
+        // The destination is an unpublished, newly created file, so rollback journaling cannot
+        // protect any prior user data. Avoid the journal and SQLite's intermediate syncs, then
+        // explicitly sync the completed, validated snapshot once before publishing it. This keeps
+        // the durability boundary while avoiding redundant writes for large libraries.
+        snapshot.pragma_update(None, "journal_mode", "OFF")?;
+        snapshot.pragma_update(None, "synchronous", "OFF")?;
+        {
+            let backup = rusqlite::backup::Backup::new(&self.connection, &mut snapshot)?;
+            // Release SQLite's source lock between bounded 8 MiB chunks. Smaller chunks add one
+            // millisecond of unconditional scheduler sleep each, which dominates large snapshots;
+            // this remains responsive to other connections without adding hundreds of pauses.
+            backup.run_to_completion(BACKUP_PAGES_PER_STEP, Duration::from_millis(1), None)?;
+        }
+
+        let integrity: String = snapshot.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if !integrity.eq_ignore_ascii_case("ok") {
+            return Err(StorageError::Integrity(format!(
+                "backup quick check failed: {integrity}"
+            )));
+        }
+        let books =
+            validated_count(
+                snapshot.query_row("SELECT count(*) FROM books", [], |row| row.get(0))?,
+            )?;
+        drop(snapshot);
+        OpenOptions::new()
+            .read(true)
+            .open(temporary.path())?
+            .sync_all()?;
+
+        match std::fs::hard_link(temporary.path(), destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(StorageError::BackupDestinationExists(
+                    destination.to_path_buf(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let bytes = std::fs::metadata(destination)?.len();
+
+        Ok(BackupReport {
+            destination: destination.to_path_buf(),
+            bytes,
+            books,
+        })
+    }
+
+    /// Runs read-only database, index, relationship, and referenced-file checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the diagnostic queries themselves cannot run. Findings such as
+    /// corrupt pages, an inconsistent FTS index, or unavailable files are returned in the report.
+    pub fn diagnostics(&self) -> Result<LibraryDiagnostics> {
+        let schema_version = self
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+
+        let sqlite_integrity_errors = collect_integrity_errors(&self.connection)?;
+        let foreign_key_violations = collect_foreign_key_violations(&self.connection)?;
+
+        let fts_error = self
+            .connection
+            .execute(
+                "INSERT INTO books_fts(books_fts, rank) VALUES ('integrity-check', 1)",
+                [],
+            )
+            .err()
+            .map(|error| error.to_string());
+
+        let books_without_assets = diagnostic_count(
+            &self.connection,
+            "SELECT count(*) FROM books b \
+             WHERE NOT EXISTS (SELECT 1 FROM book_assets a WHERE a.book_id = b.id)",
+        )?;
+        let duplicate_book_formats = diagnostic_count(
+            &self.connection,
+            "SELECT count(*) FROM ( \
+                 SELECT 1 FROM book_assets GROUP BY book_id, format HAVING count(*) > 1 \
+             )",
+        )?;
+        let duplicate_reference_paths = diagnostic_count(
+            &self.connection,
+            "SELECT count(*) FROM ( \
+                 SELECT 1 FROM book_assets WHERE storage_mode = 'reference' \
+                 GROUP BY path_encoding, path HAVING count(*) > 1 \
+             )",
+        )?;
+        let invalid_asset_relationships = diagnostic_count(
+            &self.connection,
+            "SELECT count(*) FROM book_assets a \
+             LEFT JOIN books b ON b.id = a.book_id \
+             WHERE b.id IS NULL \
+                OR a.format NOT IN ('epub', 'pdf') \
+                OR a.storage_mode NOT IN ('reference', 'managed') \
+                OR a.health NOT IN ('unknown', 'available', 'missing', 'unreadable') \
+                OR a.path_encoding NOT IN ('utf8', 'unix', 'windows') \
+                OR length(a.path) = 0 \
+                OR (a.storage_mode = 'managed' AND a.path_encoding <> 'utf8') \
+                OR (a.path_encoding = 'windows' AND length(a.path) % 2 <> 0)",
+        )?;
+        let unchecked_managed_assets = diagnostic_count(
+            &self.connection,
+            "SELECT count(*) FROM book_assets WHERE storage_mode = 'managed'",
+        )?;
+
+        let referenced_files = collect_referenced_file_diagnostics(&self.connection)?;
+
+        Ok(LibraryDiagnostics {
+            schema_version,
+            supported_schema_version: SCHEMA_VERSION,
+            sqlite_integrity_errors,
+            foreign_key_violations,
+            fts_error,
+            books_without_assets,
+            duplicate_book_formats,
+            duplicate_reference_paths,
+            invalid_asset_relationships,
+            referenced_files,
+            unchecked_managed_assets,
+        })
+    }
+
+    /// Returns compact library and asset counts using one read transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the aggregate query fails or `SQLite` returns a negative count.
+    pub fn stats(&self) -> Result<LibraryStats> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let counts = transaction.query_row(
+            "SELECT \
+                 (SELECT count(*) FROM books), \
+                 count(*), \
+                 (SELECT count(*) FROM book_covers), \
+                 count(*) FILTER (WHERE format = 'epub'), \
+                 count(*) FILTER (WHERE format = 'pdf'), \
+                 count(*) FILTER (WHERE storage_mode = 'reference'), \
+                 count(*) FILTER (WHERE storage_mode = 'managed'), \
+                 count(*) FILTER (WHERE health = 'unknown'), \
+                 count(*) FILTER (WHERE health = 'available'), \
+                 count(*) FILTER (WHERE health = 'missing'), \
+                 count(*) FILTER (WHERE health = 'unreadable') \
+             FROM book_assets",
+            [],
+            |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ])
+            },
+        )?;
+        transaction.commit()?;
+        let [
+            books,
+            assets,
+            covers,
+            epub_assets,
+            pdf_assets,
+            referenced_assets,
+            managed_assets,
+            unknown_assets,
+            available_assets,
+            missing_assets,
+            unreadable_assets,
+        ] = counts;
+        Ok(LibraryStats {
+            books: validated_count(books)?,
+            assets: validated_count(assets)?,
+            covers: validated_count(covers)?,
+            epub_assets: validated_count(epub_assets)?,
+            pdf_assets: validated_count(pdf_assets)?,
+            referenced_assets: validated_count(referenced_assets)?,
+            managed_assets: validated_count(managed_assets)?,
+            unknown_assets: validated_count(unknown_assets)?,
+            available_assets: validated_count(available_assets)?,
+            missing_assets: validated_count(missing_assets)?,
+            unreadable_assets: validated_count(unreadable_assets)?,
+        })
+    }
+
     fn update_reference_asset_path(
         &mut self,
         id: AssetId,
@@ -1730,6 +1980,134 @@ impl LibraryDatabase {
             .optional()?;
         Ok(cover)
     }
+}
+
+struct TemporaryBackup {
+    path: PathBuf,
+}
+
+impl TemporaryBackup {
+    fn reserve(parent: &Path, destination_name: &std::ffi::OsStr) -> Result<Self> {
+        for _ in 0..1_024 {
+            let id = NEXT_BACKUP_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let mut name = OsString::from(".");
+            name.push(destination_name);
+            name.push(format!(".lectern-backup-{}-{id}.tmp", std::process::id()));
+            let path = parent.join(name);
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    drop(file);
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not reserve a temporary backup path",
+        )))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TemporaryBackup {
+    fn drop(&mut self) {
+        let _removed = std::fs::remove_file(&self.path);
+    }
+}
+
+fn diagnostic_count(connection: &Connection, sql: &str) -> Result<u64> {
+    validated_count(connection.query_row(sql, [], |row| row.get(0))?)
+}
+
+fn collect_integrity_errors(connection: &Connection) -> Result<Vec<String>> {
+    let mut statement = connection.prepare("PRAGMA integrity_check")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut errors = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    if errors.len() == 1 && errors[0].eq_ignore_ascii_case("ok") {
+        errors.clear();
+    }
+    Ok(errors)
+}
+
+fn collect_foreign_key_violations(connection: &Connection) -> Result<u64> {
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = statement.query([])?;
+    let mut count = 0_u64;
+    while rows.next()?.is_some() {
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn collect_referenced_file_diagnostics(
+    connection: &Connection,
+) -> Result<ReferencedFileDiagnostics> {
+    let mut invalid_paths = 0_u64;
+    let mut assets = Vec::new();
+    let mut statement = connection.prepare(
+        "SELECT health, path_encoding, path FROM book_assets \
+         WHERE storage_mode = 'reference' ORDER BY id",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let stored_health = decode_health(&row.get::<_, String>(0)?)?;
+        let path_encoding = row.get::<_, String>(1)?;
+        let path = match decode_path(&path_encoding, row.get(2)?) {
+            Ok(path) => path,
+            Err(StorageError::InvalidPathEncoding(_) | StorageError::InvalidPathData(_)) => {
+                invalid_paths += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        assets.push((stored_health, path));
+    }
+    let mut diagnostics = assets
+        .par_iter()
+        .fold(ReferencedFileDiagnostics::default, |mut report, asset| {
+            let (stored_health, path) = asset;
+            let observed_health = inspect_reference_asset(path);
+            report.checked += 1;
+            match observed_health {
+                AssetHealth::Available => report.available += 1,
+                AssetHealth::Missing => report.missing += 1,
+                AssetHealth::Unreadable => report.unreadable += 1,
+                AssetHealth::Unknown => {
+                    unreachable!("a diagnostic must produce a concrete health")
+                }
+            }
+            if *stored_health != observed_health {
+                report.stale_health += 1;
+            }
+            report
+        })
+        .reduce(ReferencedFileDiagnostics::default, merge_file_diagnostics);
+    diagnostics.checked += invalid_paths;
+    diagnostics.invalid_paths = invalid_paths;
+    Ok(diagnostics)
+}
+
+fn merge_file_diagnostics(
+    left: ReferencedFileDiagnostics,
+    right: ReferencedFileDiagnostics,
+) -> ReferencedFileDiagnostics {
+    ReferencedFileDiagnostics {
+        checked: left.checked + right.checked,
+        available: left.available + right.available,
+        missing: left.missing + right.missing,
+        unreadable: left.unreadable + right.unreadable,
+        invalid_paths: left.invalid_paths + right.invalid_paths,
+        stale_health: left.stale_health + right.stale_health,
+    }
+}
+
+fn validated_count(count: i64) -> Result<u64> {
+    u64::try_from(count).map_err(|_| StorageError::InvalidCount(count))
 }
 
 fn configure_persistent_database(connection: &Connection) -> Result<()> {
@@ -1953,6 +2331,7 @@ struct ReferenceAsset {
 struct ImportStatements<'connection> {
     find_reference_owner: Statement<'connection>,
     insert_book: Statement<'connection>,
+    replace_metadata: Statement<'connection>,
     upsert_asset: Statement<'connection>,
     upsert_cover: Statement<'connection>,
 }
@@ -1969,6 +2348,12 @@ impl<'connection> ImportStatements<'connection> {
                      title, sort_title, authors, sort_authors, series, publisher, language, \
                      description \
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?,
+            replace_metadata: transaction.prepare(
+                "UPDATE books SET \
+                     title = ?1, sort_title = ?2, authors = ?3, sort_authors = ?4, \
+                     series = ?5, publisher = ?6, language = ?7, description = ?8, \
+                     modified_at = unixepoch() WHERE id = ?9",
             )?,
             upsert_asset: transaction.prepare(
                 "INSERT INTO book_assets ( \
@@ -1997,6 +2382,7 @@ fn upsert_book<'a>(
     metadata: MetadataInput<'_>,
     assets: impl IntoIterator<Item = AssetInput<'a>>,
     cover: Option<&[u8]>,
+    metadata_policy: ReimportMetadataPolicy,
 ) -> Result<BookId> {
     let assets = prepare_assets(assets)?;
     let mut owner = None::<i64>;
@@ -2017,6 +2403,25 @@ fn upsert_book<'a>(
     }
 
     let id = if let Some(id) = owner {
+        if metadata_policy == ReimportMetadataPolicy::ReplaceExisting {
+            statements.replace_metadata.execute(params![
+                metadata.title.trim(),
+                sortable(metadata.title),
+                metadata.authors.trim(),
+                sortable(metadata.authors),
+                optional_text(metadata.series),
+                optional_text(metadata.publisher),
+                optional_text(metadata.language),
+                optional_text(metadata.description),
+                id,
+            ])?;
+            organisation::replace_flattened_organisation(
+                transaction,
+                id,
+                metadata.authors,
+                metadata.series,
+            )?;
+        }
         id
     } else {
         statements.insert_book.execute(params![
@@ -2386,6 +2791,7 @@ struct LibraryQueryPlan {
     joins: String,
     where_clause: String,
     order: &'static str,
+    has_full_text_search: bool,
 }
 
 impl LibraryQueryPlan {
@@ -2473,6 +2879,7 @@ impl LibraryQueryPlan {
             joins: joins.join(" "),
             where_clause,
             order,
+            has_full_text_search,
         })
     }
 }
@@ -2583,6 +2990,37 @@ fn query_window_with_plan(
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
+fn query_first_page_with_total(
+    connection: &Connection,
+    plan: &LibraryQueryPlan,
+    limit: u32,
+) -> Result<(u64, Vec<BookSummary>)> {
+    let sql = format!(
+        "SELECT b.id, b.title, b.authors, b.series, b.series_index, \
+         b.has_cover, b.has_file_issue, count(*) OVER() \
+         FROM books b {} {} ORDER BY {} LIMIT ?{}",
+        plan.joins,
+        plan.where_clause,
+        plan.order,
+        plan.bindings.len() + 1,
+    );
+    let mut bindings = plan.bindings.clone();
+    bindings.push(i64::from(limit).into());
+    let mut statement = connection.prepare_cached(&sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(bindings), |row| {
+        Ok((book_summary(row)?, row.get::<_, i64>(7)?))
+    })?;
+    let mut books = Vec::new();
+    let mut total = 0;
+    for row in rows {
+        let (book, count) = row?;
+        if books.is_empty() {
+            total = u64::try_from(count).map_err(|_| StorageError::InvalidCount(count))?;
+        }
+        books.push(book);
+    }
+    Ok((total, books))
+}
 #[cfg(test)]
 mod tests {
     use std::{
@@ -2596,7 +3034,7 @@ mod tests {
 
     use lectern_core::{
         AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAssetDraft, BookFormat,
-        BookId, BookMetadataDraft, LibraryQuery, SortOrder,
+        BookId, BookMetadataDraft, LibraryQuery, ReimportMetadataPolicy, SortOrder,
         organisation::{
             BookEdit, BookSelection, BulkTagEdit, ContributorCreditEdit, ContributorFacet,
             ContributorReference, ContributorRole, ExactFacets, ImportedContributorCredit,
@@ -5273,6 +5711,157 @@ END;
             assert!(details.contains(expected_index), "{details}");
             assert!(details.contains("COVERING"), "{details}");
         }
+    }
+
+    #[test]
+    fn diagnostics_validate_database_index_relationships_and_files() {
+        let asset = TestAsset::file("diagnostics-clean");
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        database
+            .import_books(&[record(
+                asset.path().to_string_lossy().as_ref(),
+                "Dune",
+                "Frank Herbert",
+            )])
+            .expect("import book");
+        database
+            .rescan_reference_assets()
+            .expect("store file health");
+
+        let report = database.diagnostics().expect("run diagnostics");
+
+        assert!(report.is_healthy(), "{report:#?}");
+        assert_eq!(report.schema_version, SCHEMA_VERSION);
+        assert_eq!(report.referenced_files.checked, 1);
+        assert_eq!(report.referenced_files.available, 1);
+        assert_eq!(report.referenced_files.stale_health, 0);
+    }
+
+    #[test]
+    fn diagnostics_report_missing_files_and_books_without_assets() {
+        let asset = TestAsset::file("diagnostics-issues");
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let book = database
+            .import_books(&[record(
+                asset.path().to_string_lossy().as_ref(),
+                "Dune",
+                "Frank Herbert",
+            )])
+            .expect("import book")[0];
+        database
+            .rescan_reference_assets()
+            .expect("store available health");
+        fs::remove_file(asset.path()).expect("remove referenced file");
+        database
+            .connection
+            .execute("DELETE FROM book_assets WHERE book_id = ?1", [book.value()])
+            .expect("remove last asset outside service invariant");
+
+        let report = database.diagnostics().expect("run diagnostics");
+
+        assert!(!report.is_healthy());
+        assert_eq!(report.books_without_assets, 1);
+    }
+
+    #[test]
+    fn diagnostics_report_file_health_without_mutating_it() {
+        let path = temporary_asset_path("diagnostics-missing");
+        fs::write(&path, b"publication").expect("write referenced file");
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        database
+            .import_books(&[record(
+                path.to_string_lossy().as_ref(),
+                "Dune",
+                "Frank Herbert",
+            )])
+            .expect("import book");
+        database
+            .rescan_reference_assets()
+            .expect("store available health");
+        fs::remove_file(&path).expect("remove referenced file");
+
+        let report = database.diagnostics().expect("run diagnostics");
+        let book = database
+            .get_book(BookId::new(1))
+            .expect("load book")
+            .expect("book exists");
+
+        assert_eq!(report.referenced_files.missing, 1);
+        assert_eq!(report.referenced_files.stale_health, 1);
+        assert_eq!(book.assets[0].health, AssetHealth::Available);
+    }
+
+    #[test]
+    fn backup_captures_committed_wal_data_and_refuses_overwrite() {
+        let source = TestDatabase::new("backup-source");
+        let destination = TestDatabase::new("backup-destination");
+        let mut database = LibraryDatabase::open(source.path()).expect("open source library");
+        database
+            .import_books(&[record("/books/dune.epub", "Dune", "Frank Herbert")])
+            .expect("import book into WAL database");
+
+        let report = database.backup(destination.path()).expect("create backup");
+        let backup = LibraryDatabase::open(destination.path()).expect("open backup");
+
+        assert_eq!(report.destination, destination.path());
+        assert!(report.bytes > 0);
+        assert_eq!(report.books, 1);
+        assert_eq!(backup.count().expect("count backup books"), 1);
+        assert!(matches!(
+            database.backup(destination.path()),
+            Err(StorageError::BackupDestinationExists(path)) if path == destination.path()
+        ));
+        assert_eq!(backup.count().expect("backup remains readable"), 1);
+    }
+
+    #[test]
+    fn stats_reconcile_book_asset_cover_and_health_counts() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let mut imported = record("/books/dune.epub", "Dune", "Frank Herbert");
+        imported.cover_thumbnail = Some(vec![1, 2, 3]);
+        database.import_books(&[imported]).expect("import book");
+
+        let stats = database.stats().expect("load stats");
+
+        assert_eq!(stats.books, 1);
+        assert_eq!(stats.assets, 1);
+        assert_eq!(stats.covers, 1);
+        assert_eq!(stats.epub_assets, 1);
+        assert_eq!(stats.referenced_assets, 1);
+        assert_eq!(stats.unknown_assets, 1);
+    }
+
+    #[test]
+    fn explicit_reimport_policy_can_replace_metadata() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let original = record("/books/dune.epub", "Edited title", "Edited author");
+        let id = database.import_books(&[original]).expect("first import")[0];
+        let mut replacement = record("/books/dune.epub", "Parsed title", "Parsed author");
+        replacement.book.series = Some("Dune Saga".into());
+
+        database
+            .import_books_with_policy(&[replacement], ReimportMetadataPolicy::ReplaceExisting)
+            .expect("replace metadata on reimport");
+        let stored = database
+            .get_book(id)
+            .expect("load book")
+            .expect("book exists");
+
+        assert_eq!(stored.title, "Parsed title");
+        assert_eq!(stored.authors, "Parsed author");
+        assert_eq!(stored.contributors.len(), 1);
+        assert_eq!(
+            stored.contributors[0].contributor.display_name,
+            "Parsed author"
+        );
+        assert_eq!(stored.series.as_deref(), Some("Dune Saga"));
+        assert_eq!(
+            stored
+                .series_membership
+                .as_ref()
+                .map(|membership| membership.series.name.as_str()),
+            Some("Dune Saga")
+        );
     }
 
     #[test]

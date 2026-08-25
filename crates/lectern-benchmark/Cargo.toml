@@ -15,6 +15,7 @@ path = "src/main.rs"
 image.workspace = true
 lectern-core.workspace = true
 lectern-import.workspace = true
+lectern-service.workspace = true
 lectern-desktop = { path = "../lectern-desktop" }
 lectern-storage.workspace = true
 lopdf.workspace = true

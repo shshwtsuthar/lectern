@@ -13,7 +13,8 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use eframe::egui;
 use image::{ImageReader, Limits};
 use lectern_core::{
-    AssetHealthReport, AssetId, Book, BookFormat, BookId, BookSummary, LibraryQuery,
+    AssetHealthReport, AssetId, Book, BookFormat, BookId, BookSummary, ImportProgress,
+    ImportSummary, LibraryQuery, LibraryService,
     organisation::{
         BookEdit, ContributorId, ContributorUsage, SeriesId, SeriesUsage, TagId, TagUsage,
     },
@@ -21,8 +22,7 @@ use lectern_core::{
 use lectern_desktop::export::{
     ExportControl, ExportError, ExportOutcome, ExportProgress, OverwritePolicy, export_file,
 };
-use lectern_import::{ImportProgress, ImportSummary, import_paths, validate_publication};
-use lectern_storage::LibraryDatabase;
+use lectern_service::SqliteLibraryService;
 
 const COVER_QUEUE_CAPACITY: usize = 128;
 const QUERY_QUEUE_CAPACITY: usize = 1;
@@ -613,8 +613,8 @@ fn metadata_worker(
     events: &Sender<WorkerEvent>,
     context: &egui::Context,
 ) {
-    let mut database = match LibraryDatabase::open(database_path) {
-        Ok(database) => database,
+    let mut service = match SqliteLibraryService::open(database_path) {
+        Ok(service) => service,
         Err(error) => {
             publish(events, context, WorkerEvent::Error(error.to_string()));
             return;
@@ -624,22 +624,22 @@ fn metadata_worker(
     while let Ok(request) = receiver.recv() {
         let published = match request {
             MetadataRequest::Load(id) => {
-                let result = database.get_book(id).map_err(|error| error.to_string());
+                let result = service.get_book(id).map_err(|error| error.to_string());
                 publish(events, context, WorkerEvent::BookLoaded { id, result })
             }
             MetadataRequest::Save(edit) => {
                 let id = edit.id;
-                let result = database
-                    .save_book_edit(&edit)
+                let result = service
+                    .update_metadata(&edit)
                     .map_err(|error| error.to_string())
-                    .and_then(|()| database.get_book(id).map_err(|error| error.to_string()))
+                    .and_then(|()| service.get_book(id).map_err(|error| error.to_string()))
                     .and_then(|book| {
                         book.ok_or_else(|| "saved book disappeared before reload".to_owned())
                     });
                 publish(events, context, WorkerEvent::BookSaved { id, result })
             }
             MetadataRequest::Remove { id, title } => {
-                let result = database.remove_book(id).map_err(|error| error.to_string());
+                let result = service.remove_book(id).map_err(|error| error.to_string());
                 publish(
                     events,
                     context,
@@ -679,8 +679,8 @@ fn autocomplete_worker(
     events: &Sender<WorkerEvent>,
     context: &egui::Context,
 ) {
-    let database = match LibraryDatabase::open(database_path) {
-        Ok(database) => database,
+    let mut service = match SqliteLibraryService::open(database_path) {
+        Ok(service) => service,
         Err(error) => {
             publish(events, context, WorkerEvent::Error(error.to_string()));
             return;
@@ -703,7 +703,7 @@ fn autocomplete_worker(
                 WorkerEvent::ContributorSuggestions {
                     generation,
                     row_id,
-                    result: database
+                    result: service
                         .autocomplete_contributors(&prefix, &selected, 50)
                         .map_err(|error| error.to_string()),
                 },
@@ -717,7 +717,7 @@ fn autocomplete_worker(
                 context,
                 WorkerEvent::SeriesSuggestions {
                     generation,
-                    result: database
+                    result: service
                         .autocomplete_series(&prefix, &selected, 50)
                         .map_err(|error| error.to_string()),
                 },
@@ -731,7 +731,7 @@ fn autocomplete_worker(
                 context,
                 WorkerEvent::TagSuggestions {
                     generation,
-                    result: database
+                    result: service
                         .autocomplete_tags(&prefix, &selected, 50)
                         .map_err(|error| error.to_string()),
                 },
@@ -745,7 +745,7 @@ fn autocomplete_worker(
                 context,
                 WorkerEvent::FacetContributorSuggestions {
                     generation,
-                    result: database
+                    result: service
                         .autocomplete_contributors(&prefix, &selected, 50)
                         .map_err(|error| error.to_string()),
                 },
@@ -759,7 +759,7 @@ fn autocomplete_worker(
                 context,
                 WorkerEvent::FacetSeriesSuggestions {
                     generation,
-                    result: database
+                    result: service
                         .autocomplete_series(&prefix, &selected, 50)
                         .map_err(|error| error.to_string()),
                 },
@@ -773,7 +773,7 @@ fn autocomplete_worker(
                 context,
                 WorkerEvent::FacetTagSuggestions {
                     generation,
-                    result: database
+                    result: service
                         .autocomplete_tags(&prefix, &selected, 50)
                         .map_err(|error| error.to_string()),
                 },
@@ -811,8 +811,8 @@ fn asset_maintenance_worker(
     events: &Sender<WorkerEvent>,
     context: &egui::Context,
 ) {
-    let mut database = match LibraryDatabase::open(database_path) {
-        Ok(database) => database,
+    let mut service = match SqliteLibraryService::open(database_path) {
+        Ok(service) => service,
         Err(error) => {
             publish(events, context, WorkerEvent::Error(error.to_string()));
             return;
@@ -825,9 +825,7 @@ fn asset_maintenance_worker(
                 events,
                 context,
                 WorkerEvent::AssetHealthScanned(
-                    database
-                        .rescan_reference_assets()
-                        .map_err(|error| error.to_string()),
+                    service.scan_assets().map_err(|error| error.to_string()),
                 ),
             ),
             AssetMaintenanceRequest::Attach {
@@ -835,13 +833,9 @@ fn asset_maintenance_worker(
                 format,
                 path,
             } => {
-                let result = validate_publication(&path, format)
-                    .and_then(|()| {
-                        database
-                            .attach_reference_asset(book_id, format, &path)
-                            .map(|_| ())
-                            .map_err(lectern_import::ImportError::from)
-                    })
+                let result = service
+                    .attach_asset(book_id, format, &path)
+                    .map(|_| ())
                     .map_err(|error| error.to_string());
                 publish(
                     events,
@@ -858,7 +852,7 @@ fn asset_maintenance_worker(
                 context,
                 WorkerEvent::AssetDetached {
                     asset_id,
-                    result: database
+                    result: service
                         .detach_asset(asset_id)
                         .map_err(|error| error.to_string()),
                 },
@@ -869,12 +863,8 @@ fn asset_maintenance_worker(
                 format,
                 replacement_path,
             } => {
-                let result = validate_publication(&replacement_path, format)
-                    .and_then(|()| {
-                        database
-                            .relink_reference_asset(asset_id, &replacement_path, format)
-                            .map_err(lectern_import::ImportError::from)
-                    })
+                let result = service
+                    .relink_asset(asset_id, format, &replacement_path)
                     .map_err(|error| error.to_string());
                 publish(
                     events,
@@ -892,12 +882,8 @@ fn asset_maintenance_worker(
                 format,
                 replacement_path,
             } => {
-                let result = validate_publication(&replacement_path, format)
-                    .and_then(|()| {
-                        database
-                            .replace_reference_asset(asset_id, &replacement_path, format)
-                            .map_err(lectern_import::ImportError::from)
-                    })
+                let result = service
+                    .replace_asset(asset_id, format, &replacement_path)
                     .map_err(|error| error.to_string());
                 publish(
                     events,
@@ -944,10 +930,12 @@ fn import_worker(
     context: &egui::Context,
 ) {
     while let Ok(request) = receiver.recv() {
-        let result = import_paths(database_path, &request.roots, |progress| {
-            publish(events, context, WorkerEvent::ImportProgress(progress));
-        })
-        .map_err(|error| error.to_string());
+        let result = SqliteLibraryService::open(database_path).and_then(|mut service| {
+            service.import_publications(&request.roots, &mut |progress| {
+                publish(events, context, WorkerEvent::ImportProgress(progress));
+            })
+        });
+        let result = result.map_err(|error| error.to_string());
         if !publish(events, context, WorkerEvent::ImportFinished(result)) {
             break;
         }
@@ -980,8 +968,8 @@ fn query_worker(
     events: &Sender<WorkerEvent>,
     context: &egui::Context,
 ) {
-    let mut database = match LibraryDatabase::open(database_path) {
-        Ok(database) => database,
+    let mut service = match SqliteLibraryService::open(database_path) {
+        Ok(service) => service,
         Err(error) => {
             publish(events, context, WorkerEvent::Error(error.to_string()));
             return;
@@ -1005,15 +993,15 @@ fn query_worker(
             request = newer;
         }
         let result = if request.include_total {
-            database
-                .query_page(&request.query, request.offset, request.limit)
+            service
+                .query_library_page(&request.query, request.offset, request.limit)
                 .map(|page| QueryResult {
                     total: Some(page.total),
                     books: page.books,
                 })
         } else {
-            database
-                .query_window(&request.query, request.offset, request.limit)
+            service
+                .query_library_window(&request.query, request.offset, request.limit)
                 .map(|books| QueryResult { total: None, books })
         }
         .map_err(|error| error.to_string());
@@ -1058,8 +1046,8 @@ fn cover_worker(
     events: &Sender<WorkerEvent>,
     context: &egui::Context,
 ) {
-    let database = match LibraryDatabase::open(database_path) {
-        Ok(database) => database,
+    let mut service = match SqliteLibraryService::open(database_path) {
+        Ok(service) => service,
         Err(error) => {
             publish(events, context, WorkerEvent::Error(error.to_string()));
             return;
@@ -1067,7 +1055,7 @@ fn cover_worker(
     };
 
     while let Ok(id) = receiver.recv() {
-        let result = database
+        let result = service
             .load_cover(id)
             .map_err(|error| error.to_string())
             .and_then(|cover| cover.map(|bytes| decode_cover(&bytes)).transpose());
