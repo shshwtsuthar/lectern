@@ -712,6 +712,42 @@ pub trait LibraryService {
         limit: u32,
     ) -> Result<Vec<organisation::TagUsage>, Self::Error>;
 
+    /// Lists durable saved projections alphabetically.
+    fn list_saved_searches(&mut self) -> Result<Vec<organisation::SavedSearch>, Self::Error>;
+
+    /// Returns one bounded saved-search manager page in normalized-name order.
+    fn search_saved_searches(
+        &mut self,
+        prefix: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<organisation::SavedSearch>, Self::Error>;
+
+    /// Creates one named canonical projection and returns its stable identity.
+    fn create_saved_search(
+        &mut self,
+        name: &str,
+        query: &LibraryQuery,
+    ) -> Result<organisation::SavedSearchId, Self::Error>;
+
+    /// Explicitly replaces one saved projection without changing its name or identity.
+    fn update_saved_search(
+        &mut self,
+        id: organisation::SavedSearchId,
+        query: &LibraryQuery,
+    ) -> Result<(), Self::Error>;
+
+    /// Renames one saved projection without changing its query or identity.
+    fn rename_saved_search(
+        &mut self,
+        id: organisation::SavedSearchId,
+        name: &str,
+    ) -> Result<(), Self::Error>;
+
+    /// Deletes one saved projection without changing books or vocabulary.
+    fn delete_saved_search(&mut self, id: organisation::SavedSearchId)
+    -> Result<bool, Self::Error>;
+
     /// Counts book and saved-search references affected by a contributor mutation.
     fn contributor_mutation_impact(
         &mut self,

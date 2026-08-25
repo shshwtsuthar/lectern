@@ -17,8 +17,8 @@ use lectern_core::{
     ImportSummary, LibraryQuery, LibraryService,
     organisation::{
         BookEdit, BookSelection, BulkTagEdit, BulkTagResult, ContributorId, ContributorUsage,
-        SelectionSnapshot, SelectionTagUsage, SeriesId, SeriesUsage, TagId, TagUsage,
-        VocabularyMutationResult,
+        SavedSearch, SavedSearchId, SelectionSnapshot, SelectionTagUsage, SeriesId, SeriesUsage,
+        TagId, TagUsage, VocabularyMutationResult,
     },
 };
 use lectern_desktop::export::{
@@ -102,6 +102,18 @@ enum MetadataRequest {
         selection: BookSelection,
         edit: BulkTagEdit,
     },
+    LoadSavedSearches {
+        generation: u64,
+    },
+    SearchSavedSearches {
+        generation: u64,
+        prefix: String,
+        offset: u64,
+    },
+    MutateSavedSearch {
+        generation: u64,
+        mutation: SavedSearchMutation,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,6 +162,25 @@ pub(crate) enum VocabularyMutation {
     DeleteTag {
         id: TagId,
         confirmed: VocabularyMutationResult,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SavedSearchMutation {
+    Create {
+        name: String,
+        query: LibraryQuery,
+    },
+    Update {
+        id: SavedSearchId,
+        query: LibraryQuery,
+    },
+    Rename {
+        id: SavedSearchId,
+        name: String,
+    },
+    Delete {
+        id: SavedSearchId,
     },
 }
 
@@ -344,6 +375,20 @@ pub(crate) enum WorkerEvent {
     BulkTagsApplied {
         generation: u64,
         result: Result<BulkTagResult, String>,
+    },
+    SavedSearchesLoaded {
+        generation: u64,
+        result: Result<Vec<SavedSearch>, String>,
+    },
+    SavedSearchPageLoaded {
+        generation: u64,
+        offset: u64,
+        result: Result<Vec<SavedSearch>, String>,
+    },
+    SavedSearchMutated {
+        generation: u64,
+        mutation: SavedSearchMutation,
+        result: Result<Vec<SavedSearch>, String>,
     },
     BookRemoved {
         id: BookId,
@@ -721,6 +766,40 @@ impl WorkerSet {
             .is_ok()
     }
 
+    pub(crate) fn load_saved_searches(&self, generation: u64) -> bool {
+        self.metadata_sender
+            .send(MetadataRequest::LoadSavedSearches { generation })
+            .is_ok()
+    }
+
+    pub(crate) fn search_saved_searches(
+        &self,
+        generation: u64,
+        prefix: String,
+        offset: u64,
+    ) -> bool {
+        self.metadata_sender
+            .send(MetadataRequest::SearchSavedSearches {
+                generation,
+                prefix,
+                offset,
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn mutate_saved_search(
+        &self,
+        generation: u64,
+        mutation: SavedSearchMutation,
+    ) -> bool {
+        self.metadata_sender
+            .send(MetadataRequest::MutateSavedSearch {
+                generation,
+                mutation,
+            })
+            .is_ok()
+    }
+
     pub(crate) fn remove_book(&self, id: BookId, title: String) -> bool {
         self.metadata_sender
             .send(MetadataRequest::Remove { id, title })
@@ -1008,10 +1087,83 @@ fn metadata_worker(
                     WorkerEvent::BulkTagsApplied { generation, result },
                 )
             }
+            MetadataRequest::LoadSavedSearches { generation } => {
+                let result = service
+                    .list_saved_searches()
+                    .map_err(|error| error.to_string());
+                publish(
+                    events,
+                    context,
+                    WorkerEvent::SavedSearchesLoaded { generation, result },
+                )
+            }
+            MetadataRequest::SearchSavedSearches {
+                generation,
+                prefix,
+                offset,
+            } => {
+                let result = service
+                    .search_saved_searches(&prefix, offset, 100)
+                    .map_err(|error| error.to_string());
+                publish(
+                    events,
+                    context,
+                    WorkerEvent::SavedSearchPageLoaded {
+                        generation,
+                        offset,
+                        result,
+                    },
+                )
+            }
+            MetadataRequest::MutateSavedSearch {
+                generation,
+                mutation,
+            } => {
+                let result = apply_saved_search_mutation(&mut service, &mutation).and_then(|()| {
+                    service
+                        .list_saved_searches()
+                        .map_err(|error| error.to_string())
+                });
+                publish(
+                    events,
+                    context,
+                    WorkerEvent::SavedSearchMutated {
+                        generation,
+                        mutation,
+                        result,
+                    },
+                )
+            }
         };
         if !published {
             break;
         }
+    }
+}
+
+fn apply_saved_search_mutation(
+    service: &mut impl LibraryService,
+    mutation: &SavedSearchMutation,
+) -> Result<(), String> {
+    match mutation {
+        SavedSearchMutation::Create { name, query } => service
+            .create_saved_search(name, query)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        SavedSearchMutation::Update { id, query } => service
+            .update_saved_search(*id, query)
+            .map_err(|error| error.to_string()),
+        SavedSearchMutation::Rename { id, name } => service
+            .rename_saved_search(*id, name)
+            .map_err(|error| error.to_string()),
+        SavedSearchMutation::Delete { id } => service
+            .delete_saved_search(*id)
+            .map_err(|error| error.to_string())
+            .and_then(|deleted| {
+                deleted
+                    .then_some(())
+                    .ok_or_else(|| format!("saved search {id} does not exist"))
+            }),
     }
 }
 

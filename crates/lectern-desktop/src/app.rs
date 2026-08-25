@@ -13,10 +13,10 @@ use lectern_core::{
     ImportProgress, ImportSummary, LibraryQuery, SortOrder,
     organisation::{
         BookEdit, BookSelection, BulkTagEdit, BulkTagResult, ContributorFacet, ContributorId,
-        ContributorRole, ContributorUsage, ExactFacets, LibraryGeneration, NameKind,
-        SearchExpression, SearchParseError, SelectionSnapshot, SelectionTagUsage, SeriesId,
-        SeriesIndex, SeriesUsage, TagId, TagReference, TagUsage, VocabularyMutationResult,
-        identity_key, normalize_name,
+        ContributorRole, ContributorUsage, ExactFacets, LibraryGeneration, NameKind, SavedSearch,
+        SavedSearchId, SearchExpression, SearchParseError, SelectionSnapshot, SelectionTagUsage,
+        SeriesId, SeriesIndex, SeriesUsage, TagId, TagReference, TagUsage,
+        VocabularyMutationResult, identity_key, normalize_name,
     },
 };
 use lectern_desktop::export::{ExportError, ExportProgress, OverwritePolicy};
@@ -28,8 +28,8 @@ use crate::{
     platform::{NoopAssetPlatform, PlatformAction, PlatformWorker, SystemAssetPlatform},
     workers::{
         DecodedCover, ExportRequest, ImportRequest, QueryQueueResult, QueryRequest,
-        SelectionRequest, VocabularyEntityId, VocabularyKind, VocabularyMutation,
-        VocabularyRequest, VocabularyRows, WorkerEvent, WorkerSet,
+        SavedSearchMutation, SelectionRequest, VocabularyEntityId, VocabularyKind,
+        VocabularyMutation, VocabularyRequest, VocabularyRows, WorkerEvent, WorkerSet,
     },
 };
 
@@ -377,6 +377,44 @@ impl BulkTagUi {
     }
 }
 
+#[derive(Default)]
+struct SavedSearchUi {
+    generation: u64,
+    searches: Vec<SavedSearch>,
+    initialized: bool,
+    pending: bool,
+    active: Option<SavedSearchId>,
+    error: Option<String>,
+    dialog: Option<SavedSearchDialog>,
+}
+
+enum SavedSearchDialog {
+    Create {
+        name: String,
+        pending: bool,
+        error: Option<String>,
+    },
+    Rename {
+        search: SavedSearch,
+        name: String,
+        pending: bool,
+        error: Option<String>,
+    },
+    Delete {
+        search: SavedSearch,
+        pending: bool,
+        error: Option<String>,
+    },
+}
+
+enum SavedSearchAction {
+    Apply(SavedSearch),
+    Create,
+    Update(SavedSearchId),
+    Rename(SavedSearch),
+    Delete(SavedSearch),
+}
+
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 enum OrganiserSection {
     #[default]
@@ -457,6 +495,7 @@ enum VocabularyPage {
     Contributors(Vec<ContributorUsage>),
     Series(Vec<SeriesUsage>),
     Tags(Vec<TagUsage>),
+    SavedSearches(Vec<SavedSearch>),
 }
 
 impl VocabularyPage {
@@ -465,6 +504,7 @@ impl VocabularyPage {
             Self::Contributors(rows) => rows.len(),
             Self::Series(rows) => rows.len(),
             Self::Tags(rows) => rows.len(),
+            Self::SavedSearches(rows) => rows.len(),
         }
     }
 }
@@ -672,6 +712,7 @@ pub(crate) struct LecternApp {
     search_error: Option<SearchParseError>,
     filters: FilterUi,
     organiser: OrganiserUi,
+    saved_searches: SavedSearchUi,
     bulk_tags: BulkTagUi,
     query_generation: u64,
     query_pending: bool,
@@ -728,6 +769,7 @@ impl LecternApp {
             search_error: None,
             filters: FilterUi::default(),
             organiser: OrganiserUi::default(),
+            saved_searches: SavedSearchUi::default(),
             bulk_tags: BulkTagUi::default(),
             query_generation: 0,
             query_pending: false,
@@ -908,14 +950,36 @@ impl LecternApp {
                     }
                 }
                 WorkerEvent::FacetContributorSuggestions { generation, result } => {
+                    if let Ok(rows) = &result {
+                        for usage in rows {
+                            self.filters.contributor_labels.insert(
+                                usage.contributor.id,
+                                usage.contributor.display_name.clone(),
+                            );
+                        }
+                    }
                     self.filters
                         .contributor_suggestions
                         .install(generation, result);
                 }
                 WorkerEvent::FacetSeriesSuggestions { generation, result } => {
+                    if let Ok(rows) = &result {
+                        for usage in rows {
+                            self.filters
+                                .series_labels
+                                .insert(usage.series.id, usage.series.name.clone());
+                        }
+                    }
                     self.filters.series_suggestions.install(generation, result);
                 }
                 WorkerEvent::FacetTagSuggestions { generation, result } => {
+                    if let Ok(rows) = &result {
+                        for usage in rows {
+                            self.filters
+                                .tag_labels
+                                .insert(usage.tag.id, usage.tag.name.clone());
+                        }
+                    }
                     self.filters.tag_suggestions.install(generation, result);
                 }
                 WorkerEvent::BulkTagSuggestions { generation, result } => {
@@ -963,6 +1027,19 @@ impl LecternApp {
                 WorkerEvent::BulkTagsApplied { generation, result } => {
                     self.bulk_tags_applied(generation, result);
                 }
+                WorkerEvent::SavedSearchesLoaded { generation, result } => {
+                    self.saved_searches_loaded(generation, result);
+                }
+                WorkerEvent::SavedSearchPageLoaded {
+                    generation,
+                    offset,
+                    result,
+                } => self.saved_search_page_loaded(generation, offset, result),
+                WorkerEvent::SavedSearchMutated {
+                    generation,
+                    mutation,
+                    result,
+                } => self.saved_search_mutated(generation, mutation, result),
                 WorkerEvent::BookRemoved { id, title, result } => {
                     self.book_removed(id, &title, result);
                 }
@@ -1548,6 +1625,235 @@ impl LecternApp {
         }
     }
 
+    fn reload_saved_searches(&mut self) {
+        self.saved_searches.generation = self.saved_searches.generation.wrapping_add(1);
+        self.saved_searches.initialized = true;
+        self.saved_searches.pending = true;
+        self.saved_searches.error = None;
+        if !self
+            .workers
+            .load_saved_searches(self.saved_searches.generation)
+        {
+            self.saved_searches.pending = false;
+            self.saved_searches.error = Some("Metadata worker is unavailable".to_owned());
+        }
+    }
+
+    fn saved_searches_loaded(&mut self, generation: u64, result: Result<Vec<SavedSearch>, String>) {
+        if generation != self.saved_searches.generation {
+            return;
+        }
+        self.saved_searches.pending = false;
+        match result {
+            Ok(searches) => {
+                if self
+                    .saved_searches
+                    .active
+                    .is_some_and(|id| !searches.iter().any(|search| search.id == id))
+                {
+                    self.saved_searches.active = None;
+                }
+                self.saved_searches.searches = searches;
+                self.saved_searches.error = None;
+            }
+            Err(error) => self.saved_searches.error = Some(error),
+        }
+    }
+
+    fn active_saved_search(&self) -> Option<&SavedSearch> {
+        let id = self.saved_searches.active?;
+        self.saved_searches
+            .searches
+            .iter()
+            .find(|search| search.id == id)
+    }
+
+    fn saved_search_modified(&self) -> bool {
+        saved_search_is_modified(self.active_saved_search(), &self.query)
+    }
+
+    fn apply_saved_search(&mut self, search: SavedSearch) {
+        if !self
+            .saved_searches
+            .searches
+            .iter()
+            .any(|candidate| candidate.id == search.id)
+        {
+            self.saved_searches.searches.push(search.clone());
+        }
+        self.query = search.query;
+        self.search_input.clone_from(&self.query.search);
+        self.search_error = None;
+        self.saved_searches.active = Some(search.id);
+        self.filters.contributor_input.clear();
+        self.filters.series_input.clear();
+        self.filters.tag_input.clear();
+        self.filters.contributor_suggestions = SuggestionState::default();
+        self.filters.series_suggestions = SuggestionState::default();
+        self.filters.tag_suggestions = SuggestionState::default();
+        self.hydrate_active_facet_labels();
+        self.status = format!("Applied saved search {}", search.name);
+        self.refresh_library();
+    }
+
+    fn hydrate_active_facet_labels(&mut self) {
+        let contributors = self
+            .query
+            .facets
+            .contributors
+            .iter()
+            .map(|facet| facet.contributor)
+            .collect::<Vec<_>>();
+        if !contributors.is_empty() {
+            let generation = self.filters.contributor_suggestions.begin();
+            if !self.workers.autocomplete_facet_contributors(
+                generation,
+                String::new(),
+                contributors,
+            ) {
+                self.filters.contributor_suggestions.pending = false;
+            }
+        }
+        if let Some(series) = self.query.facets.series {
+            let generation = self.filters.series_suggestions.begin();
+            if !self
+                .workers
+                .autocomplete_facet_series(generation, String::new(), vec![series])
+            {
+                self.filters.series_suggestions.pending = false;
+            }
+        }
+        let mut tags = self.query.facets.included_tags.clone();
+        tags.extend_from_slice(&self.query.facets.excluded_tags);
+        tags.sort_unstable();
+        tags.dedup();
+        if !tags.is_empty() {
+            let generation = self.filters.tag_suggestions.begin();
+            if !self
+                .workers
+                .autocomplete_facet_tags(generation, String::new(), tags)
+            {
+                self.filters.tag_suggestions.pending = false;
+            }
+        }
+    }
+
+    fn begin_saved_search_action(&mut self, action: SavedSearchAction) {
+        match action {
+            SavedSearchAction::Apply(search) => self.apply_saved_search(search),
+            SavedSearchAction::Create => {
+                self.saved_searches.dialog = Some(SavedSearchDialog::Create {
+                    name: String::new(),
+                    pending: false,
+                    error: None,
+                });
+            }
+            SavedSearchAction::Update(id) => {
+                self.start_saved_search_mutation(SavedSearchMutation::Update {
+                    id,
+                    query: self.query.clone(),
+                });
+            }
+            SavedSearchAction::Rename(search) => {
+                self.saved_searches.dialog = Some(SavedSearchDialog::Rename {
+                    name: search.name.clone(),
+                    search,
+                    pending: false,
+                    error: None,
+                });
+            }
+            SavedSearchAction::Delete(search) => {
+                self.saved_searches.dialog = Some(SavedSearchDialog::Delete {
+                    search,
+                    pending: false,
+                    error: None,
+                });
+            }
+        }
+    }
+
+    fn start_saved_search_mutation(&mut self, mutation: SavedSearchMutation) {
+        if self.saved_searches.pending {
+            return;
+        }
+        self.saved_searches.generation = self.saved_searches.generation.wrapping_add(1);
+        self.saved_searches.pending = true;
+        self.saved_searches.error = None;
+        set_saved_search_dialog_pending(&mut self.saved_searches.dialog, true);
+        if !self
+            .workers
+            .mutate_saved_search(self.saved_searches.generation, mutation)
+        {
+            self.saved_searches.pending = false;
+            set_saved_search_dialog_pending(&mut self.saved_searches.dialog, false);
+            set_saved_search_dialog_error(
+                &mut self.saved_searches.dialog,
+                "Metadata worker is unavailable".to_owned(),
+            );
+        }
+    }
+
+    fn saved_search_mutated(
+        &mut self,
+        generation: u64,
+        mutation: SavedSearchMutation,
+        result: Result<Vec<SavedSearch>, String>,
+    ) {
+        if generation != self.saved_searches.generation {
+            return;
+        }
+        self.saved_searches.pending = false;
+        match result {
+            Ok(searches) => {
+                self.saved_searches.initialized = true;
+                match mutation {
+                    SavedSearchMutation::Create { name, .. } => {
+                        let key = identity_key(&name);
+                        self.saved_searches.active = searches
+                            .iter()
+                            .find(|search| identity_key(&search.name) == key)
+                            .map(|search| search.id);
+                        self.status = format!("Saved current search as {name}");
+                    }
+                    SavedSearchMutation::Update { id, .. } => {
+                        self.saved_searches.active = Some(id);
+                        "Updated saved search".clone_into(&mut self.status);
+                    }
+                    SavedSearchMutation::Rename { id, name } => {
+                        if self.saved_searches.active == Some(id) {
+                            self.saved_searches.active = Some(id);
+                        }
+                        self.status = format!("Renamed saved search to {name}");
+                    }
+                    SavedSearchMutation::Delete { id } => {
+                        if self.saved_searches.active == Some(id) {
+                            self.saved_searches.active = None;
+                        }
+                        "Deleted saved search; books and vocabulary were unchanged"
+                            .clone_into(&mut self.status);
+                    }
+                }
+                self.saved_searches.searches = searches;
+                self.saved_searches.dialog = None;
+                self.saved_searches.error = None;
+                self.clear_grid_selection();
+                if self.organiser.open && self.organiser.section == OrganiserSection::SavedSearches
+                {
+                    self.organiser.page = None;
+                    self.request_vocabulary_page(self.organiser.offset);
+                }
+            }
+            Err(error) => {
+                set_saved_search_dialog_pending(&mut self.saved_searches.dialog, false);
+                if self.saved_searches.dialog.is_some() {
+                    set_saved_search_dialog_error(&mut self.saved_searches.dialog, error);
+                } else {
+                    self.saved_searches.error = Some(error);
+                }
+            }
+        }
+    }
+
     fn book_saved(&mut self, id: BookId, result: Result<Book, String>) {
         match result {
             Ok(book) => {
@@ -1826,6 +2132,7 @@ impl LecternApp {
         let mut contributor_lookup = None;
         let mut series_lookup = None;
         let mut tag_lookup = None;
+        let mut saved_search_action = None;
         ui.horizontal_centered(|ui| {
             let search = egui::TextEdit::singleline(&mut self.search_input)
                 .hint_text("Search or use fields such as author:, tag:, format:…")
@@ -1848,6 +2155,8 @@ impl LecternApp {
                 ui.separator();
                 ui.label(RichText::new("Bare terms search all text fields. Clauses combine with AND; OR, regex, wildcards, grouping, and raw FTS are not accepted.").color(MUTED));
             });
+
+            saved_search_action = self.saved_search_menu(ui);
 
             let facet_count = self.query.facets.contributors.len()
                 + self.query.facets.included_tags.len()
@@ -1910,6 +2219,14 @@ impl LecternApp {
         }
         query_changed |= self.active_facet_chips(ui);
 
+        if let Some(error) = &self.saved_searches.error {
+            ui.label(
+                RichText::new(format!("Saved searches: {error}"))
+                    .color(Color32::LIGHT_RED)
+                    .size(12.0),
+            );
+        }
+
         self.dispatch_facet_contributor_lookup(contributor_lookup);
         self.dispatch_facet_series_lookup(series_lookup);
         self.dispatch_facet_tag_lookup(tag_lookup);
@@ -1917,6 +2234,104 @@ impl LecternApp {
         if query_changed {
             self.refresh_library();
         }
+        if let Some(action) = saved_search_action {
+            self.begin_saved_search_action(action);
+        }
+    }
+
+    fn saved_search_menu(&mut self, ui: &mut egui::Ui) -> Option<SavedSearchAction> {
+        let active = self.active_saved_search().cloned();
+        let modified = self.saved_search_modified();
+        let label = active.as_ref().map_or_else(
+            || "Saved searches".to_owned(),
+            |search| {
+                format!(
+                    "{}{}",
+                    search.name,
+                    if modified { " · Modified" } else { "" }
+                )
+            },
+        );
+        let mut action = None;
+        let mut request_load = false;
+        ui.menu_button(label, |ui| {
+            ui.set_min_width(310.0);
+            if !self.saved_searches.initialized {
+                request_load = true;
+            }
+            if self.saved_searches.pending || !self.saved_searches.initialized {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Loading saved searches…").color(MUTED));
+                });
+            }
+            if ui
+                .add_enabled(
+                    self.search_error.is_none()
+                        && self.saved_searches.initialized
+                        && !self.saved_searches.pending,
+                    egui::Button::new("Save current search…"),
+                )
+                .clicked()
+            {
+                action = Some(SavedSearchAction::Create);
+                ui.close();
+            }
+            if let Some(search) = active.as_ref() {
+                if ui
+                    .add_enabled(
+                        modified && self.search_error.is_none() && !self.saved_searches.pending,
+                        egui::Button::new("Update saved search"),
+                    )
+                    .clicked()
+                {
+                    action = Some(SavedSearchAction::Update(search.id));
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(!self.saved_searches.pending, egui::Button::new("Rename…"))
+                    .clicked()
+                {
+                    action = Some(SavedSearchAction::Rename(search.clone()));
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(!self.saved_searches.pending, egui::Button::new("Delete…"))
+                    .clicked()
+                {
+                    action = Some(SavedSearchAction::Delete(search.clone()));
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if self.saved_searches.initialized
+                && self.saved_searches.searches.is_empty()
+                && !self.saved_searches.pending
+            {
+                ui.label(RichText::new("No saved searches").color(MUTED));
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt("saved-search-toolbar-list")
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for search in &self.saved_searches.searches {
+                            let selected = self.saved_searches.active == Some(search.id);
+                            if ui
+                                .selectable_label(selected, &search.name)
+                                .on_hover_text(saved_search_summary(search))
+                                .clicked()
+                            {
+                                action = Some(SavedSearchAction::Apply(search.clone()));
+                                ui.close();
+                            }
+                        }
+                    });
+            }
+        });
+        if request_load {
+            self.reload_saved_searches();
+        }
+        action
     }
 
     fn filters_popover(
@@ -2315,13 +2730,7 @@ impl LecternApp {
 
         ui.separator();
         if self.organiser.section == OrganiserSection::SavedSearches {
-            ui.heading("Saved searches");
-            ui.label(
-                RichText::new(
-                    "Saved projections are created, applied, renamed, updated, and deleted from the Saved searches toolbar menu.",
-                )
-                .color(MUTED),
-            );
+            self.saved_search_organiser_contents(ui);
             return;
         }
 
@@ -2444,6 +2853,152 @@ impl LecternApp {
 
         if let Some(action) = row_action {
             self.begin_vocabulary_action(action);
+        }
+    }
+
+    fn saved_search_organiser_contents(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Saved searches");
+        ui.label(
+            RichText::new(
+                "Each saved search is a complete query, exact-filter, format, file-health, and sort projection.",
+            )
+            .color(MUTED),
+        );
+        let mut search_requested = false;
+        let mut create = false;
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.organiser.search_input)
+                    .hint_text("Search saved searches")
+                    .desired_width(330.0),
+            );
+            search_requested |=
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            search_requested |= ui
+                .add_enabled(!self.organiser.pending, egui::Button::new("Search"))
+                .clicked();
+            if !self.organiser.applied_prefix.is_empty() && ui.button("Clear").clicked() {
+                self.organiser.search_input.clear();
+                search_requested = true;
+            }
+            create = ui
+                .add_enabled(
+                    self.search_error.is_none() && !self.saved_searches.pending,
+                    egui::Button::new("Save current search…"),
+                )
+                .clicked();
+            if self.organiser.pending {
+                ui.spinner();
+            }
+        });
+        if search_requested {
+            self.organiser.applied_prefix = self.organiser.search_input.trim().to_owned();
+            self.request_vocabulary_page(0);
+        }
+        if let Some(error) = &self.organiser.error {
+            ui.label(RichText::new(error).color(Color32::LIGHT_RED));
+        }
+
+        let mut action = create.then_some(SavedSearchAction::Create);
+        if let Some(VocabularyPage::SavedSearches(searches)) = &self.organiser.page {
+            let row_count = searches.len();
+            let first = self.organiser.offset.saturating_add(1);
+            let last = self
+                .organiser
+                .offset
+                .saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
+            ui.label(
+                RichText::new(if row_count == 0 {
+                    "No matching saved searches".to_owned()
+                } else {
+                    format!("Showing {first}–{last} · at most 100 rows")
+                })
+                .color(MUTED)
+                .size(12.0),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt("saved-search-manager-rows")
+                .max_height(450.0)
+                .show_rows(ui, 52.0, row_count, |ui, range| {
+                    for index in range {
+                        let Some(search) = searches.get(index) else {
+                            continue;
+                        };
+                        ui.horizontal(|ui| {
+                            ui.set_min_height(48.0);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&search.name).strong());
+                                ui.label(
+                                    RichText::new(saved_search_summary(search))
+                                        .color(MUTED)
+                                        .size(11.0),
+                                );
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add_enabled(
+                                        !self.saved_searches.pending,
+                                        egui::Button::new("Delete…"),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(SavedSearchAction::Delete(search.clone()));
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.saved_searches.pending,
+                                        egui::Button::new("Rename…"),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(SavedSearchAction::Rename(search.clone()));
+                                }
+                                if ui.button("Apply").clicked() {
+                                    action = Some(SavedSearchAction::Apply(search.clone()));
+                                }
+                            });
+                        });
+                        ui.separator();
+                    }
+                });
+
+            let has_previous = self.organiser.offset > 0;
+            let has_next = row_count == usize::try_from(VOCABULARY_PAGE_SIZE).unwrap();
+            let mut previous = false;
+            let mut next = false;
+            ui.horizontal(|ui| {
+                previous = ui
+                    .add_enabled(
+                        has_previous && !self.organiser.pending,
+                        egui::Button::new("Previous 100"),
+                    )
+                    .clicked();
+                next = ui
+                    .add_enabled(
+                        has_next && !self.organiser.pending,
+                        egui::Button::new("Next 100"),
+                    )
+                    .clicked();
+            });
+            if previous {
+                self.request_vocabulary_page(
+                    self.organiser.offset.saturating_sub(VOCABULARY_PAGE_SIZE),
+                );
+            } else if next {
+                self.request_vocabulary_page(
+                    self.organiser.offset.saturating_add(VOCABULARY_PAGE_SIZE),
+                );
+            }
+        } else if self.organiser.pending {
+            centered_message(
+                ui,
+                "Loading saved searches",
+                "Reading one bounded page…",
+                true,
+            );
+        }
+        if let Some(action) = action {
+            self.begin_saved_search_action(action);
         }
     }
 
@@ -2729,6 +3284,167 @@ impl LecternApp {
         }
         if !close {
             self.organiser.dialog = Some(dialog);
+        }
+    }
+
+    fn saved_search_dialog_window(&mut self, context: &egui::Context) {
+        let mut mutation = None;
+        let mut cancel = false;
+        match &mut self.saved_searches.dialog {
+            Some(SavedSearchDialog::Create {
+                name,
+                pending,
+                error,
+            }) => {
+                let normalized = normalize_name(NameKind::SavedSearch, name);
+                let response =
+                    egui::Modal::new(egui::Id::new("create-saved-search")).show(context, |ui| {
+                        ui.set_max_width(450.0);
+                        ui.heading("Save current search");
+                        ui.label(
+                            RichText::new(
+                                "This saves the complete query, exact filters, format, file health, and sort order.",
+                            )
+                            .color(MUTED),
+                        );
+                        ui.add_space(8.0);
+                        ui.add_enabled(
+                            !*pending,
+                            egui::TextEdit::singleline(name)
+                                .hint_text("Saved-search name")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if let Err(validation) = &normalized {
+                            ui.label(
+                                RichText::new(validation.to_string()).color(Color32::LIGHT_RED),
+                            );
+                        }
+                        vocabulary_dialog_error(ui, error.as_deref());
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    normalized.is_ok() && !*pending,
+                                    egui::Button::new("Save search"),
+                                )
+                                .clicked()
+                            {
+                                mutation = Some(SavedSearchMutation::Create {
+                                    name: normalized.clone().expect("validated name"),
+                                    query: self.query.clone(),
+                                });
+                            }
+                            cancel = ui
+                                .add_enabled(!*pending, egui::Button::new("Cancel"))
+                                .clicked();
+                            if *pending {
+                                ui.spinner();
+                            }
+                        });
+                    });
+                cancel |= response.should_close() && !*pending;
+            }
+            Some(SavedSearchDialog::Rename {
+                search,
+                name,
+                pending,
+                error,
+            }) => {
+                let normalized = normalize_name(NameKind::SavedSearch, name);
+                let response =
+                    egui::Modal::new(egui::Id::new("rename-saved-search")).show(context, |ui| {
+                        ui.set_max_width(430.0);
+                        ui.heading("Rename saved search");
+                        ui.label(format!(
+                            "Rename “{}” without changing its projection.",
+                            search.name
+                        ));
+                        ui.add_space(8.0);
+                        ui.add_enabled(
+                            !*pending,
+                            egui::TextEdit::singleline(name).desired_width(f32::INFINITY),
+                        );
+                        if let Err(validation) = &normalized {
+                            ui.label(
+                                RichText::new(validation.to_string()).color(Color32::LIGHT_RED),
+                            );
+                        }
+                        vocabulary_dialog_error(ui, error.as_deref());
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    normalized.is_ok()
+                                        && normalized
+                                            .as_ref()
+                                            .is_ok_and(|value| value != &search.name)
+                                        && !*pending,
+                                    egui::Button::new("Rename"),
+                                )
+                                .clicked()
+                            {
+                                mutation = Some(SavedSearchMutation::Rename {
+                                    id: search.id,
+                                    name: normalized.clone().expect("validated name"),
+                                });
+                            }
+                            cancel = ui
+                                .add_enabled(!*pending, egui::Button::new("Cancel"))
+                                .clicked();
+                            if *pending {
+                                ui.spinner();
+                            }
+                        });
+                    });
+                cancel |= response.should_close() && !*pending;
+            }
+            Some(SavedSearchDialog::Delete {
+                search,
+                pending,
+                error,
+            }) => {
+                let response =
+                    egui::Modal::new(egui::Id::new("delete-saved-search")).show(context, |ui| {
+                        ui.set_max_width(450.0);
+                        ui.heading("Delete saved search?");
+                        ui.label(format!("Delete “{}”?", search.name));
+                        ui.label(
+                            RichText::new(
+                                "Books, vocabulary, publication files, and the current grid query will not change.",
+                            )
+                            .color(MUTED),
+                        );
+                        vocabulary_dialog_error(ui, error.as_deref());
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !*pending,
+                                    egui::Button::new(
+                                        RichText::new("Delete saved search")
+                                            .color(Color32::LIGHT_RED),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                mutation = Some(SavedSearchMutation::Delete { id: search.id });
+                            }
+                            cancel = ui
+                                .add_enabled(!*pending, egui::Button::new("Cancel"))
+                                .clicked();
+                            if *pending {
+                                ui.spinner();
+                            }
+                        });
+                    });
+                cancel |= response.should_close() && !*pending;
+            }
+            None => {}
+        }
+        if cancel {
+            self.saved_searches.dialog = None;
+        } else if let Some(mutation) = mutation {
+            self.start_saved_search_mutation(mutation);
         }
     }
 
@@ -3465,15 +4181,25 @@ impl LecternApp {
     }
 
     fn request_vocabulary_page(&mut self, offset: u64) {
-        let Some(kind) = self.organiser.section.vocabulary_kind() else {
-            self.organiser.page = None;
-            self.organiser.pending = false;
-            return;
-        };
         self.organiser.generation = self.organiser.generation.wrapping_add(1);
         self.organiser.offset = offset;
         self.organiser.pending = true;
         self.organiser.error = None;
+        if self.organiser.section == OrganiserSection::SavedSearches {
+            if !self.workers.search_saved_searches(
+                self.organiser.generation,
+                self.organiser.applied_prefix.clone(),
+                offset,
+            ) {
+                self.organiser.pending = false;
+                self.organiser.error = Some("Metadata worker is unavailable".to_owned());
+            }
+            return;
+        }
+        let Some(kind) = self.organiser.section.vocabulary_kind() else {
+            self.organiser.pending = false;
+            return;
+        };
         let request = VocabularyRequest {
             generation: self.organiser.generation,
             kind,
@@ -3483,6 +4209,31 @@ impl LecternApp {
         if !self.workers.load_vocabulary(request) {
             self.organiser.pending = false;
             self.organiser.error = Some("Vocabulary worker is busy; try again".to_owned());
+        }
+    }
+
+    fn saved_search_page_loaded(
+        &mut self,
+        generation: u64,
+        offset: u64,
+        result: Result<Vec<SavedSearch>, String>,
+    ) {
+        if generation != self.organiser.generation
+            || self.organiser.section != OrganiserSection::SavedSearches
+            || offset != self.organiser.offset
+        {
+            return;
+        }
+        self.organiser.pending = false;
+        match result {
+            Ok(searches) => {
+                self.organiser.page = Some(VocabularyPage::SavedSearches(searches));
+                self.organiser.error = None;
+            }
+            Err(error) => {
+                self.organiser.page = None;
+                self.organiser.error = Some(error);
+            }
         }
     }
 
@@ -3581,6 +4332,7 @@ impl LecternApp {
                 self.organiser.page = None;
                 self.clear_selection();
                 self.refresh_library();
+                self.reload_saved_searches();
                 self.request_vocabulary_page(self.organiser.offset);
             }
             Err(error) => match &mut self.organiser.dialog {
@@ -4529,6 +5281,7 @@ impl eframe::App for LecternApp {
         self.bulk_tag_discard_confirmation_window(ui.ctx());
         self.organiser_window(ui.ctx());
         self.vocabulary_dialog_window(ui.ctx());
+        self.saved_search_dialog_window(ui.ctx());
 
         if files_hovering {
             let rect = ui.max_rect().shrink(18.0);
@@ -5223,6 +5976,57 @@ fn vocabulary_entity_at(page: &VocabularyPage, index: usize) -> Option<Vocabular
         }
         VocabularyPage::Series(rows) => rows.get(index).cloned().map(VocabularyEntity::Series),
         VocabularyPage::Tags(rows) => rows.get(index).cloned().map(VocabularyEntity::Tag),
+        VocabularyPage::SavedSearches(_) => None,
+    }
+}
+
+fn saved_search_summary(search: &SavedSearch) -> String {
+    let exact_filters = search.query.facets.contributors.len()
+        + search.query.facets.included_tags.len()
+        + search.query.facets.excluded_tags.len()
+        + usize::from(search.query.facets.series.is_some());
+    let expression = if search.query.search.is_empty() {
+        "All books"
+    } else {
+        &search.query.search
+    };
+    format!(
+        "{expression} · {exact_filters} exact filters · {} · {} · {}",
+        search
+            .query
+            .format
+            .map_or_else(|| "all formats".to_owned(), |format| format.to_string()),
+        search
+            .query
+            .asset_health
+            .map_or_else(|| "all file states".to_owned(), |health| health.to_string()),
+        search.query.sort,
+    )
+}
+
+fn saved_search_is_modified(search: Option<&SavedSearch>, query: &LibraryQuery) -> bool {
+    search.is_some_and(|search| &search.query != query)
+}
+
+fn set_saved_search_dialog_pending(dialog: &mut Option<SavedSearchDialog>, pending: bool) {
+    match dialog {
+        Some(
+            SavedSearchDialog::Create { pending: value, .. }
+            | SavedSearchDialog::Rename { pending: value, .. }
+            | SavedSearchDialog::Delete { pending: value, .. },
+        ) => *value = pending,
+        None => {}
+    }
+}
+
+fn set_saved_search_dialog_error(dialog: &mut Option<SavedSearchDialog>, error: String) {
+    match dialog {
+        Some(
+            SavedSearchDialog::Create { error: value, .. }
+            | SavedSearchDialog::Rename { error: value, .. }
+            | SavedSearchDialog::Delete { error: value, .. },
+        ) => *value = Some(error),
+        None => {}
     }
 }
 
@@ -5611,7 +6415,8 @@ mod tests {
     use eframe::egui;
     use lectern_core::ImportProgress;
     use lectern_core::organisation::{
-        BulkTagEdit, LibraryGeneration, SelectionSnapshot, TagId, TagReference,
+        BulkTagEdit, LibraryGeneration, SavedSearch, SavedSearchId, SelectionSnapshot, TagId,
+        TagReference,
     };
     use lectern_core::{
         AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId,
@@ -5624,6 +6429,7 @@ mod tests {
         QUERY_PAGE_SIZE, apply_search_input, asset_health_status, build_bulk_tag_edit,
         bulk_tag_observed_state, column_count, cover_image, export_fraction,
         format_export_progress, import_status, query_page_offset, removal_file_message,
+        saved_search_is_modified, saved_search_summary,
     };
 
     #[test]
@@ -5644,6 +6450,26 @@ mod tests {
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE - 1), 0);
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE), QUERY_PAGE_SIZE);
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE + 17), QUERY_PAGE_SIZE);
+    }
+
+    #[test]
+    fn saved_searches_track_complete_projection_modifications() {
+        let saved = SavedSearch {
+            id: SavedSearchId::new(7),
+            name: "Recently added".into(),
+            query: LibraryQuery::default(),
+        };
+        assert!(!saved_search_is_modified(
+            Some(&saved),
+            &LibraryQuery::default()
+        ));
+        let changed = LibraryQuery {
+            search: "language:fr".into(),
+            ..LibraryQuery::default()
+        };
+        assert!(saved_search_is_modified(Some(&saved), &changed));
+        assert!(!saved_search_is_modified(None, &changed));
+        assert!(saved_search_summary(&saved).contains("0 exact filters"));
     }
 
     #[test]

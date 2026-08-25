@@ -13,8 +13,8 @@ use lectern_core::{
     LibraryStats,
     organisation::{
         BookEdit, BookSelection, BulkTagEdit, BulkTagResult, ContributorId, ContributorUsage,
-        SelectionSnapshot, SelectionTagUsage, SeriesId, SeriesUsage, TagId, TagUsage,
-        VocabularyMutationResult,
+        SavedSearch, SavedSearchId, SelectionSnapshot, SelectionTagUsage, SeriesId, SeriesUsage,
+        TagId, TagUsage, VocabularyMutationResult,
     },
 };
 use lectern_import::{import_paths_into, validate_publication};
@@ -189,6 +189,43 @@ impl LibraryService for SqliteLibraryService {
         limit: u32,
     ) -> Result<Vec<TagUsage>, Self::Error> {
         Ok(self.database.search_tags(prefix, offset, limit)?)
+    }
+
+    fn list_saved_searches(&mut self) -> Result<Vec<SavedSearch>, Self::Error> {
+        Ok(self.database.list_saved_searches()?)
+    }
+
+    fn search_saved_searches(
+        &mut self,
+        prefix: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<SavedSearch>, Self::Error> {
+        Ok(self.database.search_saved_searches(prefix, offset, limit)?)
+    }
+
+    fn create_saved_search(
+        &mut self,
+        name: &str,
+        query: &LibraryQuery,
+    ) -> Result<SavedSearchId, Self::Error> {
+        Ok(self.database.create_saved_search(name, query)?)
+    }
+
+    fn update_saved_search(
+        &mut self,
+        id: SavedSearchId,
+        query: &LibraryQuery,
+    ) -> Result<(), Self::Error> {
+        Ok(self.database.update_saved_search(id, query)?)
+    }
+
+    fn rename_saved_search(&mut self, id: SavedSearchId, name: &str) -> Result<(), Self::Error> {
+        Ok(self.database.rename_saved_search(id, name)?)
+    }
+
+    fn delete_saved_search(&mut self, id: SavedSearchId) -> Result<bool, Self::Error> {
+        Ok(self.database.delete_saved_search(id)?)
     }
 
     fn contributor_mutation_impact(
