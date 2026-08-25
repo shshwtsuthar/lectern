@@ -37,6 +37,8 @@ class CiPerformanceTests(unittest.TestCase):
                 "organisation-migration-v1",
                 "organisation-query-v1",
                 "organisation-vocabulary-v1",
+                "bulk-tags-v1",
+                "saved-searches-v1",
             ],
         )
         self.assertIn(
@@ -48,11 +50,32 @@ class CiPerformanceTests(unittest.TestCase):
         )
         self.assertIn(
             {
+                "name": "bulk-tags-v1",
+                "budget": "benchmarks/bulk-tags-regression-v1.json",
+            },
+            registry["suites"],
+        )
+        self.assertIn(
+            {
+                "name": "saved-searches-v1",
+                "budget": "benchmarks/saved-searches-regression-v1.json",
+            },
+            registry["suites"],
+        )
+        self.assertIn(
+            {
                 "name": "maintenance-v1",
                 "budget": "benchmarks/maintenance-regression-v1.json",
             },
             registry["suites"],
         )
+
+    def test_workflow_provides_a_display_for_compositor_suites(self) -> None:
+        workflow = (
+            MODULE_PATH.parents[1] / ".github" / "workflows" / "performance.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(workflow.count("xvfb-run --auto-servernum"), 2)
 
     def test_registry_rejects_unsafe_budget_path(self) -> None:
         registry = {

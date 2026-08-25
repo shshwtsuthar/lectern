@@ -57,6 +57,14 @@
     {
       "name": "organisation-vocabulary-v1",
       "budget": "benchmarks/organisation-vocabulary-regression-v1.json"
+    },
+    {
+      "name": "bulk-tags-v1",
+      "budget": "benchmarks/bulk-tags-regression-v1.json"
+    },
+    {
+      "name": "saved-searches-v1",
+      "budget": "benchmarks/saved-searches-regression-v1.json"
     }
   ]
 }
