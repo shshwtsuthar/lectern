@@ -2,6 +2,7 @@
 
 mod app;
 mod benchmark;
+mod curation;
 mod platform;
 mod workers;
 

@@ -12,6 +12,10 @@ use eframe::egui::{self, Align, Color32, FontId, RichText, Sense, Stroke, Stroke
 use lectern_core::{
     AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookFormat, BookId, BookSummary,
     LibraryQuery, SortOrder,
+    organisation::{
+        BookEdit, ContributorRole, ContributorUsage, SeriesIndex, SeriesUsage, TagUsage,
+        identity_key,
+    },
 };
 use lectern_desktop::export::{ExportError, ExportProgress, OverwritePolicy};
 use lectern_import::{ImportProgress, ImportSummary};
@@ -19,6 +23,7 @@ use lectern_storage::LibraryDatabase;
 
 use crate::{
     benchmark::{BenchmarkFrame, DesktopBenchmark},
+    curation::{BookCurationDraft, SeriesDraft},
     platform::{NoopAssetPlatform, PlatformAction, PlatformWorker, SystemAssetPlatform},
     workers::{
         DecodedCover, ExportRequest, ImportRequest, QueryQueueResult, QueryRequest, WorkerEvent,
@@ -63,18 +68,88 @@ struct MetadataActions {
     detach: Option<AssetDetachConfirmation>,
     attach: Option<BookFormat>,
     remove: bool,
+    contributor_lookup: Option<ContributorLookup>,
+    series_lookup: Option<SeriesLookup>,
+    tag_lookup: Option<TagLookup>,
 }
 
 struct BookEditor {
     original: Book,
+    original_edit: BookEdit,
     title: String,
-    authors: String,
-    series: String,
     publisher: String,
     language: String,
     description: String,
+    curation: BookCurationDraft,
+    contributor_suggestions: SuggestionState<ContributorUsage>,
+    contributor_suggestion_row: Option<u64>,
+    series_suggestions: SuggestionState<SeriesUsage>,
+    tag_suggestions: SuggestionState<TagUsage>,
+    tag_input: String,
+    series_clear_restore: Option<SeriesDraft>,
     saving: bool,
     error: Option<String>,
+}
+
+struct ContributorLookup {
+    generation: u64,
+    row_id: u64,
+    prefix: String,
+}
+
+struct SeriesLookup {
+    generation: u64,
+    prefix: String,
+}
+
+struct TagLookup {
+    generation: u64,
+    prefix: String,
+}
+
+struct SuggestionState<T> {
+    generation: u64,
+    pending: bool,
+    results: Vec<T>,
+    error: Option<String>,
+}
+
+impl<T> Default for SuggestionState<T> {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            pending: false,
+            results: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+impl<T> SuggestionState<T> {
+    fn begin(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = true;
+        self.results.clear();
+        self.error = None;
+        self.generation
+    }
+
+    fn install(&mut self, generation: u64, result: Result<Vec<T>, String>) {
+        if generation != self.generation {
+            return;
+        }
+        self.pending = false;
+        match result {
+            Ok(results) => {
+                self.results = results;
+                self.error = None;
+            }
+            Err(error) => {
+                self.results.clear();
+                self.error = Some(error);
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -171,41 +246,51 @@ struct BookRemovalUi {
 
 impl BookEditor {
     fn new(book: Book) -> Self {
+        let curation = BookCurationDraft::from_book(&book);
+        let original_edit = curation
+            .to_book_edit(
+                &book,
+                &book.title,
+                book.publisher.as_deref().unwrap_or_default(),
+                book.language.as_deref().unwrap_or_default(),
+                book.description.as_deref().unwrap_or_default(),
+            )
+            .expect("stored normalized book metadata is editable");
         Self {
             title: book.title.clone(),
-            authors: book.authors.clone(),
-            series: book.series.clone().unwrap_or_default(),
             publisher: book.publisher.clone().unwrap_or_default(),
             language: book.language.clone().unwrap_or_default(),
             description: book.description.clone().unwrap_or_default(),
+            curation,
+            original_edit,
             original: book,
+            contributor_suggestions: SuggestionState::default(),
+            contributor_suggestion_row: None,
+            series_suggestions: SuggestionState::default(),
+            tag_suggestions: SuggestionState::default(),
+            tag_input: String::new(),
+            series_clear_restore: None,
             saving: false,
             error: None,
         }
     }
 
-    fn book(&self) -> Book {
-        Book {
-            id: self.original.id,
-            title: self.title.trim().to_owned(),
-            authors: self.authors.trim().to_owned(),
-            series: optional_metadata(&self.series),
-            contributors: self.original.contributors.clone(),
-            series_membership: self.original.series_membership.clone(),
-            tags: self.original.tags.clone(),
-            publisher: optional_metadata(&self.publisher),
-            language: optional_metadata(&self.language),
-            description: optional_metadata(&self.description),
-            assets: self.original.assets.clone(),
-        }
+    fn edit(&self) -> Result<BookEdit, String> {
+        self.curation.to_book_edit(
+            &self.original,
+            &self.title,
+            &self.publisher,
+            &self.language,
+            &self.description,
+        )
     }
 
     fn changed(&self) -> bool {
-        self.book() != self.original
+        self.edit().map_or(true, |edit| edit != self.original_edit)
     }
 
     fn can_save(&self) -> bool {
-        !self.saving && !self.title.trim().is_empty() && self.changed()
+        !self.saving && self.changed() && self.edit().is_ok()
     }
 }
 
@@ -399,7 +484,28 @@ impl LecternApp {
                         }
                     }
                 }
-                WorkerEvent::BookSaved { book, result } => self.book_saved(book, result),
+                WorkerEvent::BookSaved { id, result } => self.book_saved(id, result),
+                WorkerEvent::ContributorSuggestions {
+                    generation,
+                    row_id,
+                    result,
+                } => {
+                    if let Some(editor) = &mut self.editor
+                        && editor.contributor_suggestion_row == Some(row_id)
+                    {
+                        editor.contributor_suggestions.install(generation, result);
+                    }
+                }
+                WorkerEvent::SeriesSuggestions { generation, result } => {
+                    if let Some(editor) = &mut self.editor {
+                        editor.series_suggestions.install(generation, result);
+                    }
+                }
+                WorkerEvent::TagSuggestions { generation, result } => {
+                    if let Some(editor) = &mut self.editor {
+                        editor.tag_suggestions.install(generation, result);
+                    }
+                }
                 WorkerEvent::BookRemoved { id, title, result } => {
                     self.book_removed(id, &title, result);
                 }
@@ -647,11 +753,11 @@ impl LecternApp {
         self.query_pending = self.library_total.is_none() || self.pending_pages.contains(&0);
     }
 
-    fn book_saved(&mut self, book: Book, result: Result<(), String>) {
+    fn book_saved(&mut self, id: BookId, result: Result<Book, String>) {
         match result {
-            Ok(()) => {
+            Ok(book) => {
                 self.status = format!("Saved metadata for {}", book.title);
-                if self.editor.as_ref().map(|editor| editor.original.id) == Some(book.id) {
+                if self.editor.as_ref().map(|editor| editor.original.id) == Some(id) {
                     self.editor = Some(BookEditor::new(book));
                 }
                 self.refresh_library();
@@ -659,7 +765,7 @@ impl LecternApp {
             Err(error) => {
                 self.status = format!("Could not save metadata: {error}");
                 if let Some(editor) = &mut self.editor
-                    && editor.original.id == book.id
+                    && editor.original.id == id
                 {
                     editor.saving = false;
                     editor.error = Some(error);
@@ -1241,6 +1347,9 @@ impl LecternApp {
         let mut detach = None;
         let mut attach = None;
         let mut remove = false;
+        let mut contributor_lookup = None;
+        let mut series_lookup = None;
+        let mut tag_lookup = None;
         let removal_busy = self.book_removal.removing.is_some();
         let library_operation_busy = self.importing || self.asset_maintenance.busy();
         egui::Panel::right("metadata-editor")
@@ -1301,6 +1410,9 @@ impl LecternApp {
                 detach = actions.detach;
                 attach = actions.attach;
                 remove = actions.remove;
+                contributor_lookup = actions.contributor_lookup;
+                series_lookup = actions.series_lookup;
+                tag_lookup = actions.tag_lookup;
             });
 
         save |= metadata_save_shortcut(ui, removal_busy, library_operation_busy);
@@ -1328,6 +1440,65 @@ impl LecternApp {
             self.choose_format_attachment(format);
         } else if remove {
             self.request_book_removal();
+        }
+        self.dispatch_contributor_lookup(contributor_lookup);
+        self.dispatch_series_lookup(series_lookup);
+        self.dispatch_tag_lookup(tag_lookup);
+    }
+
+    fn dispatch_contributor_lookup(&mut self, lookup: Option<ContributorLookup>) {
+        let Some(lookup) = lookup else {
+            return;
+        };
+        let selected = self.editor.as_ref().map_or_else(Vec::new, |editor| {
+            editor.curation.existing_contributor_ids()
+        });
+        if !self.workers.autocomplete_contributors(
+            lookup.generation,
+            lookup.row_id,
+            lookup.prefix,
+            selected,
+        ) && let Some(editor) = &mut self.editor
+        {
+            editor.contributor_suggestions.pending = false;
+            editor.contributor_suggestions.error =
+                Some("Metadata worker is unavailable".to_owned());
+        }
+    }
+
+    fn dispatch_series_lookup(&mut self, lookup: Option<SeriesLookup>) {
+        let Some(lookup) = lookup else {
+            return;
+        };
+        let selected = self
+            .editor
+            .as_ref()
+            .map_or_else(Vec::new, |editor| editor.curation.existing_series_id());
+        if !self
+            .workers
+            .autocomplete_series(lookup.generation, lookup.prefix, selected)
+            && let Some(editor) = &mut self.editor
+        {
+            editor.series_suggestions.pending = false;
+            editor.series_suggestions.error = Some("Metadata worker is unavailable".to_owned());
+        }
+    }
+
+    fn dispatch_tag_lookup(&mut self, lookup: Option<TagLookup>) {
+        let Some(lookup) = lookup else {
+            return;
+        };
+        let selected = self
+            .editor
+            .as_ref()
+            .map_or_else(Vec::new, |editor| editor.curation.existing_tag_ids());
+        if !self
+            .workers
+            .autocomplete_tags(lookup.generation, lookup.prefix, selected)
+            && let Some(editor) = &mut self.editor
+        {
+            editor.tag_suggestions.pending = false;
+            editor.tag_suggestions.error = Some("Metadata worker is unavailable".to_owned());
         }
     }
 
@@ -1564,8 +1735,10 @@ impl LecternApp {
         if !editor.can_save() {
             return;
         }
-        let book = editor.book();
-        if self.workers.save_book(book) {
+        let Ok(edit) = editor.edit() else {
+            return;
+        };
+        if self.workers.save_book(edit) {
             editor.saving = true;
             editor.error = None;
             "Saving metadata…".clone_into(&mut self.status);
@@ -2209,8 +2382,9 @@ fn metadata_form(
             if editor.title.trim().is_empty() {
                 ui.label(RichText::new("A title is required.").color(Color32::LIGHT_RED));
             }
-            metadata_text_field(ui, "Authors", &mut editor.authors, editing_enabled);
-            metadata_text_field(ui, "Series", &mut editor.series, editing_enabled);
+            contributor_editor(ui, editor, editing_enabled, &mut actions);
+            series_editor(ui, editor, editing_enabled, &mut actions);
+            tag_editor(ui, editor, editing_enabled, &mut actions);
             metadata_text_field(ui, "Publisher", &mut editor.publisher, editing_enabled);
             metadata_text_field(ui, "Language", &mut editor.language, editing_enabled);
 
@@ -2243,6 +2417,12 @@ fn metadata_form(
                 ui.add_space(8.0);
                 ui.label(RichText::new(error).color(Color32::LIGHT_RED));
             }
+            if editor.changed()
+                && let Err(error) = editor.edit()
+            {
+                ui.add_space(8.0);
+                ui.label(RichText::new(error).color(Color32::LIGHT_RED));
+            }
 
             ui.add_space(12.0);
             (actions.save, actions.reset) = metadata_save_controls(ui, editor, editing_enabled);
@@ -2258,6 +2438,414 @@ fn metadata_form(
             );
         });
     actions
+}
+
+fn contributor_editor(
+    ui: &mut egui::Ui,
+    editor: &mut BookEditor,
+    editing_enabled: bool,
+    actions: &mut MetadataActions,
+) {
+    ui.add_space(4.0);
+    ui.label(RichText::new("Contributors").strong());
+    if editor.curation.contributors.is_empty() {
+        ui.label(RichText::new("No contributors assigned.").color(MUTED));
+    }
+
+    let mut remove = None;
+    let mut move_row = None;
+    for index in 0..editor.curation.contributors.len() {
+        let row_id = editor.curation.contributors[index].row_id;
+        let mut selected_suggestion = None;
+        let mut create_new = false;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let previous_name = editor.curation.contributors[index].name.clone();
+                let response = ui.add_enabled(
+                    editing_enabled,
+                    egui::TextEdit::singleline(&mut editor.curation.contributors[index].name)
+                        .desired_width(180.0)
+                        .hint_text("Contributor name"),
+                );
+                if response.changed() {
+                    editor.curation.contributors[index].name_edited(&previous_name);
+                    editor.contributor_suggestion_row = Some(row_id);
+                    let generation = editor.contributor_suggestions.begin();
+                    actions.contributor_lookup = Some(ContributorLookup {
+                        generation,
+                        row_id,
+                        prefix: editor.curation.contributors[index].name.clone(),
+                    });
+                }
+                egui::ComboBox::from_id_salt(("credit-role", row_id))
+                    .selected_text(editor.curation.contributors[index].role.to_string())
+                    .show_ui(ui, |ui| {
+                        for role in ContributorRole::ALL {
+                            ui.selectable_value(
+                                &mut editor.curation.contributors[index].role,
+                                role,
+                                role.to_string(),
+                            );
+                        }
+                    });
+            });
+
+            ui.horizontal(|ui| {
+                let existing = editor.curation.contributors[index].existing_id.is_some();
+                ui.label(RichText::new("Sort name").color(MUTED).size(11.0));
+                ui.add_enabled(
+                    editing_enabled && !existing,
+                    egui::TextEdit::singleline(&mut editor.curation.contributors[index].sort_name)
+                        .desired_width(180.0),
+                )
+                .on_disabled_hover_text(
+                    "Existing sort names are library-wide; change them in Organise library",
+                );
+                if ui
+                    .add_enabled(editing_enabled && index > 0, egui::Button::new("↑"))
+                    .on_hover_text("Move credit earlier")
+                    .clicked()
+                {
+                    move_row = Some((index, index - 1));
+                }
+                if ui
+                    .add_enabled(
+                        editing_enabled && index + 1 < editor.curation.contributors.len(),
+                        egui::Button::new("↓"),
+                    )
+                    .on_hover_text("Move credit later")
+                    .clicked()
+                {
+                    move_row = Some((index, index + 1));
+                }
+                if ui
+                    .add_enabled(editing_enabled, egui::Button::new("Remove"))
+                    .clicked()
+                {
+                    remove = Some(index);
+                }
+            });
+
+            if editor.contributor_suggestion_row == Some(row_id) {
+                suggestion_status(ui, &editor.contributor_suggestions);
+                for (suggestion_index, usage) in editor
+                    .contributor_suggestions
+                    .results
+                    .iter()
+                    .take(8)
+                    .enumerate()
+                {
+                    let label = format!(
+                        "{} · {} · {} books",
+                        usage.contributor.display_name, usage.contributor.sort_name, usage.books
+                    );
+                    if ui
+                        .add_enabled(editing_enabled, egui::Button::new(label))
+                        .clicked()
+                    {
+                        selected_suggestion = Some(suggestion_index);
+                    }
+                }
+                let name = editor.curation.contributors[index].name.trim();
+                let exact_exists = !name.is_empty()
+                    && editor.contributor_suggestions.results.iter().any(|usage| {
+                        identity_key(&usage.contributor.display_name) == identity_key(name)
+                    });
+                if !name.is_empty()
+                    && !exact_exists
+                    && !editor.contributor_suggestions.pending
+                    && ui
+                        .add_enabled(
+                            editing_enabled,
+                            egui::Button::new(format!("Create contributor ‘{name}’")),
+                        )
+                        .clicked()
+                {
+                    create_new = true;
+                }
+            }
+        });
+
+        if let Some(suggestion_index) = selected_suggestion {
+            let usage = &editor.contributor_suggestions.results[suggestion_index];
+            editor.curation.contributors[index].select_existing(
+                usage.contributor.id,
+                &usage.contributor.display_name,
+                &usage.contributor.sort_name,
+            );
+            editor.contributor_suggestion_row = None;
+            editor.contributor_suggestions.results.clear();
+        } else if create_new {
+            if let Err(error) = editor.curation.contributors[index].confirm_new() {
+                editor.error = Some(error);
+            } else {
+                editor.contributor_suggestion_row = None;
+                editor.contributor_suggestions.results.clear();
+            }
+        }
+        ui.add_space(4.0);
+    }
+    if let Some(index) = remove {
+        editor.curation.contributors.remove(index);
+        editor.contributor_suggestion_row = None;
+        editor.contributor_suggestions.results.clear();
+    } else if let Some((from, to)) = move_row {
+        editor.curation.contributors.swap(from, to);
+    }
+    if ui
+        .add_enabled(editing_enabled, egui::Button::new("Add contributor"))
+        .clicked()
+    {
+        let row_id = editor.curation.add_contributor();
+        editor.contributor_suggestion_row = Some(row_id);
+    }
+}
+
+fn series_editor(
+    ui: &mut egui::Ui,
+    editor: &mut BookEditor,
+    editing_enabled: bool,
+    actions: &mut MetadataActions,
+) {
+    ui.add_space(4.0);
+    ui.label(RichText::new("Series").strong());
+    let mut selected_suggestion = None;
+    let mut create_new = false;
+    ui.horizontal(|ui| {
+        let previous = editor.curation.series.clone();
+        let response = ui.add_enabled(
+            editing_enabled,
+            egui::TextEdit::singleline(&mut editor.curation.series.name)
+                .desired_width(205.0)
+                .hint_text("Series name"),
+        );
+        if response.changed() {
+            editor.curation.series.name_edited();
+            if editor.curation.series.name.trim().is_empty()
+                && !editor.curation.series.index.trim().is_empty()
+            {
+                editor.series_clear_restore = Some(previous);
+            } else if editor.curation.series.name.trim().is_empty() {
+                editor.curation.series.clear();
+                editor.series_suggestions.results.clear();
+            } else {
+                let generation = editor.series_suggestions.begin();
+                actions.series_lookup = Some(SeriesLookup {
+                    generation,
+                    prefix: editor.curation.series.name.clone(),
+                });
+            }
+        }
+        if ui
+            .add_enabled(
+                editing_enabled && !editor.curation.series.name.trim().is_empty(),
+                egui::Button::new("Clear"),
+            )
+            .clicked()
+        {
+            if editor.curation.series.index.trim().is_empty() {
+                editor.curation.series.clear();
+            } else {
+                editor.series_clear_restore = Some(editor.curation.series.clone());
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Book number").color(MUTED).size(11.0));
+        ui.add_enabled(
+            editing_enabled && !editor.curation.series.name.trim().is_empty(),
+            egui::TextEdit::singleline(&mut editor.curation.series.index).desired_width(110.0),
+        );
+    });
+    if !editor.curation.series.index.trim().is_empty()
+        && let Err(error) = editor.curation.series.index.trim().parse::<SeriesIndex>()
+    {
+        ui.label(RichText::new(error.to_string()).color(Color32::LIGHT_RED));
+    }
+
+    if editor.series_clear_restore.is_some() {
+        ui.label(
+            RichText::new("Clear this series and its book number?").color(Color32::LIGHT_YELLOW),
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(editing_enabled, egui::Button::new("Clear both"))
+                .clicked()
+            {
+                editor.curation.series.clear();
+                editor.series_clear_restore = None;
+                editor.series_suggestions.results.clear();
+            }
+            if ui
+                .add_enabled(editing_enabled, egui::Button::new("Keep series"))
+                .clicked()
+                && let Some(previous) = editor.series_clear_restore.take()
+            {
+                editor.curation.series = previous;
+            }
+        });
+        return;
+    }
+
+    suggestion_status(ui, &editor.series_suggestions);
+    for (suggestion_index, usage) in editor.series_suggestions.results.iter().take(8).enumerate() {
+        if ui
+            .add_enabled(
+                editing_enabled,
+                egui::Button::new(format!("{} · {} books", usage.series.name, usage.books)),
+            )
+            .clicked()
+        {
+            selected_suggestion = Some(suggestion_index);
+        }
+    }
+    let name = editor.curation.series.name.trim();
+    let exact_exists = !name.is_empty()
+        && editor
+            .series_suggestions
+            .results
+            .iter()
+            .any(|usage| identity_key(&usage.series.name) == identity_key(name));
+    if !name.is_empty()
+        && editor.curation.series.existing_id.is_none()
+        && !editor.curation.series.confirmed_new
+        && !exact_exists
+        && !editor.series_suggestions.pending
+        && ui
+            .add_enabled(
+                editing_enabled,
+                egui::Button::new(format!("Create series ‘{name}’")),
+            )
+            .clicked()
+    {
+        create_new = true;
+    }
+    if let Some(suggestion_index) = selected_suggestion {
+        let usage = &editor.series_suggestions.results[suggestion_index];
+        editor
+            .curation
+            .series
+            .select_existing(usage.series.id, &usage.series.name);
+        editor.series_suggestions.results.clear();
+    } else if create_new {
+        if let Err(error) = editor.curation.series.confirm_new() {
+            editor.error = Some(error);
+        } else {
+            editor.series_suggestions.results.clear();
+        }
+    }
+}
+
+fn tag_editor(
+    ui: &mut egui::Ui,
+    editor: &mut BookEditor,
+    editing_enabled: bool,
+    actions: &mut MetadataActions,
+) {
+    ui.add_space(4.0);
+    ui.label(RichText::new("Tags").strong());
+    let mut remove = None;
+    ui.horizontal_wrapped(|ui| {
+        for (index, tag) in editor.curation.tags.iter().enumerate() {
+            if ui
+                .add_enabled(
+                    editing_enabled,
+                    egui::Button::new(format!("{} ×", tag.name)),
+                )
+                .on_hover_text("Remove this tag from the book")
+                .clicked()
+            {
+                remove = Some(index);
+            }
+        }
+    });
+    if let Some(index) = remove {
+        editor.curation.tags.remove(index);
+    }
+
+    let response = ui.add_enabled(
+        editing_enabled,
+        egui::TextEdit::singleline(&mut editor.tag_input)
+            .desired_width(f32::INFINITY)
+            .hint_text("Search or create a tag"),
+    );
+    if response.changed() {
+        if editor.tag_input.trim().is_empty() {
+            editor.tag_suggestions.results.clear();
+            editor.tag_suggestions.error = None;
+        } else {
+            let generation = editor.tag_suggestions.begin();
+            actions.tag_lookup = Some(TagLookup {
+                generation,
+                prefix: editor.tag_input.clone(),
+            });
+        }
+    }
+
+    let enter = response.has_focus()
+        && !editor.tag_suggestions.pending
+        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+    let exact_suggestion =
+        editor.tag_suggestions.results.iter().position(|usage| {
+            identity_key(&usage.tag.name) == identity_key(editor.tag_input.trim())
+        });
+    let mut selected_suggestion = None;
+    suggestion_status(ui, &editor.tag_suggestions);
+    for (suggestion_index, usage) in editor.tag_suggestions.results.iter().take(8).enumerate() {
+        if ui
+            .add_enabled(
+                editing_enabled,
+                egui::Button::new(format!("{} · {} books", usage.tag.name, usage.books)),
+            )
+            .clicked()
+        {
+            selected_suggestion = Some(suggestion_index);
+        }
+    }
+
+    let mut create_new = false;
+    if !editor.tag_input.trim().is_empty()
+        && exact_suggestion.is_none()
+        && !editor.tag_suggestions.pending
+    {
+        create_new = ui
+            .add_enabled(
+                editing_enabled,
+                egui::Button::new(format!("Create and add ‘{}’", editor.tag_input.trim())),
+            )
+            .clicked();
+    }
+    selected_suggestion =
+        selected_suggestion.or_else(|| enter.then_some(exact_suggestion).flatten());
+    create_new |= enter && exact_suggestion.is_none();
+
+    if let Some(suggestion_index) = selected_suggestion {
+        let usage = &editor.tag_suggestions.results[suggestion_index];
+        editor
+            .curation
+            .add_existing_tag(usage.tag.id, &usage.tag.name);
+        editor.tag_input.clear();
+        editor.tag_suggestions.results.clear();
+    } else if create_new {
+        match editor.curation.add_new_tag(&editor.tag_input) {
+            Ok(_) => {
+                editor.tag_input.clear();
+                editor.tag_suggestions.results.clear();
+            }
+            Err(error) => editor.error = Some(error),
+        }
+    }
+}
+
+fn suggestion_status<T>(ui: &mut egui::Ui, state: &SuggestionState<T>) {
+    if state.pending {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(RichText::new("Searching library…").color(MUTED).size(11.0));
+        });
+    } else if let Some(error) = &state.error {
+        ui.label(RichText::new(error).color(Color32::LIGHT_RED).size(11.0));
+    }
 }
 
 fn asset_rows(
@@ -2533,11 +3121,6 @@ fn format_extension(format: BookFormat) -> &'static str {
     }
 }
 
-fn optional_metadata(value: &str) -> Option<String> {
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -2704,12 +3287,14 @@ mod tests {
         };
         let mut editor = BookEditor::new(book);
         editor.title = "  Dune Messiah  ".into();
-        editor.series = "   ".into();
+        editor.curation.series.name = " Dune Chronicles ".into();
+        editor.curation.series.confirm_new().unwrap();
+        editor.curation.series.index = "2.000000".into();
 
-        let saved = editor.book();
+        let saved = editor.edit().unwrap();
 
         assert_eq!(saved.title, "Dune Messiah");
-        assert_eq!(saved.series, None);
+        assert_eq!(saved.series.unwrap().index.unwrap().to_string(), "2");
         assert!(editor.changed());
     }
 }

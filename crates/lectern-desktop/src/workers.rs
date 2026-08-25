@@ -14,6 +14,9 @@ use eframe::egui;
 use image::{ImageReader, Limits};
 use lectern_core::{
     AssetHealthReport, AssetId, Book, BookFormat, BookId, BookSummary, LibraryQuery,
+    organisation::{
+        BookEdit, ContributorId, ContributorUsage, SeriesId, SeriesUsage, TagId, TagUsage,
+    },
 };
 use lectern_desktop::export::{
     ExportControl, ExportError, ExportOutcome, ExportProgress, OverwritePolicy, export_file,
@@ -63,8 +66,27 @@ pub(crate) struct ExportRequest {
 
 enum MetadataRequest {
     Load(BookId),
-    Save(Book),
+    Save(BookEdit),
     Remove { id: BookId, title: String },
+}
+
+enum AutocompleteRequest {
+    Contributors {
+        generation: u64,
+        row_id: u64,
+        prefix: String,
+        selected: Vec<ContributorId>,
+    },
+    Series {
+        generation: u64,
+        prefix: String,
+        selected: Vec<SeriesId>,
+    },
+    Tags {
+        generation: u64,
+        prefix: String,
+        selected: Vec<TagId>,
+    },
 }
 
 enum AssetMaintenanceRequest {
@@ -117,8 +139,21 @@ pub(crate) enum WorkerEvent {
         result: Result<Option<Book>, String>,
     },
     BookSaved {
-        book: Book,
-        result: Result<(), String>,
+        id: BookId,
+        result: Result<Book, String>,
+    },
+    ContributorSuggestions {
+        generation: u64,
+        row_id: u64,
+        result: Result<Vec<ContributorUsage>, String>,
+    },
+    SeriesSuggestions {
+        generation: u64,
+        result: Result<Vec<SeriesUsage>, String>,
+    },
+    TagSuggestions {
+        generation: u64,
+        result: Result<Vec<TagUsage>, String>,
     },
     BookRemoved {
         id: BookId,
@@ -165,6 +200,7 @@ pub(crate) struct WorkerSet {
     cover_sender: Sender<BookId>,
     import_sender: Sender<ImportRequest>,
     metadata_sender: Sender<MetadataRequest>,
+    autocomplete_sender: Sender<AutocompleteRequest>,
     asset_maintenance_sender: Sender<AssetMaintenanceRequest>,
     export_sender: Sender<ExportRequest>,
     event_receiver: Receiver<WorkerEvent>,
@@ -176,6 +212,7 @@ impl WorkerSet {
         let (cover_sender, cover_receiver) = bounded(COVER_QUEUE_CAPACITY);
         let (import_sender, import_receiver) = bounded(1);
         let (metadata_sender, metadata_receiver) = unbounded();
+        let (autocomplete_sender, autocomplete_receiver) = unbounded();
         let (asset_maintenance_sender, asset_maintenance_receiver) = bounded(1);
         let (export_sender, export_receiver) = bounded(1);
         let (event_sender, event_receiver) = unbounded();
@@ -211,6 +248,12 @@ impl WorkerSet {
             event_sender.clone(),
             context.clone(),
         );
+        spawn_autocomplete_worker(
+            database_path.to_path_buf(),
+            autocomplete_receiver,
+            event_sender.clone(),
+            context.clone(),
+        );
         spawn_asset_maintenance_worker(
             database_path.to_path_buf(),
             asset_maintenance_receiver,
@@ -224,6 +267,7 @@ impl WorkerSet {
             cover_sender,
             import_sender,
             metadata_sender,
+            autocomplete_sender,
             asset_maintenance_sender,
             export_sender,
             event_receiver,
@@ -253,9 +297,56 @@ impl WorkerSet {
         self.metadata_sender.send(MetadataRequest::Load(id)).is_ok()
     }
 
-    pub(crate) fn save_book(&self, book: Book) -> bool {
+    pub(crate) fn save_book(&self, edit: BookEdit) -> bool {
         self.metadata_sender
-            .send(MetadataRequest::Save(book))
+            .send(MetadataRequest::Save(edit))
+            .is_ok()
+    }
+
+    pub(crate) fn autocomplete_contributors(
+        &self,
+        generation: u64,
+        row_id: u64,
+        prefix: String,
+        selected: Vec<ContributorId>,
+    ) -> bool {
+        self.autocomplete_sender
+            .send(AutocompleteRequest::Contributors {
+                generation,
+                row_id,
+                prefix,
+                selected,
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn autocomplete_series(
+        &self,
+        generation: u64,
+        prefix: String,
+        selected: Vec<SeriesId>,
+    ) -> bool {
+        self.autocomplete_sender
+            .send(AutocompleteRequest::Series {
+                generation,
+                prefix,
+                selected,
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn autocomplete_tags(
+        &self,
+        generation: u64,
+        prefix: String,
+        selected: Vec<TagId>,
+    ) -> bool {
+        self.autocomplete_sender
+            .send(AutocompleteRequest::Tags {
+                generation,
+                prefix,
+                selected,
+            })
             .is_ok()
     }
 
@@ -464,9 +555,16 @@ fn metadata_worker(
                 let result = database.get_book(id).map_err(|error| error.to_string());
                 publish(events, context, WorkerEvent::BookLoaded { id, result })
             }
-            MetadataRequest::Save(book) => {
-                let result = database.save_book(&book).map_err(|error| error.to_string());
-                publish(events, context, WorkerEvent::BookSaved { book, result })
+            MetadataRequest::Save(edit) => {
+                let id = edit.id;
+                let result = database
+                    .save_book_edit(&edit)
+                    .map_err(|error| error.to_string())
+                    .and_then(|()| database.get_book(id).map_err(|error| error.to_string()))
+                    .and_then(|book| {
+                        book.ok_or_else(|| "saved book disappeared before reload".to_owned())
+                    });
+                publish(events, context, WorkerEvent::BookSaved { id, result })
             }
             MetadataRequest::Remove { id, title } => {
                 let result = database.remove_book(id).map_err(|error| error.to_string());
@@ -476,6 +574,96 @@ fn metadata_worker(
                     WorkerEvent::BookRemoved { id, title, result },
                 )
             }
+        };
+        if !published {
+            break;
+        }
+    }
+}
+
+fn spawn_autocomplete_worker(
+    database_path: PathBuf,
+    receiver: Receiver<AutocompleteRequest>,
+    events: Sender<WorkerEvent>,
+    context: egui::Context,
+) {
+    let failure_events = events.clone();
+    let failure_context = context.clone();
+    let result = thread::Builder::new()
+        .name("lectern-autocomplete".into())
+        .spawn(move || autocomplete_worker(&database_path, &receiver, &events, &context));
+    if let Err(error) = result {
+        publish(
+            &failure_events,
+            &failure_context,
+            WorkerEvent::Error(format!("Could not start autocomplete worker: {error}")),
+        );
+    }
+}
+
+fn autocomplete_worker(
+    database_path: &PathBuf,
+    receiver: &Receiver<AutocompleteRequest>,
+    events: &Sender<WorkerEvent>,
+    context: &egui::Context,
+) {
+    let database = match LibraryDatabase::open(database_path) {
+        Ok(database) => database,
+        Err(error) => {
+            publish(events, context, WorkerEvent::Error(error.to_string()));
+            return;
+        }
+    };
+
+    while let Ok(mut request) = receiver.recv() {
+        while let Ok(newer) = receiver.try_recv() {
+            request = newer;
+        }
+        let published = match request {
+            AutocompleteRequest::Contributors {
+                generation,
+                row_id,
+                prefix,
+                selected,
+            } => publish(
+                events,
+                context,
+                WorkerEvent::ContributorSuggestions {
+                    generation,
+                    row_id,
+                    result: database
+                        .autocomplete_contributors(&prefix, &selected, 50)
+                        .map_err(|error| error.to_string()),
+                },
+            ),
+            AutocompleteRequest::Series {
+                generation,
+                prefix,
+                selected,
+            } => publish(
+                events,
+                context,
+                WorkerEvent::SeriesSuggestions {
+                    generation,
+                    result: database
+                        .autocomplete_series(&prefix, &selected, 50)
+                        .map_err(|error| error.to_string()),
+                },
+            ),
+            AutocompleteRequest::Tags {
+                generation,
+                prefix,
+                selected,
+            } => publish(
+                events,
+                context,
+                WorkerEvent::TagSuggestions {
+                    generation,
+                    result: database
+                        .autocomplete_tags(&prefix, &selected, 50)
+                        .map_err(|error| error.to_string()),
+                },
+            ),
         };
         if !published {
             break;
