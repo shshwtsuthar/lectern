@@ -17,9 +17,9 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 use lectern_core::organisation::{
     BookEdit, BookSelection, BulkTagEdit, BulkTagResult, ContributorId, ContributorUsage,
-    LibraryGeneration, NameKind, SearchClause, SearchExpression, SearchParseError,
-    SelectionSnapshot, SelectionTagUsage, SeriesId, SeriesUsage, TagId, TagReference, TagUsage,
-    TextMatch, identity_key, normalize_name,
+    LibraryGeneration, NameKind, SavedSearch, SavedSearchId, SearchClause, SearchExpression,
+    SearchParseError, SelectionSnapshot, SelectionTagUsage, SeriesId, SeriesUsage, TagId,
+    TagReference, TagUsage, TextMatch, identity_key, normalize_name,
 };
 use lectern_core::{
     AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookAssetDraft,
@@ -1081,6 +1081,83 @@ impl LibraryDatabase {
         limit: u32,
     ) -> Result<Vec<TagUsage>> {
         organisation::autocomplete_tags(&self.connection, prefix, selected, limit)
+    }
+
+    /// Lists durable saved projections alphabetically by normalized name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored canonical values or facet references cannot be loaded.
+    pub fn list_saved_searches(&self) -> Result<Vec<SavedSearch>> {
+        organisation::list_saved_searches(&self.connection)
+    }
+
+    /// Creates one named canonical query/filter/sort projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name or query is invalid, collides, references an absent entity,
+    /// or cannot be committed.
+    pub fn create_saved_search(
+        &mut self,
+        name: &str,
+        query: &LibraryQuery,
+    ) -> Result<SavedSearchId> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = organisation::create_saved_search(&transaction, name, query)?;
+        transaction.commit()?;
+        self.bump_generation();
+        Ok(id)
+    }
+
+    /// Explicitly replaces one saved projection while retaining its name and stable ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the saved search is absent, the query is invalid, a facet entity is
+    /// absent, or the transaction cannot commit.
+    pub fn update_saved_search(&mut self, id: SavedSearchId, query: &LibraryQuery) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        organisation::update_saved_search(&transaction, id, query)?;
+        transaction.commit()?;
+        self.bump_generation();
+        Ok(())
+    }
+
+    /// Renames one saved projection without changing its query or stable ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the saved search is absent, the name is invalid or collides, or the
+    /// transaction cannot commit.
+    pub fn rename_saved_search(&mut self, id: SavedSearchId, name: &str) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        organisation::rename_saved_search(&transaction, id, name)?;
+        transaction.commit()?;
+        self.bump_generation();
+        Ok(())
+    }
+
+    /// Deletes one saved projection without changing books or vocabulary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the delete cannot be committed.
+    pub fn delete_saved_search(&self, id: SavedSearchId) -> Result<bool> {
+        let changed = self
+            .connection
+            .prepare_cached("DELETE FROM saved_searches WHERE id = ?1")?
+            .execute([id.value()])?;
+        if changed == 1 {
+            self.bump_generation();
+        }
+        Ok(changed == 1)
     }
 
     /// Attaches one externally referenced publication to an existing logical book.
@@ -2302,7 +2379,8 @@ mod tests {
         organisation::{
             BookEdit, BookSelection, BulkTagEdit, ContributorCreditEdit, ContributorFacet,
             ContributorReference, ContributorRole, ExactFacets, ImportedContributorCredit,
-            ImportedOrganisation, SeriesIndex, SeriesMembershipEdit, SeriesReference, TagReference,
+            ImportedOrganisation, SavedSearchId, SearchExpression, SeriesIndex,
+            SeriesMembershipEdit, SeriesReference, TagId, TagReference,
         },
     };
     use rusqlite::Connection;
@@ -4304,6 +4382,161 @@ END;
                 .autocomplete_tags("Invalid", &[], 50)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn saved_searches_round_trip_complete_canonical_projections() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let id = database
+            .import_books(&[record(
+                "/books/saved-search.epub",
+                "Legacy title",
+                "Combined author",
+            )])
+            .expect("import book")[0];
+        database
+            .save_book_edit(&earthsea_edit(id))
+            .expect("save normalized entities");
+        let book = database.get_book(id).unwrap().unwrap();
+        let contributor = book.contributors[0].contributor.id;
+        let series = book.series_membership.as_ref().unwrap().series.id;
+        let included = book
+            .tags
+            .iter()
+            .find(|tag| tag.name == "Science Fiction")
+            .unwrap()
+            .id;
+        let excluded = book
+            .tags
+            .iter()
+            .find(|tag| tag.name == "Fantasy")
+            .unwrap()
+            .id;
+        let query = LibraryQuery {
+            search: " title:\"A Wizard\"   language:en ".into(),
+            format: Some(BookFormat::Epub),
+            asset_health: Some(AssetHealth::Available),
+            facets: ExactFacets::new(
+                vec![ContributorFacet {
+                    contributor,
+                    author_only: true,
+                }],
+                Some(series),
+                vec![included],
+                vec![excluded],
+            )
+            .unwrap(),
+            sort: SortOrder::Series,
+        };
+
+        let saved_id = database
+            .create_saved_search("  Earthsea   reference  ", &query)
+            .expect("create saved search");
+        let saved = database.list_saved_searches().expect("list saved searches");
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, saved_id);
+        assert_eq!(saved[0].name, "Earthsea reference");
+        assert_eq!(
+            saved[0].query.search,
+            SearchExpression::parse(&query.search).unwrap().canonical()
+        );
+        assert_eq!(saved[0].query.format, query.format);
+        assert_eq!(saved[0].query.asset_health, query.asset_health);
+        assert_eq!(saved[0].query.facets, query.facets);
+        assert_eq!(saved[0].query.sort, query.sort);
+
+        let replacement = LibraryQuery {
+            search: "publisher:Parnassus".into(),
+            format: None,
+            asset_health: Some(AssetHealth::Unknown),
+            facets: ExactFacets::default(),
+            sort: SortOrder::RecentlyAdded,
+        };
+        database
+            .update_saved_search(saved_id, &replacement)
+            .expect("explicit update");
+        database
+            .rename_saved_search(saved_id, "Zeta")
+            .expect("rename with stable identity");
+        let first_id = database
+            .create_saved_search("Alpha", &LibraryQuery::default())
+            .expect("create alphabetically first search");
+        let saved = database.list_saved_searches().unwrap();
+        assert_eq!(
+            saved.iter().map(|value| value.id).collect::<Vec<_>>(),
+            [first_id, saved_id]
+        );
+        assert_eq!(saved[1].query, replacement);
+
+        let before_collision = saved.clone();
+        assert!(matches!(
+            database.rename_saved_search(saved_id, " alpha "),
+            Err(StorageError::InvalidCuration(_))
+        ));
+        assert_eq!(database.list_saved_searches().unwrap(), before_collision);
+
+        let before_invalid_update = database.list_saved_searches().unwrap();
+        assert!(matches!(
+            database.update_saved_search(
+                saved_id,
+                &LibraryQuery {
+                    search: "title:".into(),
+                    ..LibraryQuery::default()
+                }
+            ),
+            Err(StorageError::InvalidSearch(_))
+        ));
+        assert_eq!(
+            database.list_saved_searches().unwrap(),
+            before_invalid_update
+        );
+
+        let before_missing_facet = database.list_saved_searches().unwrap();
+        assert!(
+            database
+                .update_saved_search(
+                    saved_id,
+                    &LibraryQuery {
+                        facets: ExactFacets::new(
+                            Vec::new(),
+                            None,
+                            vec![TagId::new(i64::MAX)],
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                        ..LibraryQuery::default()
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(
+            database.list_saved_searches().unwrap(),
+            before_missing_facet
+        );
+
+        let book_before_delete = database.get_book(id).unwrap().unwrap();
+        let tags_before_delete = database.autocomplete_tags("", &[], 50).unwrap();
+        assert!(
+            !database
+                .delete_saved_search(SavedSearchId::new(404))
+                .unwrap()
+        );
+        assert!(database.delete_saved_search(saved_id).unwrap());
+        assert_eq!(database.get_book(id).unwrap().unwrap(), book_before_delete);
+        assert_eq!(
+            database.autocomplete_tags("", &[], 50).unwrap(),
+            tags_before_delete
+        );
+        assert_eq!(
+            database
+                .list_saved_searches()
+                .unwrap()
+                .iter()
+                .map(|value| value.id)
+                .collect::<Vec<_>>(),
+            [first_id]
         );
     }
 

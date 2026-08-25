@@ -3,13 +3,13 @@
 use std::collections::{HashMap, HashSet};
 
 use lectern_core::{
-    BookId,
+    AssetHealth, BookFormat, BookId, LibraryQuery, SortOrder,
     organisation::{
         BookEdit, Contributor, ContributorCredit, ContributorCreditEdit, ContributorId,
         ContributorReference, ContributorRole, ContributorUsage, ImportedContributorCredit,
-        ImportedOrganisation, NameKind, Series, SeriesId, SeriesIndex, SeriesMembership,
-        SeriesMembershipEdit, SeriesReference, SeriesUsage, Tag, TagId, TagReference, TagUsage,
-        identity_key, normalize_name,
+        ImportedOrganisation, NameKind, SavedSearch, SavedSearchId, Series, SeriesId, SeriesIndex,
+        SeriesMembership, SeriesMembershipEdit, SeriesReference, SeriesUsage, Tag, TagId,
+        TagReference, TagUsage, identity_key, normalize_name,
     },
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -1035,6 +1035,333 @@ fn prefix_bounds(kind: NameKind, prefix: &str) -> Result<(String, String)> {
 
 fn checked_count(count: i64) -> Result<u64> {
     u64::try_from(count).map_err(|_| StorageError::InvalidCount(count))
+}
+
+struct SavedSearchRow {
+    id: SavedSearchId,
+    name: String,
+    shape_version: i64,
+    search: String,
+    series: Option<i64>,
+    format: Option<String>,
+    health: Option<String>,
+    sort: String,
+}
+
+/// Loads every durable saved projection in normalized name order.
+pub(super) fn list_saved_searches(connection: &Connection) -> Result<Vec<SavedSearch>> {
+    let base_rows = {
+        let mut statement = connection.prepare_cached(
+            "SELECT id, name, shape_version, search_expression, series_id, format, \
+                    file_health, sort_order \
+             FROM saved_searches ORDER BY identity_key, id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(SavedSearchRow {
+                id: SavedSearchId::new(row.get(0)?),
+                name: row.get(1)?,
+                shape_version: row.get(2)?,
+                search: row.get(3)?,
+                series: row.get(4)?,
+                format: row.get(5)?,
+                health: row.get(6)?,
+                sort: row.get(7)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut contributors = load_saved_contributor_facets(connection)?;
+    let mut included_tags = load_saved_tag_facets(connection, "saved_search_included_tags")?;
+    let mut excluded_tags = load_saved_tag_facets(connection, "saved_search_excluded_tags")?;
+
+    base_rows
+        .into_iter()
+        .map(|row| {
+            let id = row.id.value();
+            load_saved_search(
+                row,
+                contributors.remove(&id).unwrap_or_default(),
+                included_tags.remove(&id).unwrap_or_default(),
+                excluded_tags.remove(&id).unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+fn load_saved_contributor_facets(
+    connection: &Connection,
+) -> Result<HashMap<i64, Vec<lectern_core::organisation::ContributorFacet>>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT saved_search_id, contributor_id, author_only \
+         FROM saved_search_contributors ORDER BY saved_search_id, contributor_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            lectern_core::organisation::ContributorFacet {
+                contributor: ContributorId::new(row.get(1)?),
+                author_only: row.get(2)?,
+            },
+        ))
+    })?;
+    let mut facets = HashMap::<i64, Vec<_>>::new();
+    for row in rows {
+        let (saved_search, facet) = row?;
+        facets.entry(saved_search).or_default().push(facet);
+    }
+    Ok(facets)
+}
+
+fn load_saved_tag_facets(
+    connection: &Connection,
+    table: &'static str,
+) -> Result<HashMap<i64, Vec<TagId>>> {
+    let sql =
+        format!("SELECT saved_search_id, tag_id FROM {table} ORDER BY saved_search_id, tag_id");
+    let mut statement = connection.prepare_cached(&sql)?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, TagId::new(row.get(1)?)))
+    })?;
+    let mut facets = HashMap::<i64, Vec<_>>::new();
+    for row in rows {
+        let (saved_search, tag) = row?;
+        facets.entry(saved_search).or_default().push(tag);
+    }
+    Ok(facets)
+}
+
+fn load_saved_search(
+    row: SavedSearchRow,
+    contributors: Vec<lectern_core::organisation::ContributorFacet>,
+    included_tags: Vec<TagId>,
+    excluded_tags: Vec<TagId>,
+) -> Result<SavedSearch> {
+    let SavedSearchRow {
+        id,
+        name,
+        shape_version,
+        search,
+        series,
+        format,
+        health,
+        sort,
+    } = row;
+    if shape_version != 1 {
+        return Err(StorageError::Integrity(format!(
+            "saved search {id} has unsupported shape version {shape_version}"
+        )));
+    }
+    let search = lectern_core::organisation::SearchExpression::parse(&search)
+        .map_err(|error| {
+            StorageError::Integrity(format!(
+                "saved search {id} has an invalid search expression: {error}"
+            ))
+        })?
+        .canonical();
+    let facets = lectern_core::organisation::ExactFacets::new(
+        contributors,
+        series.map(SeriesId::new),
+        included_tags,
+        excluded_tags,
+    )
+    .map_err(|error| StorageError::Integrity(error.to_string()))?;
+    let format = format
+        .map(|value| {
+            BookFormat::parse(&value).ok_or_else(|| {
+                StorageError::Integrity(format!("saved search {id} has invalid format {value:?}"))
+            })
+        })
+        .transpose()?;
+    let asset_health = health
+        .map(|value| {
+            AssetHealth::parse(&value).ok_or_else(|| {
+                StorageError::Integrity(format!(
+                    "saved search {id} has invalid file health {value:?}"
+                ))
+            })
+        })
+        .transpose()?;
+    let sort = SortOrder::parse(&sort).ok_or_else(|| {
+        StorageError::Integrity(format!("saved search {id} has invalid sort order"))
+    })?;
+    Ok(SavedSearch {
+        id,
+        name,
+        query: LibraryQuery {
+            search,
+            format,
+            asset_health,
+            facets,
+            sort,
+        },
+    })
+}
+
+/// Creates one durable canonical saved projection.
+pub(super) fn create_saved_search(
+    transaction: &Transaction<'_>,
+    name: &str,
+    query: &LibraryQuery,
+) -> Result<SavedSearchId> {
+    let name = normalize_user_name(NameKind::SavedSearch, name)?;
+    let key = identity_key(&name);
+    ensure_saved_name_available(transaction, &key, None)?;
+    let canonical_search =
+        lectern_core::organisation::SearchExpression::parse(&query.search)?.canonical();
+    transaction.execute(
+        "INSERT INTO saved_searches( \
+             name, identity_key, search_expression, series_id, format, file_health, sort_order \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            name,
+            key,
+            canonical_search,
+            query.facets.series.map(SeriesId::value),
+            query.format.map(BookFormat::as_str),
+            query.asset_health.map(AssetHealth::as_str),
+            query.sort.as_str(),
+        ],
+    )?;
+    let id = SavedSearchId::new(transaction.last_insert_rowid());
+    replace_saved_facets(transaction, id, query)?;
+    Ok(id)
+}
+
+/// Replaces one saved projection without changing its stable name or identity.
+pub(super) fn update_saved_search(
+    transaction: &Transaction<'_>,
+    id: SavedSearchId,
+    query: &LibraryQuery,
+) -> Result<()> {
+    let canonical_search =
+        lectern_core::organisation::SearchExpression::parse(&query.search)?.canonical();
+    let changed = transaction.execute(
+        "UPDATE saved_searches SET \
+             search_expression = ?1, series_id = ?2, format = ?3, file_health = ?4, \
+             sort_order = ?5 \
+         WHERE id = ?6",
+        params![
+            canonical_search,
+            query.facets.series.map(SeriesId::value),
+            query.format.map(BookFormat::as_str),
+            query.asset_health.map(AssetHealth::as_str),
+            query.sort.as_str(),
+            id.value(),
+        ],
+    )?;
+    if changed == 0 {
+        return Err(StorageError::InvalidCuration(format!(
+            "saved search {id} does not exist"
+        )));
+    }
+    replace_saved_facets(transaction, id, query)
+}
+
+/// Renames one saved projection while retaining its stable ID.
+pub(super) fn rename_saved_search(
+    transaction: &Transaction<'_>,
+    id: SavedSearchId,
+    name: &str,
+) -> Result<()> {
+    let name = normalize_user_name(NameKind::SavedSearch, name)?;
+    let key = identity_key(&name);
+    ensure_saved_name_available(transaction, &key, Some(id))?;
+    let changed = transaction.execute(
+        "UPDATE saved_searches SET name = ?1, identity_key = ?2 WHERE id = ?3",
+        params![name, key, id.value()],
+    )?;
+    if changed == 0 {
+        return Err(StorageError::InvalidCuration(format!(
+            "saved search {id} does not exist"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_saved_name_available(
+    connection: &Connection,
+    key: &str,
+    current: Option<SavedSearchId>,
+) -> Result<()> {
+    let collision = connection
+        .query_row(
+            "SELECT id FROM saved_searches WHERE identity_key = ?1",
+            [key],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if collision.is_some_and(|id| Some(SavedSearchId::new(id)) != current) {
+        return Err(StorageError::InvalidCuration(
+            "saved-search name collides with an existing saved search".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn replace_saved_facets(
+    transaction: &Transaction<'_>,
+    id: SavedSearchId,
+    query: &LibraryQuery,
+) -> Result<()> {
+    let canonical = lectern_core::organisation::ExactFacets::new(
+        query.facets.contributors.clone(),
+        query.facets.series,
+        query.facets.included_tags.clone(),
+        query.facets.excluded_tags.clone(),
+    )
+    .map_err(|error| StorageError::InvalidCuration(error.to_string()))?;
+    transaction.execute(
+        "DELETE FROM saved_search_contributors WHERE saved_search_id = ?1",
+        [id.value()],
+    )?;
+    transaction.execute(
+        "DELETE FROM saved_search_included_tags WHERE saved_search_id = ?1",
+        [id.value()],
+    )?;
+    transaction.execute(
+        "DELETE FROM saved_search_excluded_tags WHERE saved_search_id = ?1",
+        [id.value()],
+    )?;
+    {
+        let mut insert = transaction.prepare(
+            "INSERT INTO saved_search_contributors( \
+                 saved_search_id, contributor_id, author_only \
+             ) VALUES (?1, ?2, ?3)",
+        )?;
+        for facet in canonical.contributors {
+            insert.execute(params![
+                id.value(),
+                facet.contributor.value(),
+                facet.author_only,
+            ])?;
+        }
+    }
+    insert_saved_tags(
+        transaction,
+        "saved_search_included_tags",
+        id,
+        &canonical.included_tags,
+    )?;
+    insert_saved_tags(
+        transaction,
+        "saved_search_excluded_tags",
+        id,
+        &canonical.excluded_tags,
+    )
+}
+
+fn insert_saved_tags(
+    transaction: &Transaction<'_>,
+    table: &'static str,
+    id: SavedSearchId,
+    tags: &[TagId],
+) -> Result<()> {
+    let sql = format!("INSERT INTO {table}(saved_search_id, tag_id) VALUES (?1, ?2)");
+    let mut insert = transaction.prepare(&sql)?;
+    for tag in tags {
+        insert.execute(params![id.value(), tag.value()])?;
+    }
+    Ok(())
 }
 
 pub(super) fn series_index_from_database(
