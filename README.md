@@ -9,12 +9,18 @@ immediately searchable, renders a cover grid, and edits their metadata.
 - Add individual EPUB or PDF books, recursively import a folder, or drop either onto the window.
 - Extract EPUB metadata and embedded covers; extract standard PDF metadata and render the first page
   as a bounded cover thumbnail.
-- Search title, author, series, and publisher with SQLite FTS5 prefix indexes.
+- Search with safe fielded prefixes/phrases and combine exact contributor, series, tag, format, and
+  file-health filters.
 - Represent one logical book with one or more stable file assets and filter by any available format.
-- Sort by title, author, or recently added.
+- Sort by title, author, series, or recently added.
 - Browse a virtualized grid backed by bounded result pages; cover I/O, image decoding, and database
   queries stay off the UI thread.
-- Edit metadata in place and refresh the search index as soon as it is saved.
+- Edit ordered contributor roles, contributor sort names, series membership and decimal book
+  number, and flat tags in place; normalized identities and the search index update atomically.
+- Select individual books, unloaded-page ranges, or every current result, then add and remove tags
+  atomically with exact affected counts and bounded memory.
+- Rename, merge, and delete contributors, series, and tags from a bounded, searchable organiser.
+- Save, apply, explicitly update, rename, and delete complete query/filter/sort projections.
 - Attach a missing EPUB or PDF format to an existing book after validating the selected file,
   without changing its metadata, cover, or existing file assets.
 - Remove a book from the library without deleting any of its EPUB or PDF files.
@@ -23,7 +29,7 @@ immediately searchable, renders a cover grid, and edits their metadata.
 - Run library diagnostics and create a consistent, validated SQLite backup from the command line,
   including while the live library has committed data in its WAL.
 
-Bulk editing, device export, filesystem export, and Calibre-library import are not implemented yet.
+Device export, filesystem export, and Calibre-library import are not implemented yet.
 Password-protected PDFs also require a future password prompt. These remain product work rather
 than hidden placeholders in this release.
 
@@ -75,7 +81,9 @@ publication, and refuse to overwrite an existing destination.
 
 The first import can be started with **Add books**, **Add folder**, or native drag-and-drop. Click a
 book card to edit its metadata, attach another format, or remove it from Lectern while keeping its
-original files; `Ctrl-S` on Windows/Linux or `Cmd-S` on macOS saves changes.
+original files; `Ctrl-S` on Windows/Linux or `Cmd-S` on macOS saves changes. Use `Ctrl`/`Cmd`-click
+to toggle grid selection, `Shift`-click for a range, and the toolbar to select all matching books,
+edit their tags, manage exact filters, or reuse a saved search.
 
 ## Workspace
 

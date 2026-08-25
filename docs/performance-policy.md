@@ -65,6 +65,10 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-query-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-vocabulary-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/bulk-tags-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/saved-searches-regression-v1.json
 ```
 
 The export suite is also mandatory for changes to copy buffers, publication, overwrite behavior,
@@ -74,6 +78,8 @@ the exploratory harness. When that workload is not yet stable enough to gate, re
 after raw results and add or improve deterministic coverage rather than claiming an exemption.
 The compositor-backed desktop workload checks title, author, and recently-added sort-to-first-
 painted-frame p95 against a 50 ms product budget while retaining all interaction samples.
+The bulk-tag suite additionally requires a native display and checks selection dispatch and durable
+completion through their next painted frames; CI supplies an isolated X11 display for this gate.
 
 ## Merge gate
 

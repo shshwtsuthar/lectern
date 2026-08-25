@@ -9,6 +9,12 @@ follow [Semantic Versioning](https://semver.org/) once releases begin.
 
 ### Added
 
+- A complete organisation workflow with normalized contributors and roles, one indexed series per
+  book, flat tags, exact facets, safe fielded search, series sorting, and atomic derived projections.
+- Query-backed individual, range, and all-matching selection with atomic multi-tag edits, exact
+  result counts, stale-generation protection, and bounded compositor/memory regression coverage.
+- Bounded contributor, series, tag, and saved-search management, including explicit vocabulary
+  merges and complete reusable query/filter/sort projections.
 - Validated EPUB/PDF format attachment for existing logical books, preserving metadata, covers,
   source bytes, and existing asset identities.
 - Confirmed single-book removal that clears library metadata, asset records, covers, and search

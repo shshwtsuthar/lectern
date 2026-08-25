@@ -65,6 +65,19 @@ The publication-export workload lives in
 samples, gates p05 throughput and peak RSS growth, and verifies exact bytes, collision safety,
 missing-source handling, and temporary-file cleanup.
 
+The normalized organisation workloads cover migration, exact/fielded query planning, and bounded
+vocabulary reads and mutations. The bulk-tag gate in
+[`bulk-tags-regression-v1.json`](bulk-tags-regression-v1.json) selects 10,000 matching books without
+materializing them, applies and reverses an atomic tag edit, checks exact relationship and memory
+results, and retains 40 native compositor samples for both dispatch and completion-to-painted-grid.
+It requires an active X11 or Wayland display; CI runs it under an isolated X11 display.
+
+The saved-search gate in
+[`saved-searches-regression-v1.json`](saved-searches-regression-v1.json) uses 250 complete canonical
+projections. It measures a bounded 100-row manager page, application through the first 128 matching
+book IDs, and create/update/rename/delete lifecycle while proving that book, vocabulary, asset, and
+FTS state remains intact.
+
 Performance-sensitive pull requests additionally run the base and candidate revisions three times
 each on the same runner. The gate compares the median of their run-level p95 values and fails a
 scenario when it exceeds both the versioned percentage limit and minimum material latency delta.
@@ -102,6 +115,10 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-query-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-vocabulary-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/bulk-tags-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/saved-searches-regression-v1.json
 ```
 
 Use `--output-dir PATH` to choose a new artifact directory, or `--budget PATH` to evaluate a
@@ -210,6 +227,13 @@ inspected. These generated artifacts are ignored by Git.
 - Asset-action-to-first-painted-frame begins when the compositor workload queues an Open or Reveal
   request through a no-op platform adapter and ends after the following frame. It excludes external
   application startup; each action retains 40 samples and must remain at or below 50 ms p95.
+- Bulk selection dispatch ends after the busy state is painted; bulk completion ends after the
+  refreshed result page has been installed and painted. Each endpoint retains 40 samples and has a
+  50 ms p95 budget, while the paired 10,000-book durable mutation and refresh has a 500 ms p95 and
+  32 MiB peak-RSS-growth budget.
+- Saved-search manager latency includes the bounded alphabetical read and full projection decode;
+  apply latency includes exact count plus the first 128 IDs; lifecycle latency covers canonical
+  create, list, update, rename, and delete with integrity reconciliation after every sample.
 - Startup, post-population idle-window, sorting, scrolling, and import memory are Linux process RSS.
   RSS is sampled every 20 ms and excludes dedicated GPU memory.
 - Percentiles use the nearest-rank method and every underlying sample remains in JSON.
