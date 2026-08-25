@@ -87,6 +87,21 @@ enum AutocompleteRequest {
         prefix: String,
         selected: Vec<TagId>,
     },
+    FacetContributors {
+        generation: u64,
+        prefix: String,
+        selected: Vec<ContributorId>,
+    },
+    FacetSeries {
+        generation: u64,
+        prefix: String,
+        selected: Vec<SeriesId>,
+    },
+    FacetTags {
+        generation: u64,
+        prefix: String,
+        selected: Vec<TagId>,
+    },
 }
 
 enum AssetMaintenanceRequest {
@@ -152,6 +167,18 @@ pub(crate) enum WorkerEvent {
         result: Result<Vec<SeriesUsage>, String>,
     },
     TagSuggestions {
+        generation: u64,
+        result: Result<Vec<TagUsage>, String>,
+    },
+    FacetContributorSuggestions {
+        generation: u64,
+        result: Result<Vec<ContributorUsage>, String>,
+    },
+    FacetSeriesSuggestions {
+        generation: u64,
+        result: Result<Vec<SeriesUsage>, String>,
+    },
+    FacetTagSuggestions {
         generation: u64,
         result: Result<Vec<TagUsage>, String>,
     },
@@ -343,6 +370,51 @@ impl WorkerSet {
     ) -> bool {
         self.autocomplete_sender
             .send(AutocompleteRequest::Tags {
+                generation,
+                prefix,
+                selected,
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn autocomplete_facet_contributors(
+        &self,
+        generation: u64,
+        prefix: String,
+        selected: Vec<ContributorId>,
+    ) -> bool {
+        self.autocomplete_sender
+            .send(AutocompleteRequest::FacetContributors {
+                generation,
+                prefix,
+                selected,
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn autocomplete_facet_series(
+        &self,
+        generation: u64,
+        prefix: String,
+        selected: Vec<SeriesId>,
+    ) -> bool {
+        self.autocomplete_sender
+            .send(AutocompleteRequest::FacetSeries {
+                generation,
+                prefix,
+                selected,
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn autocomplete_facet_tags(
+        &self,
+        generation: u64,
+        prefix: String,
+        selected: Vec<TagId>,
+    ) -> bool {
+        self.autocomplete_sender
+            .send(AutocompleteRequest::FacetTags {
                 generation,
                 prefix,
                 selected,
@@ -658,6 +730,48 @@ fn autocomplete_worker(
                 events,
                 context,
                 WorkerEvent::TagSuggestions {
+                    generation,
+                    result: database
+                        .autocomplete_tags(&prefix, &selected, 50)
+                        .map_err(|error| error.to_string()),
+                },
+            ),
+            AutocompleteRequest::FacetContributors {
+                generation,
+                prefix,
+                selected,
+            } => publish(
+                events,
+                context,
+                WorkerEvent::FacetContributorSuggestions {
+                    generation,
+                    result: database
+                        .autocomplete_contributors(&prefix, &selected, 50)
+                        .map_err(|error| error.to_string()),
+                },
+            ),
+            AutocompleteRequest::FacetSeries {
+                generation,
+                prefix,
+                selected,
+            } => publish(
+                events,
+                context,
+                WorkerEvent::FacetSeriesSuggestions {
+                    generation,
+                    result: database
+                        .autocomplete_series(&prefix, &selected, 50)
+                        .map_err(|error| error.to_string()),
+                },
+            ),
+            AutocompleteRequest::FacetTags {
+                generation,
+                prefix,
+                selected,
+            } => publish(
+                events,
+                context,
+                WorkerEvent::FacetTagSuggestions {
                     generation,
                     result: database
                         .autocomplete_tags(&prefix, &selected, 50)

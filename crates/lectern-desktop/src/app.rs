@@ -13,7 +13,8 @@ use lectern_core::{
     AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookFormat, BookId, BookSummary,
     LibraryQuery, SortOrder,
     organisation::{
-        BookEdit, ContributorRole, ContributorUsage, SeriesIndex, SeriesUsage, TagUsage,
+        BookEdit, ContributorFacet, ContributorId, ContributorRole, ContributorUsage, ExactFacets,
+        SearchExpression, SearchParseError, SeriesId, SeriesIndex, SeriesUsage, TagId, TagUsage,
         identity_key,
     },
 };
@@ -107,6 +108,21 @@ struct TagLookup {
     prefix: String,
 }
 
+struct FacetContributorLookup {
+    generation: u64,
+    prefix: String,
+}
+
+struct FacetSeriesLookup {
+    generation: u64,
+    prefix: String,
+}
+
+struct FacetTagLookup {
+    generation: u64,
+    prefix: String,
+}
+
 struct SuggestionState<T> {
     generation: u64,
     pending: bool,
@@ -150,6 +166,28 @@ impl<T> SuggestionState<T> {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum TagFacetMode {
+    #[default]
+    Include,
+    Exclude,
+}
+
+#[derive(Default)]
+struct FilterUi {
+    contributor_input: String,
+    contributor_author_only: bool,
+    contributor_suggestions: SuggestionState<ContributorUsage>,
+    series_input: String,
+    series_suggestions: SuggestionState<SeriesUsage>,
+    tag_input: String,
+    tag_mode: TagFacetMode,
+    tag_suggestions: SuggestionState<TagUsage>,
+    contributor_labels: HashMap<ContributorId, String>,
+    series_labels: HashMap<SeriesId, String>,
+    tag_labels: HashMap<TagId, String>,
 }
 
 #[derive(Default)]
@@ -298,6 +336,9 @@ pub(crate) struct LecternApp {
     database_path: PathBuf,
     workers: WorkerSet,
     query: LibraryQuery,
+    search_input: String,
+    search_error: Option<SearchParseError>,
+    filters: FilterUi,
     query_generation: u64,
     query_pending: bool,
     library_total: Option<usize>,
@@ -344,6 +385,9 @@ impl LecternApp {
             database_path,
             workers,
             query: LibraryQuery::default(),
+            search_input: String::new(),
+            search_error: None,
+            filters: FilterUi::default(),
             query_generation: 0,
             query_pending: false,
             library_total: None,
@@ -505,6 +549,17 @@ impl LecternApp {
                     if let Some(editor) = &mut self.editor {
                         editor.tag_suggestions.install(generation, result);
                     }
+                }
+                WorkerEvent::FacetContributorSuggestions { generation, result } => {
+                    self.filters
+                        .contributor_suggestions
+                        .install(generation, result);
+                }
+                WorkerEvent::FacetSeriesSuggestions { generation, result } => {
+                    self.filters.series_suggestions.install(generation, result);
+                }
+                WorkerEvent::FacetTagSuggestions { generation, result } => {
+                    self.filters.tag_suggestions.install(generation, result);
                 }
                 WorkerEvent::BookRemoved { id, title, result } => {
                     self.book_removed(id, &title, result);
@@ -1028,11 +1083,49 @@ impl LecternApp {
         ui.add_space(10.0);
 
         let mut query_changed = false;
+        let mut contributor_lookup = None;
+        let mut series_lookup = None;
+        let mut tag_lookup = None;
         ui.horizontal_centered(|ui| {
-            let search = egui::TextEdit::singleline(&mut self.query.search)
-                .hint_text("Search title, author, series, or publisher…")
+            let search = egui::TextEdit::singleline(&mut self.search_input)
+                .hint_text("Search or use fields such as author:, tag:, format:…")
                 .desired_width(380.0);
-            query_changed |= ui.add_sized([380.0, 34.0], search).changed();
+            if ui.add_sized([380.0, 34.0], search).changed() {
+                match apply_search_input(&mut self.query, &self.search_input) {
+                    Ok(changed) => {
+                        query_changed |= changed;
+                        self.search_error = None;
+                    }
+                    Err(error) => self.search_error = Some(error),
+                }
+            }
+
+            ui.menu_button("Search help", |ui| {
+                ui.label(RichText::new("Safe fielded search").strong());
+                ui.label("title:foundation  author:le  contributor:\"ursula le guin\"");
+                ui.label("series:earthsea  tag:\"science fiction\"  publisher:ace");
+                ui.label("language:en  format:epub  file:missing");
+                ui.separator();
+                ui.label(RichText::new("Bare terms search all text fields. Clauses combine with AND; OR, regex, wildcards, grouping, and raw FTS are not accepted.").color(MUTED));
+            });
+
+            let facet_count = self.query.facets.contributors.len()
+                + self.query.facets.included_tags.len()
+                + self.query.facets.excluded_tags.len()
+                + usize::from(self.query.facets.series.is_some());
+            let filter_label = if facet_count == 0 {
+                "Filters".to_owned()
+            } else {
+                format!("Filters ({facet_count})")
+            };
+            ui.menu_button(filter_label, |ui| {
+                query_changed |= self.filters_popover(
+                    ui,
+                    &mut contributor_lookup,
+                    &mut series_lookup,
+                    &mut tag_lookup,
+                );
+            });
 
             let previous_format = self.query.format;
             egui::ComboBox::from_id_salt("format-filter")
@@ -1068,9 +1161,280 @@ impl LecternApp {
             query_changed |= previous_sort != self.query.sort;
         });
 
+        if let Some(error) = &self.search_error {
+            ui.label(
+                RichText::new(error.to_string())
+                    .color(Color32::LIGHT_RED)
+                    .size(12.0),
+            );
+        }
+        query_changed |= self.active_facet_chips(ui);
+
+        self.dispatch_facet_contributor_lookup(contributor_lookup);
+        self.dispatch_facet_series_lookup(series_lookup);
+        self.dispatch_facet_tag_lookup(tag_lookup);
+
         if query_changed {
             self.refresh_library();
         }
+    }
+
+    fn filters_popover(
+        &mut self,
+        ui: &mut egui::Ui,
+        contributor_lookup: &mut Option<FacetContributorLookup>,
+        series_lookup: &mut Option<FacetSeriesLookup>,
+        tag_lookup: &mut Option<FacetTagLookup>,
+    ) -> bool {
+        let mut changed = false;
+        ui.set_min_width(390.0);
+        ui.label(RichText::new("Required contributors").strong());
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.filters.contributor_input)
+                        .hint_text("Find contributor")
+                        .desired_width(235.0),
+                )
+                .changed()
+            {
+                let generation = self.filters.contributor_suggestions.begin();
+                *contributor_lookup = Some(FacetContributorLookup {
+                    generation,
+                    prefix: self.filters.contributor_input.clone(),
+                });
+            }
+            ui.checkbox(
+                &mut self.filters.contributor_author_only,
+                "Author role only",
+            );
+        });
+        suggestion_status(ui, &self.filters.contributor_suggestions);
+        let mut contributor_selected = None;
+        for (index, usage) in self
+            .filters
+            .contributor_suggestions
+            .results
+            .iter()
+            .take(8)
+            .enumerate()
+        {
+            if ui
+                .button(format!(
+                    "{} · {} books",
+                    usage.contributor.display_name, usage.books
+                ))
+                .clicked()
+            {
+                contributor_selected = Some(index);
+            }
+        }
+        if let Some(index) = contributor_selected {
+            let usage = &self.filters.contributor_suggestions.results[index];
+            let facet = ContributorFacet {
+                contributor: usage.contributor.id,
+                author_only: self.filters.contributor_author_only,
+            };
+            self.query
+                .facets
+                .contributors
+                .retain(|existing| existing.contributor != facet.contributor);
+            self.query.facets.contributors.push(facet);
+            self.query.facets.contributors.sort_unstable();
+            self.filters
+                .contributor_labels
+                .insert(usage.contributor.id, usage.contributor.display_name.clone());
+            self.filters.contributor_input.clear();
+            self.filters.contributor_suggestions.results.clear();
+            changed = true;
+        }
+
+        ui.separator();
+        ui.label(RichText::new("Series").strong());
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut self.filters.series_input)
+                    .hint_text("Find series")
+                    .desired_width(f32::INFINITY),
+            )
+            .changed()
+        {
+            let generation = self.filters.series_suggestions.begin();
+            *series_lookup = Some(FacetSeriesLookup {
+                generation,
+                prefix: self.filters.series_input.clone(),
+            });
+        }
+        suggestion_status(ui, &self.filters.series_suggestions);
+        let mut series_selected = None;
+        for (index, usage) in self
+            .filters
+            .series_suggestions
+            .results
+            .iter()
+            .take(8)
+            .enumerate()
+        {
+            if ui
+                .button(format!("{} · {} books", usage.series.name, usage.books))
+                .clicked()
+            {
+                series_selected = Some(index);
+            }
+        }
+        if let Some(index) = series_selected {
+            let usage = &self.filters.series_suggestions.results[index];
+            self.query.facets.series = Some(usage.series.id);
+            self.filters
+                .series_labels
+                .insert(usage.series.id, usage.series.name.clone());
+            self.filters.series_input.clear();
+            self.filters.series_suggestions.results.clear();
+            changed = true;
+        }
+
+        ui.separator();
+        ui.label(RichText::new("Tags").strong());
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.filters.tag_mode,
+                TagFacetMode::Include,
+                "Require tag",
+            );
+            ui.selectable_value(
+                &mut self.filters.tag_mode,
+                TagFacetMode::Exclude,
+                "Exclude tag",
+            );
+        });
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut self.filters.tag_input)
+                    .hint_text("Find tag")
+                    .desired_width(f32::INFINITY),
+            )
+            .changed()
+        {
+            let generation = self.filters.tag_suggestions.begin();
+            *tag_lookup = Some(FacetTagLookup {
+                generation,
+                prefix: self.filters.tag_input.clone(),
+            });
+        }
+        suggestion_status(ui, &self.filters.tag_suggestions);
+        let mut tag_selected = None;
+        for (index, usage) in self
+            .filters
+            .tag_suggestions
+            .results
+            .iter()
+            .take(8)
+            .enumerate()
+        {
+            if ui
+                .button(format!("{} · {} books", usage.tag.name, usage.books))
+                .clicked()
+            {
+                tag_selected = Some(index);
+            }
+        }
+        if let Some(index) = tag_selected {
+            let usage = &self.filters.tag_suggestions.results[index];
+            match self.filters.tag_mode {
+                TagFacetMode::Include => self.query.facets.include_tag(usage.tag.id),
+                TagFacetMode::Exclude => self.query.facets.exclude_tag(usage.tag.id),
+            }
+            self.filters
+                .tag_labels
+                .insert(usage.tag.id, usage.tag.name.clone());
+            self.filters.tag_input.clear();
+            self.filters.tag_suggestions.results.clear();
+            changed = true;
+        }
+        changed
+    }
+
+    fn active_facet_chips(&mut self, ui: &mut egui::Ui) -> bool {
+        if self.query.facets == ExactFacets::default() {
+            return false;
+        }
+        let mut remove_contributor = None;
+        let mut remove_series = false;
+        let mut remove_included = None;
+        let mut remove_excluded = None;
+        let mut clear = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Active filters").color(MUTED).size(12.0));
+            for facet in &self.query.facets.contributors {
+                let name = self
+                    .filters
+                    .contributor_labels
+                    .get(&facet.contributor)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Contributor {}", facet.contributor.value()));
+                let role = if facet.author_only { " · Author" } else { "" };
+                if ui.button(format!("{name}{role} ×")).clicked() {
+                    remove_contributor = Some(facet.contributor);
+                }
+            }
+            if let Some(series) = self.query.facets.series {
+                let name = self
+                    .filters
+                    .series_labels
+                    .get(&series)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Series {}", series.value()));
+                remove_series = ui.button(format!("{name} ×")).clicked();
+            }
+            for tag in &self.query.facets.included_tags {
+                let name = self
+                    .filters
+                    .tag_labels
+                    .get(tag)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Tag {}", tag.value()));
+                if ui.button(format!("+{name} ×")).clicked() {
+                    remove_included = Some(*tag);
+                }
+            }
+            for tag in &self.query.facets.excluded_tags {
+                let name = self
+                    .filters
+                    .tag_labels
+                    .get(tag)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Tag {}", tag.value()));
+                if ui.button(format!("−{name} ×")).clicked() {
+                    remove_excluded = Some(*tag);
+                }
+            }
+            clear = ui.small_button("Clear all").clicked();
+        });
+        if clear {
+            self.query.facets = ExactFacets::default();
+            return true;
+        }
+        let mut changed = false;
+        if let Some(id) = remove_contributor {
+            self.query
+                .facets
+                .contributors
+                .retain(|facet| facet.contributor != id);
+            changed = true;
+        }
+        if remove_series {
+            self.query.facets.series = None;
+            changed = true;
+        }
+        if let Some(id) = remove_included {
+            self.query.facets.included_tags.retain(|tag| *tag != id);
+            changed = true;
+        }
+        if let Some(id) = remove_excluded {
+            self.query.facets.excluded_tags.retain(|tag| *tag != id);
+            changed = true;
+        }
+        changed
     }
 
     fn toolbar_actions(&mut self, ui: &mut egui::Ui) -> (bool, bool, bool) {
@@ -1499,6 +1863,60 @@ impl LecternApp {
         {
             editor.tag_suggestions.pending = false;
             editor.tag_suggestions.error = Some("Metadata worker is unavailable".to_owned());
+        }
+    }
+
+    fn dispatch_facet_contributor_lookup(&mut self, lookup: Option<FacetContributorLookup>) {
+        let Some(lookup) = lookup else {
+            return;
+        };
+        let selected = self
+            .query
+            .facets
+            .contributors
+            .iter()
+            .map(|facet| facet.contributor)
+            .collect();
+        if !self
+            .workers
+            .autocomplete_facet_contributors(lookup.generation, lookup.prefix, selected)
+        {
+            self.filters.contributor_suggestions.pending = false;
+            self.filters.contributor_suggestions.error =
+                Some("Autocomplete worker is unavailable".to_owned());
+        }
+    }
+
+    fn dispatch_facet_series_lookup(&mut self, lookup: Option<FacetSeriesLookup>) {
+        let Some(lookup) = lookup else {
+            return;
+        };
+        let selected = self.query.facets.series.into_iter().collect();
+        if !self
+            .workers
+            .autocomplete_facet_series(lookup.generation, lookup.prefix, selected)
+        {
+            self.filters.series_suggestions.pending = false;
+            self.filters.series_suggestions.error =
+                Some("Autocomplete worker is unavailable".to_owned());
+        }
+    }
+
+    fn dispatch_facet_tag_lookup(&mut self, lookup: Option<FacetTagLookup>) {
+        let Some(lookup) = lookup else {
+            return;
+        };
+        let mut selected = self.query.facets.included_tags.clone();
+        selected.extend_from_slice(&self.query.facets.excluded_tags);
+        selected.sort_unstable();
+        selected.dedup();
+        if !self
+            .workers
+            .autocomplete_facet_tags(lookup.generation, lookup.prefix, selected)
+        {
+            self.filters.tag_suggestions.pending = false;
+            self.filters.tag_suggestions.error =
+                Some("Autocomplete worker is unavailable".to_owned());
         }
     }
 
@@ -2848,6 +3266,13 @@ fn suggestion_status<T>(ui: &mut egui::Ui, state: &SuggestionState<T>) {
     }
 }
 
+fn apply_search_input(query: &mut LibraryQuery, input: &str) -> Result<bool, SearchParseError> {
+    let canonical = SearchExpression::parse(input)?.canonical();
+    let changed = query.search != canonical;
+    query.search = canonical;
+    Ok(changed)
+}
+
 fn asset_rows(
     ui: &mut egui::Ui,
     book: &Book,
@@ -3128,14 +3553,15 @@ mod tests {
     use eframe::egui;
     use lectern_core::{
         AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId,
+        LibraryQuery,
     };
     use lectern_desktop::export::ExportProgress;
     use lectern_import::ImportProgress;
 
     use super::{
-        BookEditor, CARD_GAP, CARD_WIDTH, COVER_SIZE, QUERY_PAGE_SIZE, asset_health_status,
-        column_count, cover_image, export_fraction, format_export_progress, import_status,
-        query_page_offset, removal_file_message,
+        BookEditor, CARD_GAP, CARD_WIDTH, COVER_SIZE, QUERY_PAGE_SIZE, apply_search_input,
+        asset_health_status, column_count, cover_image, export_fraction, format_export_progress,
+        import_status, query_page_offset, removal_file_message,
     };
 
     #[test]
@@ -3296,5 +3722,17 @@ mod tests {
         assert_eq!(saved.title, "Dune Messiah");
         assert_eq!(saved.series.unwrap().index.unwrap().to_string(), "2");
         assert!(editor.changed());
+    }
+
+    #[test]
+    fn invalid_structured_search_preserves_the_last_valid_projection() {
+        let mut query = LibraryQuery::default();
+        assert!(apply_search_input(&mut query, "author:le tag:\"science fiction\"").unwrap());
+        let valid = query.search.clone();
+
+        let error = apply_search_input(&mut query, "author:le OR tag:fantasy").unwrap_err();
+
+        assert!(error.to_string().contains("unsupported"));
+        assert_eq!(query.search, valid);
     }
 }
