@@ -91,7 +91,11 @@ enum Scenario {
 }
 
 impl Scenario {
-    const ALL: [Self; 3] = [Self::ManagerPage, Self::ApplyProjection, Self::ManagementCycle];
+    const ALL: [Self; 3] = [
+        Self::ManagerPage,
+        Self::ApplyProjection,
+        Self::ManagementCycle,
+    ];
 
     const fn name(self) -> &'static str {
         match self {
@@ -176,11 +180,9 @@ fn run(options: &Options) -> Result<(), String> {
             let started = Instant::now();
             observed_results = match scenario {
                 Scenario::ManagerPage => run_manager_page(&database)?,
-                Scenario::ApplyProjection => run_apply_projection(
-                    &mut database,
-                    &expected_apply_ids,
-                    expected_apply_total,
-                )?,
+                Scenario::ApplyProjection => {
+                    run_apply_projection(&mut database, &expected_apply_ids, expected_apply_total)?
+                }
                 Scenario::ManagementCycle => run_management_cycle(&mut database)?,
             };
             let elapsed = started.elapsed();

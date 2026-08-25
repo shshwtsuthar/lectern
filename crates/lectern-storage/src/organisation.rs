@@ -1948,7 +1948,10 @@ pub(super) fn search_saved_searches(
         let rows = statement.query_map(params![lower, upper, limit, offset], saved_search_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    let ids = base_rows.iter().map(|row| row.id.value()).collect::<Vec<_>>();
+    let ids = base_rows
+        .iter()
+        .map(|row| row.id.value())
+        .collect::<Vec<_>>();
     let mut contributors = load_saved_contributor_facets_for(connection, &ids)?;
     let mut included_tags =
         load_saved_tag_facets_for(connection, "saved_search_included_tags", &ids)?;
