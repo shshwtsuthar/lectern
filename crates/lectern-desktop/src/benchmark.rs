@@ -650,6 +650,10 @@ impl DesktopBenchmark {
         Some(started.elapsed().as_secs_f32() * self.config.scroll_pixels_per_second)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive benchmark state machine preserves endpoint ordering"
+    )]
     pub(crate) fn frame_finished(&mut self, context: &egui::Context, frame: &BenchmarkFrame) {
         if matches!(self.phase, Phase::Startup { .. }) {
             context.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -1090,6 +1094,10 @@ impl DesktopBenchmark {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one schema-shaped writer keeps benchmark reconciliation explicit"
+    )]
     fn write_result(
         &mut self,
         failure: Option<&str>,

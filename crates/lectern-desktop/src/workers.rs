@@ -985,6 +985,10 @@ fn spawn_metadata_worker(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one exhaustive receiver loop preserves serialized metadata ordering"
+)]
 fn metadata_worker(
     database_path: &PathBuf,
     receiver: &Receiver<MetadataRequest>,
@@ -1217,6 +1221,10 @@ fn spawn_autocomplete_worker(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one exhaustive receiver loop preserves autocomplete coalescing"
+)]
 fn autocomplete_worker(
     database_path: &PathBuf,
     receiver: &Receiver<AutocompleteRequest>,

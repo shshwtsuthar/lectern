@@ -847,6 +847,10 @@ impl LecternApp {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive event loop keeps worker transitions serialized"
+    )]
     fn poll_workers(&mut self, context: &egui::Context) {
         while let Some(event) = self.workers.next_event() {
             match event {
@@ -2106,6 +2110,10 @@ impl LecternApp {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one immediate-mode toolbar keeps query transition ordering explicit"
+    )]
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let (add_books, add_folder, rescan_files) = self.toolbar_actions(ui);
         if add_books
@@ -2334,6 +2342,10 @@ impl LecternApp {
         action
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one immediate-mode popover keeps exact-facet transitions together"
+    )]
     fn filters_popover(
         &mut self,
         ui: &mut egui::Ui,
@@ -2704,6 +2716,10 @@ impl LecternApp {
         self.organiser.open = open;
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one immediate-mode organiser view keeps section state together"
+    )]
     fn organiser_contents(&mut self, ui: &mut egui::Ui) {
         let mut requested_section = None;
         ui.horizontal(|ui| {
@@ -2856,6 +2872,10 @@ impl LecternApp {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one immediate-mode saved-search view keeps paging actions together"
+    )]
     fn saved_search_organiser_contents(&mut self, ui: &mut egui::Ui) {
         ui.heading("Saved searches");
         ui.label(
@@ -3048,6 +3068,10 @@ impl LecternApp {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one modal dispatcher keeps vocabulary confirmation state exhaustive"
+    )]
     fn vocabulary_dialog_window(&mut self, context: &egui::Context) {
         let Some(mut dialog) = self.organiser.dialog.take() else {
             return;
@@ -3287,6 +3311,10 @@ impl LecternApp {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one modal dispatcher keeps saved-search retry state exhaustive"
+    )]
     fn saved_search_dialog_window(&mut self, context: &egui::Context) {
         let mut mutation = None;
         let mut cancel = false;
@@ -3616,6 +3644,10 @@ impl LecternApp {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one immediate-mode bulk editor keeps queued tag states coherent"
+    )]
     fn bulk_tag_panel(&mut self, ui: &mut egui::Ui) {
         let mut close = false;
         let mut lookup = None;
@@ -3952,6 +3984,10 @@ impl LecternApp {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one immediate-mode metadata panel keeps destructive actions visible"
+    )]
     fn metadata_panel(&mut self, ui: &mut egui::Ui) {
         let mut close = false;
         let mut reset = false;
@@ -5561,6 +5597,10 @@ fn metadata_form(
     actions
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one immediate-mode editor keeps ordered credit actions coherent"
+)]
 fn contributor_editor(
     ui: &mut egui::Ui,
     editor: &mut BookEditor,
@@ -5722,6 +5762,10 @@ fn contributor_editor(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one immediate-mode editor keeps series and index validation together"
+)]
 fn series_editor(
     ui: &mut egui::Ui,
     editor: &mut BookEditor,
@@ -6135,6 +6179,10 @@ fn apply_search_input(query: &mut LibraryQuery, input: &str) -> Result<bool, Sea
     Ok(changed)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one immediate-mode asset list keeps per-row action state together"
+)]
 fn asset_rows(
     ui: &mut egui::Ui,
     book: &Book,
@@ -6588,7 +6636,7 @@ mod tests {
             total_bytes: 256 * 1024 * 1024,
         };
 
-        assert_eq!(export_fraction(halfway), 0.5);
+        assert!((export_fraction(halfway) - 0.5).abs() <= f32::EPSILON);
         assert_eq!(
             format_export_progress(halfway, false),
             "Exporting 128 of 256 MiB…"
