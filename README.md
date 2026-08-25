@@ -20,6 +20,8 @@ immediately searchable, renders a cover grid, and edits their metadata.
 - Remove a book from the library without deleting any of its EPUB or PDF files.
 - Rescan referenced book files, filter missing or unreadable assets, and safely relink a missing
   EPUB or PDF without losing its logical-book metadata, cover, or asset identity.
+- Run library diagnostics and create a consistent, validated SQLite backup from the command line,
+  including while the live library has committed data in its WAL.
 
 Bulk editing, device export, filesystem export, and Calibre-library import are not implemented yet.
 Password-protected PDFs also require a future password prompt. These remain product work rather
@@ -48,7 +50,11 @@ the latest stable toolchain for day-to-day development.
 
 ```sh
 cargo run
-cargo run -p lectern-cli -- --help
+cargo run -p lectern-cli -- stats
+cargo run -p lectern-cli -- doctor
+cargo run -p lectern-cli -- backup /path/to/library-backup.sqlite3
+cargo run -p lectern-cli -- import /path/to/books /path/to/another.epub
+cargo run -p lectern-cli -- scan
 cargo test-all
 cargo clippy-all
 cargo fmt --all --check
@@ -60,7 +66,12 @@ development or testing:
 
 ```sh
 LECTERN_DATA_DIR=/path/to/lectern-data cargo run --release
+cargo run -p lectern-cli -- --database /path/to/library.sqlite3 doctor
 ```
+
+Administrative CLI commands require an existing library and do not silently create one. Backups
+are online SQLite snapshots, include committed WAL data, validate integrity and book counts before
+publication, and refuse to overwrite an existing destination.
 
 The first import can be started with **Add books**, **Add folder**, or native drag-and-drop. Click a
 book card to edit its metadata, attach another format, or remove it from Lectern while keeping its
@@ -70,7 +81,8 @@ original files; `Ctrl-S` on Windows/Linux or `Cmd-S` on macOS saves changes.
 
 ```text
 crates/
-├── lectern-core/     # UI- and infrastructure-independent application boundary
+├── lectern-core/     # Domain language and workflow contract
+├── lectern-service/  # Application policy and workflow orchestration
 ├── lectern-desktop/  # Native application
 ├── lectern-import/   # EPUB and PDF discovery and ingestion
 ├── lectern-storage/  # SQLite persistence
@@ -90,9 +102,9 @@ are the same book; trusted aggregate importers such as the planned Calibre adapt
 several formats atomically.
 
 The application has performance-conscious boundaries and deterministic weekly regression suites
-for full-result queries, paged queries, single-book removal, and validated format attachment with a
-bounded refresh against a 50,000-book library. The broader benchmark study retains raw measurements
-for cold launch, import throughput, scrolling, and memory; see
+for backup and diagnostics, full-result and paged queries, curation, single-book removal, and asset
+lifecycle workflows against a 50,000-book library. The broader benchmark study retains raw
+measurements for cold launch, import throughput, scrolling, and memory; see
 [`benchmarks/README.md`](benchmarks/README.md) for how to run and interpret both workflows.
 
 ## Quality gates

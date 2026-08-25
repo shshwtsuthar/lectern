@@ -38,6 +38,8 @@ Before every commit containing a performance-sensitive change:
 Storage and query changes currently require all registered deterministic storage suites:
 
 ```sh
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/maintenance-regression-v1.json
 python3 benchmarks/performance_regression.py
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/query-covered-regression-v1.json
@@ -57,6 +59,12 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/export-asset-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/reimport-known-path-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/organisation-migration-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/organisation-query-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/organisation-vocabulary-regression-v1.json
 ```
 
 The export suite is also mandatory for changes to copy buffers, publication, overwrite behavior,

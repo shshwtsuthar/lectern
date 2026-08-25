@@ -6,29 +6,39 @@ storage, and import layers.
 ## Dependency direction
 
 ```text
-lectern-desktop ────────> lectern-core
-       │                       ▲
-       ├──> lectern-storage ───┘
-       └──> lectern-import ────┬──> lectern-core
-                               └──> lectern-storage
+lectern-desktop ──┐
+                  ├──> lectern-service ──┬──> lectern-core
+lectern-cli ──────┘                      ├──> lectern-import ──┬──> lectern-core
+                                         │                    └──> lectern-storage
+                                         └──> lectern-storage ───> lectern-core
 ```
 
 `lectern-core` owns domain language, use cases, and the interfaces those use cases need. It must not
 depend on a desktop framework, database driver, device SDK, network client, or platform API. Adapters
 may depend on the core and implement its interfaces; the core must never depend on adapters.
 
-The CLI exists as a lightweight diagnostic and automation surface. It is not a commitment to a
-CLI-first product.
+`lectern-core` exposes one narrow `LibraryService` workflow contract rather than adapter-specific
+transactions. The SQLite implementation lives in `lectern-service`, where product policy such as
+preserving user-edited metadata on ordinary re-import is composed with parsing and persistence.
+Desktop workers and the CLI invoke this workflow boundary; storage remains responsible for
+mechanics and invariants, not frontend policy.
+
+The CLI is a real diagnostic and automation surface, though Lectern remains a desktop-first
+product. It can inspect statistics, run diagnostics, create a consistent backup, import
+publications, and rescan referenced-file health against either the default library or an explicit
+database path.
 
 ## Implemented boundaries
 
-- `lectern-core` owns logical-book, asset, query, format, and sort types without infrastructure
-  dependencies.
+- `lectern-core` owns logical-book, asset, query, maintenance, and import language plus the narrow
+  workflow interface, without infrastructure dependencies.
+- `lectern-service` owns workflow orchestration and application policy while composing import and
+  SQLite adapters.
 - `lectern-storage` owns schema migration, transactional writes, FTS5 queries, and cover blobs.
 - `lectern-import` owns EPUB/PDF discovery, bounded parsing and cover rendering, and batched
   ingestion.
 - `lectern-desktop` owns native presentation, worker coordination, and platform dialogs.
-- `lectern-cli` remains a small diagnostic executable.
+- `lectern-cli` owns command parsing and human-readable automation/diagnostic output.
 
 Add another crate only when a boundary has distinct dependencies, ownership, or release needs.
 Avoid a crate per feature and avoid a shared `utils` crate; keep helpers with the concepts that own
@@ -66,6 +76,13 @@ Persistent connections request WAL and use full synchronization. If SQLite canno
 a filesystem, full synchronization remains in effect for the returned rollback journal mode. Schema
 creation and upgrades acquire an immediate transaction, validate relational and FTS integrity, and
 advance the schema version only after validation succeeds.
+
+Online backups use SQLite's backup API rather than copying the active database file. A backup is
+written to a reserved sibling temporary path, checked for SQLite integrity and the expected book
+count, synchronized, and then published without overwriting an existing destination. Diagnostics
+report schema version, SQLite and foreign-key status, FTS consistency, missing book assets,
+relationship validity, and referenced-file health. Managed-file/hash consistency remains an
+explicit skipped check until managed storage exists.
 
 ## Operational principles
 

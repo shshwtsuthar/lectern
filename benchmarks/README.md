@@ -2,10 +2,10 @@
 
 This directory contains two complementary workflows:
 
-- `performance_regression.py` is a deterministic, versioned regression runner. It exercises
-  full-result queries and paged queries over both metadata-only and covered libraries, single-book
-  removal, and validated format attachment followed by a first-page refresh each week in GitHub
-  Actions, can be dispatched manually, and fails when a release latency budget is exceeded.
+- `performance_regression.py` is a deterministic, versioned regression runner. It exercises backup
+  and diagnostics, full-result and paged queries, normalized curation, and book/asset lifecycle
+  operations each week in GitHub Actions, can be dispatched manually, and fails when a release
+  latency or resource budget is exceeded.
 - `run.py` is an opt-in exploratory study for large libraries. It exercises the production SQLite
   query path, EPUB/PDF importer, and native egui cover grid. Its raw JSON is intentionally
   non-gating because the workload requires a prepared corpus and a graphical desktop session.
@@ -16,6 +16,11 @@ Each regression workload seeds a 50,000-book SQLite library with deterministic m
 warmup iterations followed by 40 measured iterations of every versioned query scenario, and checks
 both result integrity and p95 latency. It records all raw samples, the database, toolchain/host
 metadata, commands, and a compact pass/fail report.
+
+The maintenance workload in [`maintenance-regression-v1.json`](maintenance-regression-v1.json)
+runs 3 warmups and 20 measured iterations of the production online-backup and diagnostic paths. It
+validates SQLite, foreign keys, FTS, relationships, referenced-file partitioning, snapshot counts,
+snapshot integrity, and collision safety while gating backup and doctor p95.
 
 The metadata-only full-result workload and its limits live in
 [`query-regression-v1.json`](query-regression-v1.json), with a matching covered-library projection
@@ -70,6 +75,8 @@ absolute budget until it has a comparable history.
 Run it locally from the repository root:
 
 ```bash
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/maintenance-regression-v1.json
 python3 benchmarks/performance_regression.py
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/query-covered-regression-v1.json
@@ -89,6 +96,12 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/export-asset-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/reimport-known-path-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/organisation-migration-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/organisation-query-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/organisation-vocabulary-regression-v1.json
 ```
 
 Use `--output-dir PATH` to choose a new artifact directory, or `--budget PATH` to evaluate a
