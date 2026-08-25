@@ -12,8 +12,9 @@ use lectern_core::{
     ImportProgress, ImportSummary, LibraryDiagnostics, LibraryPage, LibraryQuery, LibraryService,
     LibraryStats,
     organisation::{
-        BookEdit, ContributorId, ContributorUsage, SelectionSnapshot, SeriesId, SeriesUsage, TagId,
-        TagUsage, VocabularyMutationResult,
+        BookEdit, BookSelection, BulkTagEdit, BulkTagResult, ContributorId, ContributorUsage,
+        SelectionSnapshot, SelectionTagUsage, SeriesId, SeriesUsage, TagId, TagUsage,
+        VocabularyMutationResult,
     },
 };
 use lectern_import::{import_paths_into, validate_publication};
@@ -105,6 +106,25 @@ impl LibraryService for SqliteLibraryService {
         limit: u32,
     ) -> Result<Vec<BookId>, Self::Error> {
         Ok(self.database.query_ids_window(query, offset, limit)?)
+    }
+
+    fn selection_tag_usage(
+        &mut self,
+        selection: &BookSelection,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<SelectionTagUsage>, Self::Error> {
+        Ok(self
+            .database
+            .selection_tag_usage(selection, offset, limit)?)
+    }
+
+    fn apply_bulk_tags(
+        &mut self,
+        selection: &BookSelection,
+        edit: &BulkTagEdit,
+    ) -> Result<BulkTagResult, Self::Error> {
+        Ok(self.database.apply_bulk_tags(selection, edit)?)
     }
 
     fn get_book(&mut self, id: BookId) -> Result<Option<Book>, Self::Error> {

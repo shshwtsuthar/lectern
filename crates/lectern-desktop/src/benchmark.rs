@@ -14,7 +14,10 @@ use std::{
 };
 
 use eframe::egui;
-use lectern_core::{BookSummary, SortOrder};
+use lectern_core::{
+    BookSummary, SortOrder,
+    organisation::{BulkTagEdit, BulkTagResult, TagId, TagReference},
+};
 use serde::Serialize;
 
 use crate::platform::PlatformAction;
@@ -35,6 +38,8 @@ const SORT_TO_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
 const ASSET_ACTION_TO_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
 const EDITOR_OPEN_TO_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
 const SELECTION_DISPATCH_TO_BUSY_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
+const BULK_COMPLETION_TO_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
+const BULK_MATCHING_BOOKS: u64 = 10_000;
 const ASSET_ACTIONS: [PlatformAction; 2] = [PlatformAction::Open, PlatformAction::Reveal];
 
 pub(crate) struct BenchmarkFrame {
@@ -62,6 +67,16 @@ struct BenchmarkConfig {
     editor_iterations: usize,
     selection_warmup_iterations: usize,
     selection_iterations: usize,
+    bulk_warmup_iterations: usize,
+    bulk_iterations: usize,
+    bulk_tags: Option<BulkTagBenchmarkTags>,
+}
+
+#[derive(Clone, Copy)]
+struct BulkTagBenchmarkTags {
+    baseline: TagId,
+    added_a: TagId,
+    added_b: TagId,
 }
 
 impl BenchmarkConfig {
@@ -90,7 +105,11 @@ impl BenchmarkConfig {
                 0,
             )?,
             selection_iterations: usize_from_env("LECTERN_BENCHMARK_SELECTION_ITERATIONS", 0)?,
+            bulk_warmup_iterations: usize_from_env("LECTERN_BENCHMARK_BULK_WARMUP_ITERATIONS", 0)?,
+            bulk_iterations: usize_from_env("LECTERN_BENCHMARK_BULK_ITERATIONS", 0)?,
+            bulk_tags: None,
         };
+        let mut config = config;
         if config.scroll.is_zero() && !config.scroll_warmup.is_zero() {
             return Err(
                 "LECTERN_BENCHMARK_SCROLL_WARMUP_SECONDS must be zero when scrolling is disabled"
@@ -122,6 +141,19 @@ impl BenchmarkConfig {
                     .into(),
             );
         }
+        if config.bulk_iterations == 0 && config.bulk_warmup_iterations > 0 {
+            return Err(
+                "LECTERN_BENCHMARK_BULK_WARMUP_ITERATIONS must be zero when bulk interactions are disabled"
+                    .into(),
+            );
+        }
+        if config.bulk_iterations > 0 {
+            config.bulk_tags = Some(BulkTagBenchmarkTags {
+                baseline: tag_id_from_env("LECTERN_BENCHMARK_BULK_BASELINE_TAG_ID")?,
+                added_a: tag_id_from_env("LECTERN_BENCHMARK_BULK_ADD_TAG_A_ID")?,
+                added_b: tag_id_from_env("LECTERN_BENCHMARK_BULK_ADD_TAG_B_ID")?,
+            });
+        }
         Ok(config)
     }
 }
@@ -148,6 +180,10 @@ enum Phase {
     Selection {
         completed: usize,
         pending: Option<PendingSelectionInteraction>,
+    },
+    BulkTags {
+        completed: usize,
+        state: BulkTagBenchmarkState,
     },
     Scroll {
         started: Instant,
@@ -179,6 +215,19 @@ struct PendingSelectionInteraction {
     installed_count: Option<u64>,
 }
 
+enum BulkTagBenchmarkState {
+    QueryRequest,
+    QueryPending,
+    SelectionRequest,
+    SelectionPending,
+    EditRequest,
+    ApplyPending,
+    RefreshPending {
+        started: Instant,
+        paint_frames_remaining: Option<u8>,
+    },
+}
+
 pub(crate) struct DesktopBenchmark {
     output_path: PathBuf,
     config: BenchmarkConfig,
@@ -204,6 +253,9 @@ pub(crate) struct DesktopBenchmark {
     close_editor_requested: bool,
     selection_dispatch_to_busy_paint_samples_ns: Vec<u64>,
     clear_selection_requested: bool,
+    bulk_completion_to_paint_samples_ns: Vec<u64>,
+    bulk_forward_operations: usize,
+    bulk_inverse_operations: usize,
     validation_failure: Option<String>,
     memory: Option<PhaseMemorySampler>,
 }
@@ -242,6 +294,9 @@ impl DesktopBenchmark {
             close_editor_requested: false,
             selection_dispatch_to_busy_paint_samples_ns: Vec::new(),
             clear_selection_requested: false,
+            bulk_completion_to_paint_samples_ns: Vec::new(),
+            bulk_forward_operations: 0,
+            bulk_inverse_operations: 0,
             validation_failure: None,
             memory: Some(memory),
         }))
@@ -295,6 +350,35 @@ impl DesktopBenchmark {
                     Some(_) => {}
                 }
                 pending.paint_frames_remaining = Some(1);
+            }
+            Phase::BulkTags { state, .. }
+                if matches!(state, BulkTagBenchmarkState::QueryPending) =>
+            {
+                if total != BULK_MATCHING_BOOKS || books.is_empty() {
+                    self.validation_failure = Some(format!(
+                        "bulk query returned {total} books and a {}-book page; expected {BULK_MATCHING_BOOKS} and a populated page",
+                        books.len(),
+                    ));
+                    return;
+                }
+                *state = BulkTagBenchmarkState::SelectionRequest;
+            }
+            Phase::BulkTags {
+                state:
+                    BulkTagBenchmarkState::RefreshPending {
+                        paint_frames_remaining,
+                        ..
+                    },
+                ..
+            } if paint_frames_remaining.is_none() => {
+                if total != BULK_MATCHING_BOOKS || books.is_empty() {
+                    self.validation_failure = Some(format!(
+                        "bulk refresh returned {total} books and a {}-book page; expected {BULK_MATCHING_BOOKS} and a populated page",
+                        books.len(),
+                    ));
+                    return;
+                }
+                *paint_frames_remaining = Some(1);
             }
             _ => {}
         }
@@ -420,6 +504,115 @@ impl DesktopBenchmark {
         std::mem::take(&mut self.clear_selection_requested)
     }
 
+    pub(crate) fn next_bulk_query_request(&mut self) -> bool {
+        let Phase::BulkTags { state, .. } = &mut self.phase else {
+            return false;
+        };
+        if !matches!(state, BulkTagBenchmarkState::QueryRequest) {
+            return false;
+        }
+        *state = BulkTagBenchmarkState::QueryPending;
+        true
+    }
+
+    pub(crate) fn next_bulk_selection_request(&mut self) -> bool {
+        let Phase::BulkTags { state, .. } = &mut self.phase else {
+            return false;
+        };
+        if !matches!(state, BulkTagBenchmarkState::SelectionRequest) {
+            return false;
+        }
+        *state = BulkTagBenchmarkState::SelectionPending;
+        true
+    }
+
+    pub(crate) fn bulk_selection_installed(&mut self, selected_books: u64) {
+        let Phase::BulkTags { state, .. } = &mut self.phase else {
+            return;
+        };
+        if !matches!(state, BulkTagBenchmarkState::SelectionPending) {
+            return;
+        }
+        if selected_books != BULK_MATCHING_BOOKS {
+            self.validation_failure = Some(format!(
+                "bulk selection installed {selected_books} books; expected {BULK_MATCHING_BOOKS}",
+            ));
+            return;
+        }
+        *state = BulkTagBenchmarkState::EditRequest;
+    }
+
+    pub(crate) fn next_bulk_edit(&mut self) -> Option<BulkTagEdit> {
+        let Phase::BulkTags { completed, state } = &mut self.phase else {
+            return None;
+        };
+        if !matches!(state, BulkTagBenchmarkState::EditRequest) {
+            return None;
+        }
+        let tags = self
+            .config
+            .bulk_tags
+            .expect("bulk benchmark tags are configured");
+        let edit = if *completed % 2 == 0 {
+            BulkTagEdit {
+                add: vec![
+                    TagReference::Existing(tags.added_a),
+                    TagReference::Existing(tags.added_b),
+                ],
+                remove: vec![tags.baseline],
+            }
+        } else {
+            BulkTagEdit {
+                add: vec![TagReference::Existing(tags.baseline)],
+                remove: vec![tags.added_a, tags.added_b],
+            }
+        };
+        *state = BulkTagBenchmarkState::ApplyPending;
+        Some(edit)
+    }
+
+    pub(crate) fn bulk_tags_completed(&mut self, result: BulkTagResult) {
+        let Phase::BulkTags { completed, state } = &mut self.phase else {
+            return;
+        };
+        if !matches!(state, BulkTagBenchmarkState::ApplyPending) {
+            return;
+        }
+        let forward = *completed % 2 == 0;
+        let (relationships_added, relationships_removed) = if forward {
+            (BULK_MATCHING_BOOKS * 2, BULK_MATCHING_BOOKS)
+        } else {
+            (BULK_MATCHING_BOOKS, BULK_MATCHING_BOOKS * 2)
+        };
+        if result.books_matched != BULK_MATCHING_BOOKS
+            || result.relationships_added != relationships_added
+            || result.relationships_removed != relationships_removed
+            || result.tags_created != 0
+        {
+            self.validation_failure = Some(format!(
+                "bulk operation returned matched/added/removed/created {}/{}/{}/{}; expected {BULK_MATCHING_BOOKS}/{relationships_added}/{relationships_removed}/0",
+                result.books_matched,
+                result.relationships_added,
+                result.relationships_removed,
+                result.tags_created,
+            ));
+            return;
+        }
+        if forward {
+            self.bulk_forward_operations += 1;
+        } else {
+            self.bulk_inverse_operations += 1;
+        }
+        *state = BulkTagBenchmarkState::RefreshPending {
+            started: Instant::now(),
+            paint_frames_remaining: None,
+        };
+    }
+
+    pub(crate) fn bulk_dispatch_failed(&mut self, error: impl Into<String>) {
+        self.validation_failure = Some(error.into());
+    }
+
     pub(crate) fn frame_started(&mut self, cpu_usage_seconds: Option<f32>, unstable_dt: f32) {
         let now = Instant::now();
         let interval = self
@@ -458,17 +651,23 @@ impl DesktopBenchmark {
     }
 
     pub(crate) fn frame_finished(&mut self, context: &egui::Context, frame: &BenchmarkFrame) {
+        if matches!(self.phase, Phase::Startup { .. }) {
+            context.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         let now = Instant::now();
         let mut begin_idle = false;
         let mut begin_sort = false;
         let mut begin_asset_actions = false;
         let mut begin_editor = false;
         let mut begin_selection = false;
+        let mut begin_bulk_tags = false;
         let mut begin_scroll = false;
         let mut sort_finished = false;
         let mut asset_actions_finished = false;
         let mut editor_finished = false;
         let mut selection_finished = false;
+        let mut bulk_tags_finished = false;
+        let mut bulk_next_selection = false;
         let mut finish = false;
         let mut failure = None;
         let mut observed_scroll_duration = None;
@@ -507,6 +706,10 @@ impl DesktopBenchmark {
                 failure =
                     Some("desktop benchmark timed out during selection interactions".to_owned());
             }
+            Phase::BulkTags { .. } if timed_out => {
+                failure =
+                    Some("desktop benchmark timed out during bulk-tag interactions".to_owned());
+            }
             Phase::Scroll { started } if timed_out => {
                 observed_scroll_duration = Some(now.duration_since(*started));
                 failure = Some("desktop benchmark timed out during scrolling".to_owned());
@@ -520,6 +723,8 @@ impl DesktopBenchmark {
                     begin_editor = true;
                 } else if self.config.selection_iterations > 0 {
                     begin_selection = true;
+                } else if self.config.bulk_iterations > 0 {
+                    begin_bulk_tags = true;
                 } else if self.config.scroll.is_zero() {
                     self.idle_end_rss_bytes = current_rss_bytes();
                     observed_scroll_duration = Some(Duration::ZERO);
@@ -612,6 +817,39 @@ impl DesktopBenchmark {
                 pending.busy_painted = true;
                 context.request_repaint();
             }
+            Phase::BulkTags {
+                completed,
+                state:
+                    BulkTagBenchmarkState::RefreshPending {
+                        started,
+                        paint_frames_remaining: Some(0),
+                    },
+            } => {
+                if frame.selection_pending
+                    || frame.selected_books != 0
+                    || frame.all_matching_selected
+                {
+                    failure = Some(
+                        "bulk refresh painted with the completed selection still active".to_owned(),
+                    );
+                } else if *completed >= self.config.bulk_warmup_iterations {
+                    if let Some(latency) = elapsed_ns(now.duration_since(*started)) {
+                        self.bulk_completion_to_paint_samples_ns.push(latency);
+                    } else {
+                        failure = Some(
+                            "bulk-completion-to-paint latency exceeded the supported range"
+                                .to_owned(),
+                        );
+                    }
+                }
+                *completed += 1;
+                bulk_tags_finished =
+                    *completed >= self.config.bulk_warmup_iterations + self.config.bulk_iterations;
+                if !bulk_tags_finished {
+                    bulk_next_selection = true;
+                }
+                context.request_repaint();
+            }
             Phase::Selection { completed, pending }
                 if pending.as_ref().is_some_and(|pending| {
                     pending.busy_painted
@@ -638,7 +876,15 @@ impl DesktopBenchmark {
                     >= self.config.selection_warmup_iterations + self.config.selection_iterations;
                 context.request_repaint();
             }
-            Phase::Editor {
+            Phase::BulkTags {
+                state:
+                    BulkTagBenchmarkState::RefreshPending {
+                        paint_frames_remaining: Some(remaining),
+                        ..
+                    },
+                ..
+            }
+            | Phase::Editor {
                 pending:
                     Some(PendingEditor {
                         paint_frames_remaining: Some(remaining),
@@ -662,7 +908,8 @@ impl DesktopBenchmark {
             | Phase::Sort { .. }
             | Phase::AssetActions { .. }
             | Phase::Editor { .. }
-            | Phase::Selection { .. } => {
+            | Phase::Selection { .. }
+            | Phase::BulkTags { .. } => {
                 context.request_repaint_after(MEMORY_SAMPLE_INTERVAL);
             }
             Phase::Scroll { started } if now.duration_since(*started) >= self.config.scroll => {
@@ -671,6 +918,10 @@ impl DesktopBenchmark {
             }
             Phase::Scroll { .. } => context.request_repaint(),
             Phase::Finished => {}
+        }
+
+        if bulk_next_selection && let Phase::BulkTags { state, .. } = &mut self.phase {
+            *state = BulkTagBenchmarkState::SelectionRequest;
         }
 
         if begin_idle {
@@ -701,6 +952,8 @@ impl DesktopBenchmark {
                 begin_editor = true;
             } else if self.config.selection_iterations > 0 {
                 begin_selection = true;
+            } else if self.config.bulk_iterations > 0 {
+                begin_bulk_tags = true;
             } else if self.config.scroll.is_zero() {
                 observed_scroll_duration = Some(Duration::ZERO);
                 finish = true;
@@ -727,6 +980,8 @@ impl DesktopBenchmark {
                 begin_editor = true;
             } else if self.config.selection_iterations > 0 {
                 begin_selection = true;
+            } else if self.config.bulk_iterations > 0 {
+                begin_bulk_tags = true;
             } else if self.config.scroll.is_zero() {
                 observed_scroll_duration = Some(Duration::ZERO);
                 finish = true;
@@ -751,6 +1006,8 @@ impl DesktopBenchmark {
         } else if editor_finished {
             if self.config.selection_iterations > 0 {
                 begin_selection = true;
+            } else if self.config.bulk_iterations > 0 {
+                begin_bulk_tags = true;
             } else if self.config.scroll.is_zero() {
                 observed_scroll_duration = Some(Duration::ZERO);
                 finish = true;
@@ -773,6 +1030,30 @@ impl DesktopBenchmark {
             };
             context.request_repaint();
         } else if selection_finished {
+            if self.config.bulk_iterations > 0 {
+                begin_bulk_tags = true;
+            } else if self.config.scroll.is_zero() {
+                observed_scroll_duration = Some(Duration::ZERO);
+                finish = true;
+            } else {
+                begin_scroll = true;
+            }
+        }
+
+        if begin_bulk_tags {
+            if self.idle_end_rss_bytes.is_none() {
+                self.idle_end_rss_bytes = current_rss_bytes();
+                if let Some(memory) = &self.memory {
+                    memory.record_sample(IDLE_PHASE, self.idle_end_rss_bytes);
+                    memory.set_phase(SORT_PHASE);
+                }
+            }
+            self.phase = Phase::BulkTags {
+                completed: 0,
+                state: BulkTagBenchmarkState::QueryRequest,
+            };
+            context.request_repaint();
+        } else if bulk_tags_finished {
             if self.config.scroll.is_zero() {
                 observed_scroll_duration = Some(Duration::ZERO);
                 finish = true;
@@ -820,7 +1101,7 @@ impl DesktopBenchmark {
             .ok_or_else(|| "memory sampler was already consumed".to_owned())?
             .finish()?;
         let result = DesktopBenchmarkResult {
-            schema_version: 5,
+            schema_version: 6,
             kind: "desktop",
             status: if failure.is_some() {
                 "failed"
@@ -876,6 +1157,12 @@ impl DesktopBenchmark {
                 self.config.selection_iterations,
                 self.library_books,
                 &self.selection_dispatch_to_busy_paint_samples_ns,
+            ),
+            bulk_tag_interactions: BulkTagInteractionsResult::new(
+                self.config,
+                self.bulk_forward_operations,
+                self.bulk_inverse_operations,
+                &self.bulk_completion_to_paint_samples_ns,
             ),
             scrolling: ScrollingResult::new(
                 self.config,
@@ -970,6 +1257,27 @@ impl DesktopBenchmark {
                     "selection dispatch p95 was {:.3} ms, above the {:.3} ms budget",
                     milliseconds(summary.p95_ns),
                     milliseconds(SELECTION_DISPATCH_TO_BUSY_PAINT_P95_BUDGET_NS),
+                )
+            })
+        })
+        .or_else(|| {
+            if self.config.bulk_iterations == 0 {
+                return None;
+            }
+            if self.bulk_completion_to_paint_samples_ns.len() != self.config.bulk_iterations {
+                return Some(format!(
+                    "bulk completion retained {} samples; expected {}",
+                    self.bulk_completion_to_paint_samples_ns.len(),
+                    self.config.bulk_iterations,
+                ));
+            }
+            let summary = summarize_samples(&self.bulk_completion_to_paint_samples_ns)
+                .expect("non-empty bulk interaction samples");
+            (summary.p95_ns > BULK_COMPLETION_TO_PAINT_P95_BUDGET_NS).then(|| {
+                format!(
+                    "bulk completion-to-paint p95 was {:.3} ms, above the {:.3} ms budget",
+                    milliseconds(summary.p95_ns),
+                    milliseconds(BULK_COMPLETION_TO_PAINT_P95_BUDGET_NS),
                 )
             })
         })
@@ -1118,6 +1426,38 @@ impl<'a> SelectionInteractionsResult<'a> {
     }
 }
 
+impl<'a> BulkTagInteractionsResult<'a> {
+    fn new(
+        config: BenchmarkConfig,
+        forward_operations: usize,
+        inverse_operations: usize,
+        samples: &'a [u64],
+    ) -> Self {
+        let latency = summarize_samples(samples);
+        let passed = config.bulk_iterations == 0
+            || (samples.len() == config.bulk_iterations
+                && latency.as_ref().is_some_and(|summary| {
+                    summary.p95_ns <= BULK_COMPLETION_TO_PAINT_P95_BUDGET_NS
+                }));
+        Self {
+            endpoint: "bulk commit completion through the next fully rendered refreshed 10000-book query grid",
+            warmup_iterations: config.bulk_warmup_iterations,
+            measured_iterations: config.bulk_iterations,
+            max_p95_ns: BULK_COMPLETION_TO_PAINT_P95_BUDGET_NS,
+            matching_books: BULK_MATCHING_BOOKS,
+            forward_operations,
+            inverse_operations,
+            forward_expected_relationships_added: BULK_MATCHING_BOOKS * 2,
+            forward_expected_relationships_removed: BULK_MATCHING_BOOKS,
+            inverse_expected_relationships_added: BULK_MATCHING_BOOKS,
+            inverse_expected_relationships_removed: BULK_MATCHING_BOOKS * 2,
+            latency,
+            samples_ns: samples,
+            passed,
+        }
+    }
+}
+
 fn sort_for_interaction(completed: usize) -> SortOrder {
     SORT_SCENARIOS[completed % SORT_SCENARIOS.len()]
 }
@@ -1209,6 +1549,7 @@ struct DesktopBenchmarkResult<'a> {
     asset_actions: AssetActionsResult<'a>,
     editor_interactions: EditorInteractionsResult<'a>,
     selection_interactions: SelectionInteractionsResult<'a>,
+    bulk_tag_interactions: BulkTagInteractionsResult<'a>,
     scrolling: ScrollingResult<'a>,
     memory: MemoryResult,
     final_frame: FinalFrameResult,
@@ -1235,6 +1576,11 @@ struct ConfigurationResult {
     editor_iterations: usize,
     selection_warmup_iterations: usize,
     selection_iterations: usize,
+    bulk_warmup_iterations: usize,
+    bulk_iterations: usize,
+    bulk_baseline_tag_id: Option<i64>,
+    bulk_add_tag_a_id: Option<i64>,
+    bulk_add_tag_b_id: Option<i64>,
 }
 
 impl From<BenchmarkConfig> for ConfigurationResult {
@@ -1251,6 +1597,11 @@ impl From<BenchmarkConfig> for ConfigurationResult {
             editor_iterations: config.editor_iterations,
             selection_warmup_iterations: config.selection_warmup_iterations,
             selection_iterations: config.selection_iterations,
+            bulk_warmup_iterations: config.bulk_warmup_iterations,
+            bulk_iterations: config.bulk_iterations,
+            bulk_baseline_tag_id: config.bulk_tags.map(|tags| tags.baseline.value()),
+            bulk_add_tag_a_id: config.bulk_tags.map(|tags| tags.added_a.value()),
+            bulk_add_tag_b_id: config.bulk_tags.map(|tags| tags.added_b.value()),
         }
     }
 }
@@ -1327,6 +1678,24 @@ struct SelectionInteractionsResult<'a> {
     measured_iterations: usize,
     max_p95_ns: u64,
     matching_books: u64,
+    latency: Option<SampleSummary>,
+    samples_ns: &'a [u64],
+    passed: bool,
+}
+
+#[derive(Serialize)]
+struct BulkTagInteractionsResult<'a> {
+    endpoint: &'static str,
+    warmup_iterations: usize,
+    measured_iterations: usize,
+    max_p95_ns: u64,
+    matching_books: u64,
+    forward_operations: usize,
+    inverse_operations: usize,
+    forward_expected_relationships_added: u64,
+    forward_expected_relationships_removed: u64,
+    inverse_expected_relationships_added: u64,
+    inverse_expected_relationships_removed: u64,
     latency: Option<SampleSummary>,
     samples_ns: &'a [u64],
     passed: bool,
@@ -1529,6 +1898,17 @@ fn usize_from_env(name: &str, default: usize) -> Result<usize, String> {
         .map_err(|_| format!("{name} expects a non-negative integer, got '{value}'"))
 }
 
+fn tag_id_from_env(name: &str) -> Result<TagId, String> {
+    let value = env::var(name).map_err(|_| format!("{name} is required for bulk interactions"))?;
+    let parsed = value
+        .parse::<i64>()
+        .map_err(|_| format!("{name} expects a positive tag ID, got '{value}'"))?;
+    if parsed <= 0 {
+        return Err(format!("{name} expects a positive tag ID, got '{value}'"));
+    }
+    Ok(TagId::new(parsed))
+}
+
 fn seconds_f32_ns(seconds: f32) -> Option<u64> {
     elapsed_ns(Duration::from_secs_f32(seconds))
 }
@@ -1643,6 +2023,9 @@ mod tests {
             editor_iterations: 40,
             selection_warmup_iterations: 10,
             selection_iterations: 40,
+            bulk_warmup_iterations: 0,
+            bulk_iterations: 0,
+            bulk_tags: None,
         };
         let result = ScrollingResult::new(
             config,

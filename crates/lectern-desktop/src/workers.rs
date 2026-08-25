@@ -16,8 +16,9 @@ use lectern_core::{
     AssetHealthReport, AssetId, Book, BookFormat, BookId, BookSummary, ImportProgress,
     ImportSummary, LibraryQuery, LibraryService,
     organisation::{
-        BookEdit, ContributorId, ContributorUsage, SelectionSnapshot, SeriesId, SeriesUsage, TagId,
-        TagUsage, VocabularyMutationResult,
+        BookEdit, BookSelection, BulkTagEdit, BulkTagResult, ContributorId, ContributorUsage,
+        SelectionSnapshot, SelectionTagUsage, SeriesId, SeriesUsage, TagId, TagUsage,
+        VocabularyMutationResult,
     },
 };
 use lectern_desktop::export::{
@@ -79,11 +80,28 @@ pub(crate) struct ExportRequest {
 }
 
 enum MetadataRequest {
+    SelectionSnapshot {
+        generation: u64,
+        query: LibraryQuery,
+    },
     Load(BookId),
     Save(BookEdit),
-    Remove { id: BookId, title: String },
+    Remove {
+        id: BookId,
+        title: String,
+    },
     VocabularyImpact(VocabularyEntityId),
     VocabularyMutation(VocabularyMutation),
+    LoadSelectionTags {
+        generation: u64,
+        selection: BookSelection,
+        offset: u64,
+    },
+    ApplyBulkTags {
+        generation: u64,
+        selection: BookSelection,
+        edit: BulkTagEdit,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,6 +194,11 @@ enum AutocompleteRequest {
         selected: Vec<SeriesId>,
     },
     FacetTags {
+        generation: u64,
+        prefix: String,
+        selected: Vec<TagId>,
+    },
+    BulkTags {
         generation: u64,
         prefix: String,
         selected: Vec<TagId>,
@@ -283,6 +306,10 @@ pub(crate) enum WorkerEvent {
         generation: u64,
         result: Result<Vec<TagUsage>, String>,
     },
+    BulkTagSuggestions {
+        generation: u64,
+        result: Result<Vec<TagUsage>, String>,
+    },
     MergeContributorSuggestions {
         generation: u64,
         result: Result<Vec<ContributorUsage>, String>,
@@ -308,6 +335,15 @@ pub(crate) enum WorkerEvent {
     VocabularyMutated {
         mutation: VocabularyMutation,
         result: Result<VocabularyMutationResult, String>,
+    },
+    SelectionTagsLoaded {
+        generation: u64,
+        offset: u64,
+        result: Result<Vec<SelectionTagUsage>, String>,
+    },
+    BulkTagsApplied {
+        generation: u64,
+        result: Result<BulkTagResult, String>,
     },
     BookRemoved {
         id: BookId,
@@ -455,7 +491,15 @@ impl WorkerSet {
     }
 
     pub(crate) fn resolve_selection(&self, request: SelectionRequest) -> bool {
-        self.selection_sender.try_send(request).is_ok()
+        match request {
+            SelectionRequest::Snapshot { generation, query } => self
+                .metadata_sender
+                .send(MetadataRequest::SelectionSnapshot { generation, query })
+                .is_ok(),
+            request @ SelectionRequest::Range { .. } => {
+                self.selection_sender.try_send(request).is_ok()
+            }
+        }
     }
 
     pub(crate) fn load_cover(&self, id: BookId) -> bool {
@@ -571,6 +615,21 @@ impl WorkerSet {
             .is_ok()
     }
 
+    pub(crate) fn autocomplete_bulk_tags(
+        &self,
+        generation: u64,
+        prefix: String,
+        selected: Vec<TagId>,
+    ) -> bool {
+        self.autocomplete_sender
+            .send(AutocompleteRequest::BulkTags {
+                generation,
+                prefix,
+                selected,
+            })
+            .is_ok()
+    }
+
     pub(crate) fn autocomplete_merge_contributors(
         &self,
         generation: u64,
@@ -629,6 +688,36 @@ impl WorkerSet {
     pub(crate) fn mutate_vocabulary(&self, mutation: VocabularyMutation) -> bool {
         self.metadata_sender
             .send(MetadataRequest::VocabularyMutation(mutation))
+            .is_ok()
+    }
+
+    pub(crate) fn load_selection_tags(
+        &self,
+        generation: u64,
+        selection: BookSelection,
+        offset: u64,
+    ) -> bool {
+        self.metadata_sender
+            .send(MetadataRequest::LoadSelectionTags {
+                generation,
+                selection,
+                offset,
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn apply_bulk_tags(
+        &self,
+        generation: u64,
+        selection: BookSelection,
+        edit: BulkTagEdit,
+    ) -> bool {
+        self.metadata_sender
+            .send(MetadataRequest::ApplyBulkTags {
+                generation,
+                selection,
+                edit,
+            })
             .is_ok()
     }
 
@@ -833,6 +922,16 @@ fn metadata_worker(
 
     while let Ok(request) = receiver.recv() {
         let published = match request {
+            MetadataRequest::SelectionSnapshot { generation, query } => {
+                let result = service
+                    .selection_snapshot(&query)
+                    .map_err(|error| error.to_string());
+                publish(
+                    events,
+                    context,
+                    WorkerEvent::SelectionSnapshotFinished { generation, result },
+                )
+            }
             MetadataRequest::Load(id) => {
                 let result = service.get_book(id).map_err(|error| error.to_string());
                 publish(events, context, WorkerEvent::BookLoaded { id, result })
@@ -875,6 +974,38 @@ fn metadata_worker(
                     events,
                     context,
                     WorkerEvent::VocabularyMutated { mutation, result },
+                )
+            }
+            MetadataRequest::LoadSelectionTags {
+                generation,
+                selection,
+                offset,
+            } => {
+                let result = service
+                    .selection_tag_usage(&selection, offset, 100)
+                    .map_err(|error| error.to_string());
+                publish(
+                    events,
+                    context,
+                    WorkerEvent::SelectionTagsLoaded {
+                        generation,
+                        offset,
+                        result,
+                    },
+                )
+            }
+            MetadataRequest::ApplyBulkTags {
+                generation,
+                selection,
+                edit,
+            } => {
+                let result = service
+                    .apply_bulk_tags(&selection, &edit)
+                    .map_err(|error| error.to_string());
+                publish(
+                    events,
+                    context,
+                    WorkerEvent::BulkTagsApplied { generation, result },
                 )
             }
         };
@@ -1033,6 +1164,20 @@ fn autocomplete_worker(
                 events,
                 context,
                 WorkerEvent::FacetTagSuggestions {
+                    generation,
+                    result: service
+                        .autocomplete_tags(&prefix, &selected, 50)
+                        .map_err(|error| error.to_string()),
+                },
+            ),
+            AutocompleteRequest::BulkTags {
+                generation,
+                prefix,
+                selected,
+            } => publish(
+                events,
+                context,
+                WorkerEvent::BulkTagSuggestions {
                     generation,
                     result: service
                         .autocomplete_tags(&prefix, &selected, 50)

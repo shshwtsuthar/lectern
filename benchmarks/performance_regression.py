@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Run Lectern's deterministic storage-performance regression suites.
+"""Run Lectern's deterministic performance regression suites.
 
-This deliberately measures only deterministic storage/query workloads. The broader ``run.py``
-study remains an opt-in exploratory benchmark because it also needs a prepared
-corpus and a native desktop session.
+Most suites measure deterministic storage/query workloads. The bulk-tag suite also exercises its
+versioned compositor endpoints and therefore requires a native desktop session.
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ import os
 import pathlib
 import platform
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -99,6 +99,7 @@ def main(arguments: list[str]) -> int:
             "organisation-migration": "migrations.json",
             "organisation-query": "organisation-queries.json",
             "organisation-vocabulary": "organisation-vocabulary.json",
+            "bulk-tags": "organisation-bulk-tags.json",
             "maintenance": "maintenance.json",
         }
         query_output = output / result_names[mode]
@@ -106,13 +107,14 @@ def main(arguments: list[str]) -> int:
         seed = read_json(seed_output)
         if mode == "organisation-migration":
             validate_migration_seed_result(seed, workload)
-        elif mode in ("organisation-query", "organisation-vocabulary"):
+        elif mode in ("organisation-query", "organisation-vocabulary", "bulk-tags"):
             validate_organisation_query_seed_result(seed, workload)
         else:
             validate_seed_result(seed, workload["books"])
 
         run_command(workload_command(mode, database, query_output, workload), commands)
         query_result = read_json(query_output)
+        desktop_result: dict[str, Any] | None = None
         if mode == "remove":
             decisions = evaluate_remove_result(query_result, budget)
         elif mode == "detach":
@@ -131,6 +133,17 @@ def main(arguments: list[str]) -> int:
             decisions = evaluate_organisation_query_result(query_result, budget)
         elif mode == "organisation-vocabulary":
             decisions = evaluate_organisation_vocabulary_result(query_result, budget)
+        elif mode == "bulk-tags":
+            decisions = evaluate_bulk_tag_result(query_result, budget)
+            desktop_output = output / "organisation-bulk-tags-desktop.json"
+            run_bulk_tag_desktop(
+                database,
+                desktop_output,
+                workload,
+                commands,
+            )
+            desktop_result = read_json(desktop_output)
+            decisions += evaluate_bulk_tag_desktop_result(desktop_result, budget)
         elif mode == "maintenance":
             decisions = evaluate_maintenance_result(query_result, budget)
         else:
@@ -141,6 +154,11 @@ def main(arguments: list[str]) -> int:
             "library_books": query_result["library_books"],
             "decisions": decisions,
         }
+        if desktop_result is not None:
+            report["desktop"] = {
+                "path": str(desktop_output),
+                "result": desktop_result,
+            }
         failures = [decision for decision in decisions if not decision["passed"]]
         if failures:
             failed_names = ", ".join(decision["name"] for decision in failures)
@@ -168,7 +186,7 @@ def seed_command(
     command = ["cargo", "run", "--release", "--locked", "-p", "lectern-benchmark"]
     if mode == "organisation-migration":
         command += ["--bin", "organisation-benchmark", "--", "seed-migration"]
-    elif mode in ("organisation-query", "organisation-vocabulary"):
+    elif mode in ("organisation-query", "organisation-vocabulary", "bulk-tags"):
         command += ["--bin", "organisation-query-benchmark", "--", "seed"]
     else:
         command += ["--", "seed"]
@@ -199,6 +217,8 @@ def workload_command(
         command += ["--bin", "organisation-query-benchmark", "--", "query"]
     elif mode == "organisation-vocabulary":
         command += ["--bin", "organisation-vocabulary-benchmark", "--"]
+    elif mode == "bulk-tags":
+        command += ["--bin", "organisation-bulk-benchmark", "--"]
     else:
         command += [
             "--",
@@ -214,6 +234,19 @@ def workload_command(
                 "reimport": "reimport",
                 "maintenance": "maintenance",
             }[mode],
+        ]
+    if mode == "bulk-tags":
+        return command + [
+            "--database",
+            str(database),
+            "--output",
+            str(output),
+            "--books",
+            str(workload["books"]),
+            "--iterations",
+            str(workload["measured_iterations"]),
+            "--warmup",
+            str(workload["warmup_iterations"]),
         ]
     return command + [
         "--database",
@@ -278,13 +311,14 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "organisation-migration",
         "organisation-query",
         "organisation-vocabulary",
+        "bulk-tags",
         "maintenance",
     ):
         raise RegressionError(
             "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
             "'remove', 'detach', 'attach', 'replace', 'export', 'reimport', "
             "'organisation-migration', 'organisation-query', "
-            "'organisation-vocabulary', or 'maintenance'"
+            "'organisation-vocabulary', 'bulk-tags', or 'maintenance'"
         )
     if query_mode == "full":
         scenario_names = workload.get("full_library_scenarios")
@@ -359,6 +393,33 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 raise RegressionError(
                     "organisation vocabulary matching_books must be greater than zero"
                 )
+        if query_mode == "bulk-tags":
+            for field in (
+                "page_size",
+                "contributors",
+                "series",
+                "tags",
+                "tags_per_book",
+                "saved_searches",
+                "matching_books",
+                "tags_added",
+                "tags_removed",
+            ):
+                if positive_or_zero_field(workload, field, "budget.workload") == 0:
+                    raise RegressionError(
+                        f"bulk-tag workload {field} must be greater than zero"
+                    )
+            compositor_samples = positive_or_zero_field(
+                workload, "compositor_samples", "budget.workload"
+            )
+            if compositor_samples == 0:
+                raise RegressionError(
+                    "bulk-tag workload compositor_samples must be greater than zero"
+                )
+            if (workload["warmup_iterations"] + compositor_samples) % 2 != 0:
+                raise RegressionError(
+                    "bulk-tag compositor warmup and measured operations must total an even number"
+                )
         scenario_names = workload.get("scenarios")
         if not isinstance(scenario_names, list) or not all(
             isinstance(name, str) and name for name in scenario_names
@@ -409,6 +470,12 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 f"budget {name!r}",
             )
         if query_mode == "organisation-vocabulary":
+            positive_or_zero_field(
+                scenario_budget,
+                "max_peak_rss_delta_bytes",
+                f"budget {name!r}",
+            )
+        if query_mode == "bulk-tags" and name == "bulk_tag_apply_and_refresh":
             positive_or_zero_field(
                 scenario_budget,
                 "max_peak_rss_delta_bytes",
@@ -1237,6 +1304,252 @@ def evaluate_organisation_vocabulary_result(
     return decisions
 
 
+def evaluate_bulk_tag_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "bulk-tag result"
+    if result.get("kind") != "organisation-bulk-tags":
+        raise RegressionError("bulk-tag result kind is invalid")
+    expected_fields = {
+        "library_books": workload["books"],
+        "matching_books": workload["matching_books"],
+        "warmup_iterations": workload["warmup_iterations"],
+        "measured_iterations": workload["measured_iterations"],
+        "page_size": workload["page_size"],
+    }
+    for field, expected in expected_fields.items():
+        if positive_or_zero_field(result, field, context) != expected:
+            raise RegressionError(f"bulk-tag {field} does not match the budget")
+    checks = result.get("verified_checks")
+    if not isinstance(checks, list) or set(checks) != set(workload["correctness"]):
+        raise RegressionError("bulk-tag correctness checks did not reconcile")
+    if positive_or_zero_field(result, "selection_materialized_summaries", context) != 0:
+        raise RegressionError("bulk-tag selection materialized book summaries")
+    peak_rss = positive_or_zero_field(result, "peak_rss_delta_bytes", context)
+
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or len(scenarios) != 1:
+        raise RegressionError("bulk-tag result must contain one storage scenario")
+    scenario = scenarios[0]
+    if not isinstance(scenario, dict) or scenario.get("name") != "bulk_tag_apply_and_refresh":
+        raise RegressionError("bulk-tag storage scenario is invalid")
+    operations = workload["warmup_iterations"] + workload["measured_iterations"]
+    exact_counts = {
+        "successful_operations": operations,
+        "books_matched_per_operation": workload["matching_books"],
+        "relationships_added_per_operation": (
+            workload["matching_books"] * workload["tags_added"]
+        ),
+        "relationships_removed_per_operation": (
+            workload["matching_books"] * workload["tags_removed"]
+        ),
+        "tags_created_per_operation": workload["tags_added"],
+        "refreshed_result_count": workload["page_size"],
+    }
+    for field, expected in exact_counts.items():
+        if positive_or_zero_field(scenario, field, "bulk-tag scenario") != expected:
+            raise RegressionError(f"bulk-tag scenario {field} did not reconcile")
+    samples = scenario.get("samples_ns")
+    if not isinstance(samples, list) or len(samples) != workload["measured_iterations"]:
+        raise RegressionError("bulk-tag storage sample count does not match the budget")
+    if any(
+        isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+        for sample in samples
+    ):
+        raise RegressionError("bulk-tag storage samples must be positive integers")
+    latency = object_field(scenario, "latency_ms", "bulk-tag scenario")
+    p95_ms = positive_number_field(latency, "p95", "bulk-tag scenario latency")
+    scenario_budget = budget["budgets"]["bulk_tag_apply_and_refresh"]
+    maximum_ms = float(scenario_budget["max_p95_ms"])
+    maximum_rss = scenario_budget["max_peak_rss_delta_bytes"]
+    return [
+        {
+            "name": "bulk_tag_apply_and_refresh",
+            "p95_ms": p95_ms,
+            "max_p95_ms": maximum_ms,
+            "peak_rss_delta_bytes": peak_rss,
+            "max_peak_rss_delta_bytes": maximum_rss,
+            "passed": p95_ms <= maximum_ms and peak_rss <= maximum_rss,
+        }
+    ]
+
+
+def run_bulk_tag_desktop(
+    database: pathlib.Path,
+    output: pathlib.Path,
+    workload: dict[str, Any],
+    commands: list[dict[str, Any]],
+) -> None:
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        raise RegressionError("bulk-tag compositor measurements require an active display")
+    tag_ids = resolve_bulk_tag_ids(database)
+    environment = os.environ.copy()
+    if environment.get("DISPLAY"):
+        environment.pop("WAYLAND_DISPLAY", None)
+        environment["WINIT_UNIX_BACKEND"] = "x11"
+    environment.update(
+        {
+            "LECTERN_DATA_DIR": str(database.parent),
+            "LECTERN_BENCHMARK_OUTPUT": str(output),
+            "LECTERN_BENCHMARK_IDLE_SECONDS": "0.5",
+            "LECTERN_BENCHMARK_SCROLL_SECONDS": "0",
+            "LECTERN_BENCHMARK_SCROLL_WARMUP_SECONDS": "0",
+            "LECTERN_BENCHMARK_SORT_ITERATIONS": "0",
+            "LECTERN_BENCHMARK_ASSET_ACTION_ITERATIONS": "0",
+            "LECTERN_BENCHMARK_EDITOR_WARMUP_ITERATIONS": "0",
+            "LECTERN_BENCHMARK_EDITOR_ITERATIONS": "0",
+            "LECTERN_BENCHMARK_SELECTION_WARMUP_ITERATIONS": str(
+                workload["warmup_iterations"]
+            ),
+            "LECTERN_BENCHMARK_SELECTION_ITERATIONS": str(
+                workload["compositor_samples"]
+            ),
+            "LECTERN_BENCHMARK_BULK_WARMUP_ITERATIONS": str(
+                workload["warmup_iterations"]
+            ),
+            "LECTERN_BENCHMARK_BULK_ITERATIONS": str(
+                workload["compositor_samples"]
+            ),
+            "LECTERN_BENCHMARK_BULK_BASELINE_TAG_ID": str(tag_ids["Bulk baseline"]),
+            "LECTERN_BENCHMARK_BULK_ADD_TAG_A_ID": str(tag_ids["Bulk added A 000"]),
+            "LECTERN_BENCHMARK_BULK_ADD_TAG_B_ID": str(tag_ids["Bulk added B 000"]),
+            "LECTERN_BENCHMARK_TIMEOUT_SECONDS": "240",
+            "WGPU_BACKEND": environment.get("WGPU_BACKEND", "vulkan"),
+        }
+    )
+    run_command(
+        [
+            "cargo",
+            "run",
+            "--release",
+            "--locked",
+            "-p",
+            "lectern-desktop",
+            "--bin",
+            "lectern",
+        ],
+        commands,
+        environment=environment,
+        timeout_seconds=270,
+    )
+
+
+def resolve_bulk_tag_ids(database: pathlib.Path) -> dict[str, int]:
+    names = ("Bulk baseline", "Bulk added A 000", "Bulk added B 000")
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT name, id FROM tags WHERE name IN (?, ?, ?)", names
+        ).fetchall()
+    resolved = {str(name): int(identifier) for name, identifier in rows}
+    if set(resolved) != set(names) or any(identifier <= 0 for identifier in resolved.values()):
+        raise RegressionError("bulk-tag storage setup did not retain benchmark tag identities")
+    return resolved
+
+
+def evaluate_bulk_tag_desktop_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    samples = workload["compositor_samples"]
+    if result.get("kind") != "desktop" or result.get("status") != "completed":
+        raise RegressionError(
+            f"bulk-tag desktop benchmark failed: {result.get('error')}"
+        )
+    if positive_or_zero_field(result, "schema_version", "desktop result") < 6:
+        raise RegressionError("bulk-tag desktop result schema is too old")
+    library = object_field(result, "library", "desktop result")
+    if positive_or_zero_field(library, "books", "desktop library") != workload["books"]:
+        raise RegressionError("bulk-tag desktop library count did not reconcile")
+
+    selection = object_field(result, "selection_interactions", "desktop result")
+    if positive_or_zero_field(selection, "measured_iterations", "desktop selection") != samples:
+        raise RegressionError("desktop selection sample configuration did not reconcile")
+    if positive_or_zero_field(selection, "matching_books", "desktop selection") != workload["books"]:
+        raise RegressionError("desktop selection count did not reconcile")
+    selection_samples = positive_samples(selection, "desktop selection", samples)
+    selection_latency = object_field(selection, "latency", "desktop selection")
+    selection_p95_ns = positive_or_zero_field(
+        selection_latency, "p95_ns", "desktop selection latency"
+    )
+    if selection_p95_ns == 0 or selection.get("passed") is not True:
+        raise RegressionError("desktop selection endpoint exceeded its absolute budget")
+
+    bulk = object_field(result, "bulk_tag_interactions", "desktop result")
+    if positive_or_zero_field(bulk, "measured_iterations", "desktop bulk tags") != samples:
+        raise RegressionError("desktop bulk-tag sample configuration did not reconcile")
+    if positive_or_zero_field(bulk, "matching_books", "desktop bulk tags") != workload["matching_books"]:
+        raise RegressionError("desktop bulk-tag target count did not reconcile")
+    total_operations = workload["warmup_iterations"] + samples
+    forward = positive_or_zero_field(bulk, "forward_operations", "desktop bulk tags")
+    inverse = positive_or_zero_field(bulk, "inverse_operations", "desktop bulk tags")
+    if forward + inverse != total_operations or abs(forward - inverse) > 1:
+        raise RegressionError("desktop bulk-tag forward/inverse operations did not reconcile")
+    expected_bulk_counts = {
+        "forward_expected_relationships_added": (
+            workload["matching_books"] * workload["tags_added"]
+        ),
+        "forward_expected_relationships_removed": (
+            workload["matching_books"] * workload["tags_removed"]
+        ),
+        "inverse_expected_relationships_added": (
+            workload["matching_books"] * workload["tags_removed"]
+        ),
+        "inverse_expected_relationships_removed": (
+            workload["matching_books"] * workload["tags_added"]
+        ),
+    }
+    for field, expected in expected_bulk_counts.items():
+        if positive_or_zero_field(bulk, field, "desktop bulk tags") != expected:
+            raise RegressionError(f"desktop bulk-tag {field} did not reconcile")
+    bulk_samples = positive_samples(bulk, "desktop bulk tags", samples)
+    bulk_latency = object_field(bulk, "latency", "desktop bulk tags")
+    bulk_p95_ns = positive_or_zero_field(
+        bulk_latency, "p95_ns", "desktop bulk-tag latency"
+    )
+    if bulk_p95_ns == 0 or bulk.get("passed") is not True:
+        raise RegressionError("desktop bulk-tag endpoint exceeded its absolute budget")
+
+    endpoints = (
+        (
+            "selection_dispatch_to_busy_paint",
+            selection_p95_ns,
+            selection_samples,
+        ),
+        (
+            "completion_to_refreshed_grid_paint",
+            bulk_p95_ns,
+            bulk_samples,
+        ),
+    )
+    decisions = []
+    for name, p95_ns, retained_samples in endpoints:
+        maximum_ms = float(budget["budgets"][name]["max_p95_ms"])
+        p95_ms = p95_ns / 1_000_000
+        decisions.append(
+            {
+                "name": name,
+                "p95_ms": p95_ms,
+                "max_p95_ms": maximum_ms,
+                "sample_count": len(retained_samples),
+                "passed": p95_ms <= maximum_ms,
+            }
+        )
+    return decisions
+
+
+def positive_samples(value: dict[str, Any], context: str, expected: int) -> list[int]:
+    samples = value.get("samples_ns")
+    if not isinstance(samples, list) or len(samples) != expected:
+        raise RegressionError(f"{context} retained an invalid sample count")
+    if any(
+        isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+        for sample in samples
+    ):
+        raise RegressionError(f"{context} samples must be positive integers")
+    return samples
+
+
 def evaluate_latency_budgets(
     by_name: dict[str, dict[str, Any]], budget: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -1273,16 +1586,45 @@ def evaluate_latency_budgets(
     return decisions
 
 
-def run_command(command: list[str], commands: list[dict[str, Any]]) -> None:
+def run_command(
+    command: list[str],
+    commands: list[dict[str, Any]],
+    *,
+    environment: dict[str, str] | None = None,
+    timeout_seconds: float | None = None,
+) -> None:
     print(f"+ {shlex.join(command)}", flush=True)
     started_at = utc_now()
     started = time.monotonic_ns()
-    result = subprocess.run(command, cwd=REPOSITORY, check=False)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=REPOSITORY,
+            env=environment,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        commands.append(
+            {
+                "command": command,
+                "started_at_utc": started_at,
+                "elapsed_ns": time.monotonic_ns() - started,
+                "return_code": None,
+                "timeout_seconds": timeout_seconds,
+                "timed_out": True,
+            }
+        )
+        raise RegressionError(
+            f"command timed out after {timeout_seconds} seconds: {shlex.join(command)}"
+        ) from error
     record = {
         "command": command,
         "started_at_utc": started_at,
         "elapsed_ns": time.monotonic_ns() - started,
         "return_code": result.returncode,
+        "timeout_seconds": timeout_seconds,
+        "timed_out": False,
     }
     commands.append(record)
     if result.returncode != 0:

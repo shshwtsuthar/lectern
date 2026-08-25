@@ -643,6 +643,21 @@ pub trait LibraryService {
         limit: u32,
     ) -> Result<Vec<BookId>, Self::Error>;
 
+    /// Returns one bounded page of tag usage across a compact selection descriptor.
+    fn selection_tag_usage(
+        &mut self,
+        selection: &organisation::BookSelection,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<organisation::SelectionTagUsage>, Self::Error>;
+
+    /// Applies one atomic, set-based tag edit to a compact selection descriptor.
+    fn apply_bulk_tags(
+        &mut self,
+        selection: &organisation::BookSelection,
+        edit: &organisation::BulkTagEdit,
+    ) -> Result<organisation::BulkTagResult, Self::Error>;
+
     /// Loads complete metadata and assets for one book.
     fn get_book(&mut self, id: BookId) -> Result<Option<Book>, Self::Error>;
 
