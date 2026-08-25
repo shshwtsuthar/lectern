@@ -17,6 +17,7 @@ use lectern_core::{
     ImportSummary, LibraryQuery, LibraryService,
     organisation::{
         BookEdit, ContributorId, ContributorUsage, SeriesId, SeriesUsage, TagId, TagUsage,
+        VocabularyMutationResult,
     },
 };
 use lectern_desktop::export::{
@@ -68,6 +69,70 @@ enum MetadataRequest {
     Load(BookId),
     Save(BookEdit),
     Remove { id: BookId, title: String },
+    VocabularyImpact(VocabularyEntityId),
+    VocabularyMutation(VocabularyMutation),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VocabularyKind {
+    Contributors,
+    Series,
+    Tags,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VocabularyEntityId {
+    Contributor(ContributorId),
+    Series(SeriesId),
+    Tag(TagId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VocabularyMutation {
+    RenameContributor {
+        id: ContributorId,
+        display_name: String,
+        sort_name: String,
+    },
+    MergeContributors {
+        source: ContributorId,
+        target: ContributorId,
+    },
+    DeleteContributor(ContributorId),
+    RenameSeries {
+        id: SeriesId,
+        name: String,
+    },
+    MergeSeries {
+        source: SeriesId,
+        target: SeriesId,
+    },
+    DeleteSeries(SeriesId),
+    RenameTag {
+        id: TagId,
+        name: String,
+    },
+    MergeTags {
+        source: TagId,
+        target: TagId,
+    },
+    DeleteTag {
+        id: TagId,
+        confirmed: VocabularyMutationResult,
+    },
+}
+
+pub(crate) struct VocabularyRequest {
+    pub(crate) generation: u64,
+    pub(crate) kind: VocabularyKind,
+    pub(crate) prefix: String,
+    pub(crate) offset: u64,
+}
+
+pub(crate) enum VocabularyRows {
+    Contributors(Vec<ContributorUsage>),
+    Series(Vec<SeriesUsage>),
+    Tags(Vec<TagUsage>),
 }
 
 enum AutocompleteRequest {
@@ -101,6 +166,21 @@ enum AutocompleteRequest {
         generation: u64,
         prefix: String,
         selected: Vec<TagId>,
+    },
+    MergeContributors {
+        generation: u64,
+        prefix: String,
+        source: ContributorId,
+    },
+    MergeSeries {
+        generation: u64,
+        prefix: String,
+        source: SeriesId,
+    },
+    MergeTags {
+        generation: u64,
+        prefix: String,
+        source: TagId,
     },
 }
 
@@ -182,6 +262,32 @@ pub(crate) enum WorkerEvent {
         generation: u64,
         result: Result<Vec<TagUsage>, String>,
     },
+    MergeContributorSuggestions {
+        generation: u64,
+        result: Result<Vec<ContributorUsage>, String>,
+    },
+    MergeSeriesSuggestions {
+        generation: u64,
+        result: Result<Vec<SeriesUsage>, String>,
+    },
+    MergeTagSuggestions {
+        generation: u64,
+        result: Result<Vec<TagUsage>, String>,
+    },
+    VocabularyLoaded {
+        generation: u64,
+        kind: VocabularyKind,
+        offset: u64,
+        result: Result<VocabularyRows, String>,
+    },
+    VocabularyImpact {
+        entity: VocabularyEntityId,
+        result: Result<VocabularyMutationResult, String>,
+    },
+    VocabularyMutated {
+        mutation: VocabularyMutation,
+        result: Result<VocabularyMutationResult, String>,
+    },
     BookRemoved {
         id: BookId,
         title: String,
@@ -228,6 +334,7 @@ pub(crate) struct WorkerSet {
     import_sender: Sender<ImportRequest>,
     metadata_sender: Sender<MetadataRequest>,
     autocomplete_sender: Sender<AutocompleteRequest>,
+    vocabulary_sender: Sender<VocabularyRequest>,
     asset_maintenance_sender: Sender<AssetMaintenanceRequest>,
     export_sender: Sender<ExportRequest>,
     event_receiver: Receiver<WorkerEvent>,
@@ -240,6 +347,7 @@ impl WorkerSet {
         let (import_sender, import_receiver) = bounded(1);
         let (metadata_sender, metadata_receiver) = unbounded();
         let (autocomplete_sender, autocomplete_receiver) = unbounded();
+        let (vocabulary_sender, vocabulary_receiver) = bounded(1);
         let (asset_maintenance_sender, asset_maintenance_receiver) = bounded(1);
         let (export_sender, export_receiver) = bounded(1);
         let (event_sender, event_receiver) = unbounded();
@@ -281,6 +389,12 @@ impl WorkerSet {
             event_sender.clone(),
             context.clone(),
         );
+        spawn_vocabulary_worker(
+            database_path.to_path_buf(),
+            vocabulary_receiver,
+            event_sender.clone(),
+            context.clone(),
+        );
         spawn_asset_maintenance_worker(
             database_path.to_path_buf(),
             asset_maintenance_receiver,
@@ -295,6 +409,7 @@ impl WorkerSet {
             import_sender,
             metadata_sender,
             autocomplete_sender,
+            vocabulary_sender,
             asset_maintenance_sender,
             export_sender,
             event_receiver,
@@ -419,6 +534,67 @@ impl WorkerSet {
                 prefix,
                 selected,
             })
+            .is_ok()
+    }
+
+    pub(crate) fn autocomplete_merge_contributors(
+        &self,
+        generation: u64,
+        prefix: String,
+        source: ContributorId,
+    ) -> bool {
+        self.autocomplete_sender
+            .send(AutocompleteRequest::MergeContributors {
+                generation,
+                prefix,
+                source,
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn autocomplete_merge_series(
+        &self,
+        generation: u64,
+        prefix: String,
+        source: SeriesId,
+    ) -> bool {
+        self.autocomplete_sender
+            .send(AutocompleteRequest::MergeSeries {
+                generation,
+                prefix,
+                source,
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn autocomplete_merge_tags(
+        &self,
+        generation: u64,
+        prefix: String,
+        source: TagId,
+    ) -> bool {
+        self.autocomplete_sender
+            .send(AutocompleteRequest::MergeTags {
+                generation,
+                prefix,
+                source,
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn load_vocabulary(&self, request: VocabularyRequest) -> bool {
+        self.vocabulary_sender.try_send(request).is_ok()
+    }
+
+    pub(crate) fn vocabulary_impact(&self, entity: VocabularyEntityId) -> bool {
+        self.metadata_sender
+            .send(MetadataRequest::VocabularyImpact(entity))
+            .is_ok()
+    }
+
+    pub(crate) fn mutate_vocabulary(&self, mutation: VocabularyMutation) -> bool {
+        self.metadata_sender
+            .send(MetadataRequest::VocabularyMutation(mutation))
             .is_ok()
     }
 
@@ -646,11 +822,62 @@ fn metadata_worker(
                     WorkerEvent::BookRemoved { id, title, result },
                 )
             }
+            MetadataRequest::VocabularyImpact(entity) => {
+                let result = match entity {
+                    VocabularyEntityId::Contributor(id) => service.contributor_mutation_impact(id),
+                    VocabularyEntityId::Series(id) => service.series_mutation_impact(id),
+                    VocabularyEntityId::Tag(id) => service.tag_mutation_impact(id),
+                }
+                .map_err(|error| error.to_string());
+                publish(
+                    events,
+                    context,
+                    WorkerEvent::VocabularyImpact { entity, result },
+                )
+            }
+            MetadataRequest::VocabularyMutation(mutation) => {
+                let result = apply_vocabulary_mutation(&mut service, &mutation);
+                publish(
+                    events,
+                    context,
+                    WorkerEvent::VocabularyMutated { mutation, result },
+                )
+            }
         };
         if !published {
             break;
         }
     }
+}
+
+fn apply_vocabulary_mutation(
+    service: &mut impl LibraryService,
+    mutation: &VocabularyMutation,
+) -> Result<VocabularyMutationResult, String> {
+    match mutation {
+        VocabularyMutation::RenameContributor {
+            id,
+            display_name,
+            sort_name,
+        } => service.rename_contributor(*id, display_name, sort_name),
+        VocabularyMutation::MergeContributors { source, target } => {
+            service.merge_contributors(*source, *target)
+        }
+        VocabularyMutation::DeleteContributor(id) => service
+            .delete_contributor(*id)
+            .map(|()| VocabularyMutationResult::default()),
+        VocabularyMutation::RenameSeries { id, name } => service.rename_series(*id, name),
+        VocabularyMutation::MergeSeries { source, target } => {
+            service.merge_series(*source, *target)
+        }
+        VocabularyMutation::DeleteSeries(id) => service
+            .delete_series(*id)
+            .map(|()| VocabularyMutationResult::default()),
+        VocabularyMutation::RenameTag { id, name } => service.rename_tag(*id, name),
+        VocabularyMutation::MergeTags { source, target } => service.merge_tags(*source, *target),
+        VocabularyMutation::DeleteTag { id, confirmed } => service.delete_tag(*id, *confirmed),
+    }
+    .map_err(|error| error.to_string())
 }
 
 fn spawn_autocomplete_worker(
@@ -778,8 +1005,137 @@ fn autocomplete_worker(
                         .map_err(|error| error.to_string()),
                 },
             ),
+            AutocompleteRequest::MergeContributors {
+                generation,
+                prefix,
+                source,
+            } => publish(
+                events,
+                context,
+                WorkerEvent::MergeContributorSuggestions {
+                    generation,
+                    result: service
+                        .autocomplete_contributors(&prefix, &[source], 50)
+                        .map(|mut rows| {
+                            rows.retain(|usage| usage.contributor.id != source);
+                            rows
+                        })
+                        .map_err(|error| error.to_string()),
+                },
+            ),
+            AutocompleteRequest::MergeSeries {
+                generation,
+                prefix,
+                source,
+            } => publish(
+                events,
+                context,
+                WorkerEvent::MergeSeriesSuggestions {
+                    generation,
+                    result: service
+                        .autocomplete_series(&prefix, &[source], 50)
+                        .map(|mut rows| {
+                            rows.retain(|usage| usage.series.id != source);
+                            rows
+                        })
+                        .map_err(|error| error.to_string()),
+                },
+            ),
+            AutocompleteRequest::MergeTags {
+                generation,
+                prefix,
+                source,
+            } => publish(
+                events,
+                context,
+                WorkerEvent::MergeTagSuggestions {
+                    generation,
+                    result: service
+                        .autocomplete_tags(&prefix, &[source], 50)
+                        .map(|mut rows| {
+                            rows.retain(|usage| usage.tag.id != source);
+                            rows
+                        })
+                        .map_err(|error| error.to_string()),
+                },
+            ),
         };
         if !published {
+            break;
+        }
+    }
+}
+
+fn spawn_vocabulary_worker(
+    database_path: PathBuf,
+    receiver: Receiver<VocabularyRequest>,
+    events: Sender<WorkerEvent>,
+    context: egui::Context,
+) {
+    let failure_events = events.clone();
+    let failure_context = context.clone();
+    let result = thread::Builder::new()
+        .name("lectern-vocabulary".into())
+        .spawn(move || vocabulary_worker(&database_path, &receiver, &events, &context));
+    if let Err(error) = result {
+        publish(
+            &failure_events,
+            &failure_context,
+            WorkerEvent::Error(format!("Could not start vocabulary worker: {error}")),
+        );
+    }
+}
+
+fn vocabulary_worker(
+    database_path: &PathBuf,
+    receiver: &Receiver<VocabularyRequest>,
+    events: &Sender<WorkerEvent>,
+    context: &egui::Context,
+) {
+    let mut service = None;
+    while let Ok(request) = receiver.recv() {
+        let service = match service.get_or_insert_with(|| SqliteLibraryService::open(database_path))
+        {
+            Ok(service) => service,
+            Err(error) => {
+                if !publish(
+                    events,
+                    context,
+                    WorkerEvent::VocabularyLoaded {
+                        generation: request.generation,
+                        kind: request.kind,
+                        offset: request.offset,
+                        result: Err(error.to_string()),
+                    },
+                ) {
+                    break;
+                }
+                service = None;
+                continue;
+            }
+        };
+        let result = match request.kind {
+            VocabularyKind::Contributors => service
+                .search_contributors(&request.prefix, request.offset, 100)
+                .map(VocabularyRows::Contributors),
+            VocabularyKind::Series => service
+                .search_series(&request.prefix, request.offset, 100)
+                .map(VocabularyRows::Series),
+            VocabularyKind::Tags => service
+                .search_tags(&request.prefix, request.offset, 100)
+                .map(VocabularyRows::Tags),
+        }
+        .map_err(|error| error.to_string());
+        if !publish(
+            events,
+            context,
+            WorkerEvent::VocabularyLoaded {
+                generation: request.generation,
+                kind: request.kind,
+                offset: request.offset,
+                result,
+            },
+        ) {
             break;
         }
     }

@@ -13,6 +13,7 @@ use lectern_core::{
     LibraryStats,
     organisation::{
         BookEdit, ContributorId, ContributorUsage, SeriesId, SeriesUsage, TagId, TagUsage,
+        VocabularyMutationResult,
     },
 };
 use lectern_import::{import_paths_into, validate_publication};
@@ -125,6 +126,118 @@ impl LibraryService for SqliteLibraryService {
         limit: u32,
     ) -> Result<Vec<TagUsage>, Self::Error> {
         Ok(self.database.autocomplete_tags(prefix, selected, limit)?)
+    }
+
+    fn search_contributors(
+        &mut self,
+        prefix: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<ContributorUsage>, Self::Error> {
+        Ok(self.database.search_contributors(prefix, offset, limit)?)
+    }
+
+    fn search_series(
+        &mut self,
+        prefix: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<SeriesUsage>, Self::Error> {
+        Ok(self.database.search_series(prefix, offset, limit)?)
+    }
+
+    fn search_tags(
+        &mut self,
+        prefix: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<TagUsage>, Self::Error> {
+        Ok(self.database.search_tags(prefix, offset, limit)?)
+    }
+
+    fn contributor_mutation_impact(
+        &mut self,
+        id: ContributorId,
+    ) -> Result<VocabularyMutationResult, Self::Error> {
+        Ok(self.database.contributor_mutation_impact(id)?)
+    }
+
+    fn series_mutation_impact(
+        &mut self,
+        id: SeriesId,
+    ) -> Result<VocabularyMutationResult, Self::Error> {
+        Ok(self.database.series_mutation_impact(id)?)
+    }
+
+    fn tag_mutation_impact(&mut self, id: TagId) -> Result<VocabularyMutationResult, Self::Error> {
+        Ok(self.database.tag_mutation_impact(id)?)
+    }
+
+    fn rename_contributor(
+        &mut self,
+        id: ContributorId,
+        display_name: &str,
+        sort_name: &str,
+    ) -> Result<VocabularyMutationResult, Self::Error> {
+        Ok(self
+            .database
+            .rename_contributor(id, display_name, sort_name)?)
+    }
+
+    fn merge_contributors(
+        &mut self,
+        source: ContributorId,
+        target: ContributorId,
+    ) -> Result<VocabularyMutationResult, Self::Error> {
+        Ok(self.database.merge_contributors(source, target)?)
+    }
+
+    fn delete_contributor(&mut self, id: ContributorId) -> Result<(), Self::Error> {
+        Ok(self.database.delete_contributor(id)?)
+    }
+
+    fn rename_series(
+        &mut self,
+        id: SeriesId,
+        name: &str,
+    ) -> Result<VocabularyMutationResult, Self::Error> {
+        Ok(self.database.rename_series(id, name)?)
+    }
+
+    fn merge_series(
+        &mut self,
+        source: SeriesId,
+        target: SeriesId,
+    ) -> Result<VocabularyMutationResult, Self::Error> {
+        Ok(self.database.merge_series(source, target)?)
+    }
+
+    fn delete_series(&mut self, id: SeriesId) -> Result<(), Self::Error> {
+        Ok(self.database.delete_series(id)?)
+    }
+
+    fn rename_tag(
+        &mut self,
+        id: TagId,
+        name: &str,
+    ) -> Result<VocabularyMutationResult, Self::Error> {
+        Ok(self.database.rename_tag(id, name)?)
+    }
+
+    fn merge_tags(
+        &mut self,
+        source: TagId,
+        target: TagId,
+    ) -> Result<VocabularyMutationResult, Self::Error> {
+        Ok(self.database.merge_tags(source, target)?)
+    }
+
+    fn delete_tag(
+        &mut self,
+        id: TagId,
+        confirmed: VocabularyMutationResult,
+    ) -> Result<VocabularyMutationResult, Self::Error> {
+        Ok(self.database.delete_tag(id, confirmed)?)
     }
 
     fn import_publications(

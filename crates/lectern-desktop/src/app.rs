@@ -14,7 +14,7 @@ use lectern_core::{
     organisation::{
         BookEdit, ContributorFacet, ContributorId, ContributorRole, ContributorUsage, ExactFacets,
         SearchExpression, SearchParseError, SeriesId, SeriesIndex, SeriesUsage, TagId, TagUsage,
-        identity_key,
+        VocabularyMutationResult, identity_key,
     },
 };
 use lectern_desktop::export::{ExportError, ExportProgress, OverwritePolicy};
@@ -25,8 +25,9 @@ use crate::{
     curation::{BookCurationDraft, SeriesDraft},
     platform::{NoopAssetPlatform, PlatformAction, PlatformWorker, SystemAssetPlatform},
     workers::{
-        DecodedCover, ExportRequest, ImportRequest, QueryQueueResult, QueryRequest, WorkerEvent,
-        WorkerSet,
+        DecodedCover, ExportRequest, ImportRequest, QueryQueueResult, QueryRequest,
+        VocabularyEntityId, VocabularyKind, VocabularyMutation, VocabularyRequest, VocabularyRows,
+        WorkerEvent, WorkerSet,
     },
 };
 
@@ -43,6 +44,7 @@ const CARD_GAP: f32 = 14.0;
 const COVER_SIZE: Vec2 = Vec2::new(142.0, 206.0);
 const MAX_CACHED_COVERS: usize = 256;
 const QUERY_PAGE_SIZE: usize = 128;
+const VOCABULARY_PAGE_SIZE: u64 = 100;
 const MAX_CACHED_QUERY_PAGES: usize = 6;
 
 struct CachedCover {
@@ -186,6 +188,151 @@ struct FilterUi {
     contributor_labels: HashMap<ContributorId, String>,
     series_labels: HashMap<SeriesId, String>,
     tag_labels: HashMap<TagId, String>,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum OrganiserSection {
+    #[default]
+    Contributors,
+    Series,
+    Tags,
+    SavedSearches,
+}
+
+impl OrganiserSection {
+    const ALL: [Self; 4] = [
+        Self::Contributors,
+        Self::Series,
+        Self::Tags,
+        Self::SavedSearches,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Contributors => "Contributors",
+            Self::Series => "Series",
+            Self::Tags => "Tags",
+            Self::SavedSearches => "Saved searches",
+        }
+    }
+
+    const fn vocabulary_kind(self) -> Option<VocabularyKind> {
+        match self {
+            Self::Contributors => Some(VocabularyKind::Contributors),
+            Self::Series => Some(VocabularyKind::Series),
+            Self::Tags => Some(VocabularyKind::Tags),
+            Self::SavedSearches => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum VocabularyEntity {
+    Contributor(ContributorUsage),
+    Series(SeriesUsage),
+    Tag(TagUsage),
+}
+
+impl VocabularyEntity {
+    const fn id(&self) -> VocabularyEntityId {
+        match self {
+            Self::Contributor(usage) => VocabularyEntityId::Contributor(usage.contributor.id),
+            Self::Series(usage) => VocabularyEntityId::Series(usage.series.id),
+            Self::Tag(usage) => VocabularyEntityId::Tag(usage.tag.id),
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Contributor(usage) => &usage.contributor.display_name,
+            Self::Series(usage) => &usage.series.name,
+            Self::Tag(usage) => &usage.tag.name,
+        }
+    }
+
+    const fn books(&self) -> u64 {
+        match self {
+            Self::Contributor(usage) => usage.books,
+            Self::Series(usage) => usage.books,
+            Self::Tag(usage) => usage.books,
+        }
+    }
+
+    const fn saved_searches(&self) -> Option<u64> {
+        match self {
+            Self::Tag(usage) => Some(usage.saved_searches),
+            Self::Contributor(_) | Self::Series(_) => None,
+        }
+    }
+}
+
+enum VocabularyPage {
+    Contributors(Vec<ContributorUsage>),
+    Series(Vec<SeriesUsage>),
+    Tags(Vec<TagUsage>),
+}
+
+impl VocabularyPage {
+    fn len(&self) -> usize {
+        match self {
+            Self::Contributors(rows) => rows.len(),
+            Self::Series(rows) => rows.len(),
+            Self::Tags(rows) => rows.len(),
+        }
+    }
+}
+
+struct RenameVocabularyDialog {
+    entity: VocabularyEntity,
+    name: String,
+    sort_name: String,
+    pending: bool,
+    error: Option<String>,
+}
+
+struct MergeVocabularyDialog {
+    source: VocabularyEntity,
+    input: String,
+    suggestions: SuggestionState<VocabularyEntity>,
+    target: Option<VocabularyEntity>,
+    impact: Option<VocabularyMutationResult>,
+    impact_pending: bool,
+    pending: bool,
+    error: Option<String>,
+}
+
+struct DeleteVocabularyDialog {
+    entity: VocabularyEntity,
+    impact: Option<VocabularyMutationResult>,
+    impact_pending: bool,
+    pending: bool,
+    error: Option<String>,
+}
+
+enum VocabularyDialog {
+    Rename(RenameVocabularyDialog),
+    Merge(MergeVocabularyDialog),
+    Delete(DeleteVocabularyDialog),
+}
+
+enum OrganiserRowAction {
+    Rename(VocabularyEntity),
+    Merge(VocabularyEntity),
+    Delete(VocabularyEntity),
+}
+
+#[derive(Default)]
+struct OrganiserUi {
+    open: bool,
+    section: OrganiserSection,
+    search_input: String,
+    applied_prefix: String,
+    generation: u64,
+    offset: u64,
+    pending: bool,
+    page: Option<VocabularyPage>,
+    error: Option<String>,
+    dialog: Option<VocabularyDialog>,
 }
 
 #[derive(Default)]
@@ -337,6 +484,7 @@ pub(crate) struct LecternApp {
     search_input: String,
     search_error: Option<SearchParseError>,
     filters: FilterUi,
+    organiser: OrganiserUi,
     query_generation: u64,
     query_pending: bool,
     library_total: Option<usize>,
@@ -386,6 +534,7 @@ impl LecternApp {
             search_input: String::new(),
             search_error: None,
             filters: FilterUi::default(),
+            organiser: OrganiserUi::default(),
             query_generation: 0,
             query_pending: false,
             library_total: None,
@@ -558,6 +707,40 @@ impl LecternApp {
                 }
                 WorkerEvent::FacetTagSuggestions { generation, result } => {
                     self.filters.tag_suggestions.install(generation, result);
+                }
+                WorkerEvent::MergeContributorSuggestions { generation, result } => {
+                    self.install_merge_suggestions(
+                        generation,
+                        result.map(|rows| {
+                            rows.into_iter()
+                                .map(VocabularyEntity::Contributor)
+                                .collect()
+                        }),
+                    );
+                }
+                WorkerEvent::MergeSeriesSuggestions { generation, result } => {
+                    self.install_merge_suggestions(
+                        generation,
+                        result.map(|rows| rows.into_iter().map(VocabularyEntity::Series).collect()),
+                    );
+                }
+                WorkerEvent::MergeTagSuggestions { generation, result } => {
+                    self.install_merge_suggestions(
+                        generation,
+                        result.map(|rows| rows.into_iter().map(VocabularyEntity::Tag).collect()),
+                    );
+                }
+                WorkerEvent::VocabularyLoaded {
+                    generation,
+                    kind,
+                    offset,
+                    result,
+                } => self.vocabulary_loaded(generation, kind, offset, result),
+                WorkerEvent::VocabularyImpact { entity, result } => {
+                    self.vocabulary_impact_loaded(entity, result);
+                }
+                WorkerEvent::VocabularyMutated { mutation, result } => {
+                    self.vocabulary_mutated(&mutation, result);
                 }
                 WorkerEvent::BookRemoved { id, title, result } => {
                     self.book_removed(id, &title, result);
@@ -1484,6 +1667,9 @@ impl LecternApp {
                     )
                     .on_hover_text("Check the availability of referenced EPUB and PDF files")
                     .clicked();
+                if ui.button("Organise library").clicked() {
+                    self.open_organiser();
+                }
                 if self.asset_maintenance.report.is_some() && ui.button("File report").clicked() {
                     self.asset_maintenance.show_report = true;
                 }
@@ -1528,6 +1714,463 @@ impl LecternApp {
                 );
             });
         previous != self.query.asset_health
+    }
+
+    fn organiser_window(&mut self, context: &egui::Context) {
+        if !self.organiser.open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Organise library")
+            .id(egui::Id::new("organise-library"))
+            .open(&mut open)
+            .default_size([760.0, 620.0])
+            .min_size([620.0, 440.0])
+            .show(context, |ui| self.organiser_contents(ui));
+        self.organiser.open = open;
+    }
+
+    fn organiser_contents(&mut self, ui: &mut egui::Ui) {
+        let mut requested_section = None;
+        ui.horizontal(|ui| {
+            for section in OrganiserSection::ALL {
+                if ui
+                    .selectable_label(self.organiser.section == section, section.label())
+                    .clicked()
+                {
+                    requested_section = Some(section);
+                }
+            }
+        });
+        if let Some(section) = requested_section
+            && section != self.organiser.section
+        {
+            self.organiser.section = section;
+            self.organiser.search_input.clear();
+            self.organiser.applied_prefix.clear();
+            self.organiser.offset = 0;
+            self.organiser.page = None;
+            self.organiser.error = None;
+            self.request_vocabulary_page(0);
+        }
+
+        ui.separator();
+        if self.organiser.section == OrganiserSection::SavedSearches {
+            ui.heading("Saved searches");
+            ui.label(
+                RichText::new(
+                    "Saved projections are created, applied, renamed, updated, and deleted from the Saved searches toolbar menu.",
+                )
+                .color(MUTED),
+            );
+            return;
+        }
+
+        let mut search = false;
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.organiser.search_input)
+                    .hint_text(format!(
+                        "Search {}",
+                        self.organiser.section.label().to_lowercase()
+                    ))
+                    .desired_width(360.0),
+            );
+            search |=
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            search |= ui
+                .add_enabled(!self.organiser.pending, egui::Button::new("Search"))
+                .clicked();
+            if !self.organiser.applied_prefix.is_empty() && ui.button("Clear").clicked() {
+                self.organiser.search_input.clear();
+                search = true;
+            }
+            if self.organiser.pending {
+                ui.spinner();
+            }
+        });
+        if search {
+            self.organiser.applied_prefix = self.organiser.search_input.trim().to_owned();
+            self.request_vocabulary_page(0);
+        }
+
+        if let Some(error) = &self.organiser.error {
+            ui.label(RichText::new(error).color(Color32::LIGHT_RED));
+        }
+
+        let mut row_action = None;
+        if let Some(page) = &self.organiser.page {
+            let row_count = page.len();
+            let first = self.organiser.offset.saturating_add(1);
+            let last = self
+                .organiser
+                .offset
+                .saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
+            ui.label(
+                RichText::new(if row_count == 0 {
+                    "No matching entities".to_owned()
+                } else {
+                    format!("Showing {first}–{last} · global usage counts")
+                })
+                .color(MUTED)
+                .size(12.0),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt("vocabulary-rows")
+                .max_height(450.0)
+                .show_rows(ui, 38.0, row_count, |ui, range| {
+                    for index in range {
+                        let Some(entity) = vocabulary_entity_at(page, index) else {
+                            continue;
+                        };
+                        ui.horizontal(|ui| {
+                            ui.set_min_height(34.0);
+                            ui.label(RichText::new(entity.name()).strong());
+                            ui.label(
+                                RichText::new(vocabulary_usage_label(&entity))
+                                    .color(MUTED)
+                                    .size(12.0),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                if ui.small_button("Delete").clicked() {
+                                    row_action = Some(OrganiserRowAction::Delete(entity.clone()));
+                                }
+                                if ui.small_button("Merge…").clicked() {
+                                    row_action = Some(OrganiserRowAction::Merge(entity.clone()));
+                                }
+                                if ui.small_button("Rename…").clicked() {
+                                    row_action = Some(OrganiserRowAction::Rename(entity.clone()));
+                                }
+                            });
+                        });
+                        ui.separator();
+                    }
+                });
+
+            let has_previous = self.organiser.offset > 0;
+            let has_next = row_count == usize::try_from(VOCABULARY_PAGE_SIZE).unwrap();
+            let mut previous = false;
+            let mut next = false;
+            ui.horizontal(|ui| {
+                previous = ui
+                    .add_enabled(
+                        has_previous && !self.organiser.pending,
+                        egui::Button::new("Previous 100"),
+                    )
+                    .clicked();
+                next = ui
+                    .add_enabled(
+                        has_next && !self.organiser.pending,
+                        egui::Button::new("Next 100"),
+                    )
+                    .clicked();
+            });
+            if previous {
+                self.request_vocabulary_page(
+                    self.organiser.offset.saturating_sub(VOCABULARY_PAGE_SIZE),
+                );
+            } else if next {
+                self.request_vocabulary_page(
+                    self.organiser.offset.saturating_add(VOCABULARY_PAGE_SIZE),
+                );
+            }
+        } else if self.organiser.pending {
+            centered_message(
+                ui,
+                "Loading organisation",
+                "Reading one bounded page…",
+                true,
+            );
+        }
+
+        if let Some(action) = row_action {
+            self.begin_vocabulary_action(action);
+        }
+    }
+
+    fn begin_vocabulary_action(&mut self, action: OrganiserRowAction) {
+        match action {
+            OrganiserRowAction::Rename(entity) => {
+                let sort_name = match &entity {
+                    VocabularyEntity::Contributor(usage) => usage.contributor.sort_name.clone(),
+                    VocabularyEntity::Series(_) | VocabularyEntity::Tag(_) => String::new(),
+                };
+                let name = entity.name().to_owned();
+                self.organiser.dialog = Some(VocabularyDialog::Rename(RenameVocabularyDialog {
+                    entity,
+                    name,
+                    sort_name,
+                    pending: false,
+                    error: None,
+                }));
+            }
+            OrganiserRowAction::Merge(source) => {
+                self.organiser.dialog = Some(VocabularyDialog::Merge(MergeVocabularyDialog {
+                    source,
+                    input: String::new(),
+                    suggestions: SuggestionState::default(),
+                    target: None,
+                    impact: None,
+                    impact_pending: false,
+                    pending: false,
+                    error: None,
+                }));
+            }
+            OrganiserRowAction::Delete(entity) => {
+                let entity_id = entity.id();
+                let mut dialog = DeleteVocabularyDialog {
+                    entity,
+                    impact: None,
+                    impact_pending: true,
+                    pending: false,
+                    error: None,
+                };
+                if !self.workers.vocabulary_impact(entity_id) {
+                    dialog.impact_pending = false;
+                    dialog.error = Some("Metadata worker is unavailable".to_owned());
+                }
+                self.organiser.dialog = Some(VocabularyDialog::Delete(dialog));
+            }
+        }
+    }
+
+    fn vocabulary_dialog_window(&mut self, context: &egui::Context) {
+        let Some(mut dialog) = self.organiser.dialog.take() else {
+            return;
+        };
+        let mut close = false;
+        let mut mutation = None;
+        let mut impact_request = None;
+        let mut merge_lookup = None;
+        match &mut dialog {
+            VocabularyDialog::Rename(rename) => {
+                egui::Modal::new(egui::Id::new("rename-vocabulary")).show(context, |ui| {
+                    ui.heading(format!("Rename {}", rename.entity.name()));
+                    ui.label(
+                        "This updates every affected book projection and saved search atomically.",
+                    );
+                    ui.label("Display name");
+                    ui.add(egui::TextEdit::singleline(&mut rename.name).desired_width(420.0));
+                    if matches!(rename.entity, VocabularyEntity::Contributor(_)) {
+                        ui.label("Sort name");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut rename.sort_name).desired_width(420.0),
+                        );
+                    }
+                    vocabulary_dialog_error(ui, rename.error.as_deref());
+                    ui.horizontal(|ui| {
+                        if rename.pending {
+                            ui.spinner();
+                        }
+                        if ui
+                            .add_enabled(!rename.pending, egui::Button::new("Rename").fill(ACCENT))
+                            .clicked()
+                        {
+                            mutation = rename_vocabulary_mutation(rename);
+                            rename.pending = mutation.is_some();
+                            if mutation.is_none() {
+                                rename.error = Some("Name cannot be empty".to_owned());
+                            }
+                        }
+                        if ui
+                            .add_enabled(!rename.pending, egui::Button::new("Cancel"))
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+            }
+            VocabularyDialog::Merge(merge) => {
+                egui::Modal::new(egui::Id::new("merge-vocabulary")).show(context, |ui| {
+                    ui.heading(format!("Merge {}", merge.source.name()));
+                    ui.label("Choose the entity to keep. The named source will be removed.");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut merge.input)
+                            .hint_text("Search for the target to keep")
+                            .desired_width(440.0),
+                    );
+                    if response.changed() {
+                        merge.target = None;
+                        merge.impact = None;
+                        let generation = merge.suggestions.begin();
+                        merge_lookup = Some((generation, merge.input.clone(), merge.source.id()));
+                    }
+                    suggestion_status(ui, &merge.suggestions);
+                    let mut selected = None;
+                    for (index, entity) in merge.suggestions.results.iter().take(8).enumerate() {
+                        if ui
+                            .button(format!("{} · {} books", entity.name(), entity.books()))
+                            .clicked()
+                        {
+                            selected = Some(index);
+                        }
+                    }
+                    if let Some(index) = selected {
+                        let target = merge.suggestions.results[index].clone();
+                        target.name().clone_into(&mut merge.input);
+                        merge.target = Some(target);
+                        merge.suggestions.results.clear();
+                        merge.impact = None;
+                    }
+                    if let Some(target) = &merge.target {
+                        ui.label(
+                            RichText::new(format!(
+                                "Source: {}  →  Keep: {}",
+                                merge.source.name(),
+                                target.name()
+                            ))
+                            .strong(),
+                        );
+                    }
+                    if merge.impact_pending {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Checking affected references…");
+                        });
+                    }
+                    if let Some(impact) = merge.impact {
+                        vocabulary_confirmation_copy(ui, "Merge", impact);
+                    }
+                    vocabulary_dialog_error(ui, merge.error.as_deref());
+                    ui.horizontal(|ui| {
+                        let can_review = merge.target.is_some()
+                            && !merge.impact_pending
+                            && !merge.pending
+                            && merge.impact.is_none();
+                        if ui
+                            .add_enabled(can_review, egui::Button::new("Review merge"))
+                            .clicked()
+                        {
+                            merge.impact_pending = true;
+                            merge.error = None;
+                            impact_request = Some(merge.source.id());
+                        }
+                        if ui
+                            .add_enabled(
+                                merge.impact.is_some() && !merge.pending,
+                                egui::Button::new("Confirm merge").fill(ACCENT),
+                            )
+                            .clicked()
+                        {
+                            mutation = merge_vocabulary_mutation(merge);
+                            merge.pending = mutation.is_some();
+                        }
+                        if merge.pending {
+                            ui.spinner();
+                        }
+                        if ui
+                            .add_enabled(!merge.pending, egui::Button::new("Cancel"))
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+            }
+            VocabularyDialog::Delete(delete) => {
+                egui::Modal::new(egui::Id::new("delete-vocabulary")).show(context, |ui| {
+                    ui.heading(format!("Delete {}?", delete.entity.name()));
+                    if delete.impact_pending {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Checking affected references…");
+                        });
+                    }
+                    let can_delete = delete.impact.is_some_and(|impact| {
+                        matches!(delete.entity, VocabularyEntity::Tag(_))
+                            || (impact.books == 0 && impact.saved_searches == 0)
+                    });
+                    if let Some(impact) = delete.impact {
+                        vocabulary_confirmation_copy(ui, "Delete", impact);
+                        if !can_delete {
+                            ui.label(
+                                RichText::new(
+                                    "Contributors and series can be deleted only when unused. Merge it instead.",
+                                )
+                                .color(Color32::LIGHT_RED),
+                            );
+                        }
+                    }
+                    vocabulary_dialog_error(ui, delete.error.as_deref());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                can_delete && !delete.pending,
+                                egui::Button::new("Confirm delete").fill(Color32::DARK_RED),
+                            )
+                            .clicked()
+                        {
+                            mutation = delete_vocabulary_mutation(delete);
+                            delete.pending = mutation.is_some();
+                        }
+                        if delete.pending {
+                            ui.spinner();
+                        }
+                        if ui
+                            .add_enabled(!delete.pending, egui::Button::new("Cancel"))
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+            }
+        }
+
+        if let Some((generation, prefix, source)) = merge_lookup {
+            let queued = match source {
+                VocabularyEntityId::Contributor(source) => self
+                    .workers
+                    .autocomplete_merge_contributors(generation, prefix, source),
+                VocabularyEntityId::Series(source) => self
+                    .workers
+                    .autocomplete_merge_series(generation, prefix, source),
+                VocabularyEntityId::Tag(source) => self
+                    .workers
+                    .autocomplete_merge_tags(generation, prefix, source),
+            };
+            if !queued && let VocabularyDialog::Merge(merge) = &mut dialog {
+                merge.suggestions.pending = false;
+                merge.suggestions.error = Some("Autocomplete worker is unavailable".to_owned());
+            }
+        }
+        if let Some(entity) = impact_request
+            && !self.workers.vocabulary_impact(entity)
+        {
+            match &mut dialog {
+                VocabularyDialog::Merge(merge) => {
+                    merge.impact_pending = false;
+                    merge.error = Some("Metadata worker is unavailable".to_owned());
+                }
+                VocabularyDialog::Delete(delete) => {
+                    delete.impact_pending = false;
+                    delete.error = Some("Metadata worker is unavailable".to_owned());
+                }
+                VocabularyDialog::Rename(_) => {}
+            }
+        }
+        if let Some(request) = mutation
+            && !self.workers.mutate_vocabulary(request)
+        {
+            match &mut dialog {
+                VocabularyDialog::Rename(rename) => {
+                    rename.pending = false;
+                    rename.error = Some("Metadata worker is unavailable".to_owned());
+                }
+                VocabularyDialog::Merge(merge) => {
+                    merge.pending = false;
+                    merge.error = Some("Metadata worker is unavailable".to_owned());
+                }
+                VocabularyDialog::Delete(delete) => {
+                    delete.pending = false;
+                    delete.error = Some("Metadata worker is unavailable".to_owned());
+                }
+            }
+        }
+        if !close {
+            self.organiser.dialog = Some(dialog);
+        }
     }
 
     fn start_import(&mut self, roots: Vec<PathBuf>) {
@@ -1915,6 +2558,247 @@ impl LecternApp {
             self.filters.tag_suggestions.pending = false;
             self.filters.tag_suggestions.error =
                 Some("Autocomplete worker is unavailable".to_owned());
+        }
+    }
+
+    fn open_organiser(&mut self) {
+        self.organiser.open = true;
+        if self.organiser.page.is_none() && !self.organiser.pending {
+            self.request_vocabulary_page(0);
+        }
+    }
+
+    fn request_vocabulary_page(&mut self, offset: u64) {
+        let Some(kind) = self.organiser.section.vocabulary_kind() else {
+            self.organiser.page = None;
+            self.organiser.pending = false;
+            return;
+        };
+        self.organiser.generation = self.organiser.generation.wrapping_add(1);
+        self.organiser.offset = offset;
+        self.organiser.pending = true;
+        self.organiser.error = None;
+        let request = VocabularyRequest {
+            generation: self.organiser.generation,
+            kind,
+            prefix: self.organiser.applied_prefix.clone(),
+            offset,
+        };
+        if !self.workers.load_vocabulary(request) {
+            self.organiser.pending = false;
+            self.organiser.error = Some("Vocabulary worker is busy; try again".to_owned());
+        }
+    }
+
+    fn vocabulary_loaded(
+        &mut self,
+        generation: u64,
+        kind: VocabularyKind,
+        offset: u64,
+        result: Result<VocabularyRows, String>,
+    ) {
+        if generation != self.organiser.generation
+            || self.organiser.section.vocabulary_kind() != Some(kind)
+            || offset != self.organiser.offset
+        {
+            return;
+        }
+        self.organiser.pending = false;
+        match result {
+            Ok(VocabularyRows::Contributors(rows)) if kind == VocabularyKind::Contributors => {
+                self.organiser.page = Some(VocabularyPage::Contributors(rows));
+                self.organiser.error = None;
+            }
+            Ok(VocabularyRows::Series(rows)) if kind == VocabularyKind::Series => {
+                self.organiser.page = Some(VocabularyPage::Series(rows));
+                self.organiser.error = None;
+            }
+            Ok(VocabularyRows::Tags(rows)) if kind == VocabularyKind::Tags => {
+                self.organiser.page = Some(VocabularyPage::Tags(rows));
+                self.organiser.error = None;
+            }
+            Ok(_) => {
+                self.organiser.page = None;
+                self.organiser.error = Some("Vocabulary worker returned the wrong row type".into());
+            }
+            Err(error) => {
+                self.organiser.page = None;
+                self.organiser.error = Some(error);
+            }
+        }
+    }
+
+    fn install_merge_suggestions(
+        &mut self,
+        generation: u64,
+        result: Result<Vec<VocabularyEntity>, String>,
+    ) {
+        if let Some(VocabularyDialog::Merge(dialog)) = &mut self.organiser.dialog {
+            dialog.suggestions.install(generation, result);
+        }
+    }
+
+    fn vocabulary_impact_loaded(
+        &mut self,
+        entity: VocabularyEntityId,
+        result: Result<VocabularyMutationResult, String>,
+    ) {
+        match &mut self.organiser.dialog {
+            Some(VocabularyDialog::Merge(dialog)) if dialog.source.id() == entity => {
+                dialog.impact_pending = false;
+                match result {
+                    Ok(impact) => {
+                        dialog.impact = Some(impact);
+                        dialog.error = None;
+                    }
+                    Err(error) => dialog.error = Some(error),
+                }
+            }
+            Some(VocabularyDialog::Delete(dialog)) if dialog.entity.id() == entity => {
+                dialog.impact_pending = false;
+                match result {
+                    Ok(impact) => {
+                        dialog.impact = Some(impact);
+                        dialog.error = None;
+                    }
+                    Err(error) => dialog.error = Some(error),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn vocabulary_mutated(
+        &mut self,
+        mutation: &VocabularyMutation,
+        result: Result<VocabularyMutationResult, String>,
+    ) {
+        match result {
+            Ok(impact) => {
+                self.cache_merge_target_label();
+                self.rewrite_active_facets_after_mutation(mutation);
+                self.status = format!(
+                    "Updated library organisation · {} books · {} saved searches · no book files changed",
+                    impact.books, impact.saved_searches
+                );
+                self.organiser.dialog = None;
+                self.organiser.page = None;
+                self.clear_selection();
+                self.refresh_library();
+                self.request_vocabulary_page(self.organiser.offset);
+            }
+            Err(error) => match &mut self.organiser.dialog {
+                Some(VocabularyDialog::Rename(dialog)) => {
+                    dialog.pending = false;
+                    dialog.error = Some(error);
+                }
+                Some(VocabularyDialog::Merge(dialog)) => {
+                    dialog.pending = false;
+                    dialog.error = Some(error);
+                }
+                Some(VocabularyDialog::Delete(dialog)) => {
+                    dialog.pending = false;
+                    dialog.error = Some(error);
+                }
+                None => self.status = format!("Could not update library organisation: {error}"),
+            },
+        }
+    }
+
+    fn cache_merge_target_label(&mut self) {
+        let Some(VocabularyDialog::Merge(dialog)) = &self.organiser.dialog else {
+            return;
+        };
+        let Some(target) = &dialog.target else {
+            return;
+        };
+        match target {
+            VocabularyEntity::Contributor(usage) => {
+                self.filters
+                    .contributor_labels
+                    .insert(usage.contributor.id, usage.contributor.display_name.clone());
+            }
+            VocabularyEntity::Series(usage) => {
+                self.filters
+                    .series_labels
+                    .insert(usage.series.id, usage.series.name.clone());
+            }
+            VocabularyEntity::Tag(usage) => {
+                self.filters
+                    .tag_labels
+                    .insert(usage.tag.id, usage.tag.name.clone());
+            }
+        }
+    }
+
+    fn rewrite_active_facets_after_mutation(&mut self, mutation: &VocabularyMutation) {
+        match mutation {
+            VocabularyMutation::RenameContributor {
+                id, display_name, ..
+            } => {
+                self.filters
+                    .contributor_labels
+                    .insert(*id, display_name.clone());
+            }
+            VocabularyMutation::MergeContributors { source, target } => {
+                let mut author_only = false;
+                let mut matched = false;
+                self.query.facets.contributors.retain(|facet| {
+                    if facet.contributor == *source || facet.contributor == *target {
+                        matched = true;
+                        author_only |= facet.author_only;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if matched {
+                    self.query.facets.contributors.push(ContributorFacet {
+                        contributor: *target,
+                        author_only,
+                    });
+                    self.query.facets.contributors.sort_unstable();
+                }
+                self.filters.contributor_labels.remove(source);
+            }
+            VocabularyMutation::DeleteContributor(id) => {
+                self.query
+                    .facets
+                    .contributors
+                    .retain(|facet| facet.contributor != *id);
+                self.filters.contributor_labels.remove(id);
+            }
+            VocabularyMutation::RenameSeries { id, name } => {
+                self.filters.series_labels.insert(*id, name.clone());
+            }
+            VocabularyMutation::MergeSeries { source, target } => {
+                if self.query.facets.series == Some(*source) {
+                    self.query.facets.series = Some(*target);
+                }
+                self.filters.series_labels.remove(source);
+            }
+            VocabularyMutation::DeleteSeries(id) => {
+                if self.query.facets.series == Some(*id) {
+                    self.query.facets.series = None;
+                }
+                self.filters.series_labels.remove(id);
+            }
+            VocabularyMutation::RenameTag { id, name } => {
+                self.filters.tag_labels.insert(*id, name.clone());
+            }
+            VocabularyMutation::MergeTags { source, target } => {
+                rewrite_tag_facet(&mut self.query.facets.included_tags, *source, *target);
+                rewrite_tag_facet(&mut self.query.facets.excluded_tags, *source, *target);
+                if self.query.facets.included_tags.contains(target) {
+                    self.query.facets.excluded_tags.retain(|id| id != target);
+                }
+                self.filters.tag_labels.remove(source);
+            }
+            VocabularyMutation::DeleteTag { id, .. } => {
+                self.query.facets.included_tags.retain(|tag| tag != id);
+                self.query.facets.excluded_tags.retain(|tag| tag != id);
+                self.filters.tag_labels.remove(id);
+            }
         }
     }
 
@@ -2632,6 +3516,8 @@ impl eframe::App for LecternApp {
         self.asset_replace_confirmation_window(ui.ctx());
         self.export_overwrite_confirmation_window(ui.ctx());
         self.book_removal_confirmation_window(ui.ctx());
+        self.organiser_window(ui.ctx());
+        self.vocabulary_dialog_window(ui.ctx());
 
         if files_hovering {
             let rect = ui.max_rect().shrink(18.0);
@@ -3252,6 +4138,114 @@ fn suggestion_status<T>(ui: &mut egui::Ui, state: &SuggestionState<T>) {
     } else if let Some(error) = &state.error {
         ui.label(RichText::new(error).color(Color32::LIGHT_RED).size(11.0));
     }
+}
+
+fn vocabulary_entity_at(page: &VocabularyPage, index: usize) -> Option<VocabularyEntity> {
+    match page {
+        VocabularyPage::Contributors(rows) => {
+            rows.get(index).cloned().map(VocabularyEntity::Contributor)
+        }
+        VocabularyPage::Series(rows) => rows.get(index).cloned().map(VocabularyEntity::Series),
+        VocabularyPage::Tags(rows) => rows.get(index).cloned().map(VocabularyEntity::Tag),
+    }
+}
+
+fn vocabulary_usage_label(entity: &VocabularyEntity) -> String {
+    match entity.saved_searches() {
+        Some(saved_searches) => {
+            format!("{} books · {saved_searches} saved searches", entity.books())
+        }
+        None => format!("{} books", entity.books()),
+    }
+}
+
+fn vocabulary_dialog_error(ui: &mut egui::Ui, error: Option<&str>) {
+    if let Some(error) = error {
+        ui.label(RichText::new(error).color(Color32::LIGHT_RED));
+    }
+}
+
+fn vocabulary_confirmation_copy(
+    ui: &mut egui::Ui,
+    operation: &str,
+    impact: VocabularyMutationResult,
+) {
+    ui.label(format!(
+        "{operation} affects {} books and {} saved searches.",
+        impact.books, impact.saved_searches
+    ));
+    ui.label(RichText::new("No book files or publication bytes will change.").strong());
+}
+
+fn rename_vocabulary_mutation(dialog: &RenameVocabularyDialog) -> Option<VocabularyMutation> {
+    if dialog.name.trim().is_empty() {
+        return None;
+    }
+    Some(match &dialog.entity {
+        VocabularyEntity::Contributor(usage) => VocabularyMutation::RenameContributor {
+            id: usage.contributor.id,
+            display_name: dialog.name.clone(),
+            sort_name: dialog.sort_name.clone(),
+        },
+        VocabularyEntity::Series(usage) => VocabularyMutation::RenameSeries {
+            id: usage.series.id,
+            name: dialog.name.clone(),
+        },
+        VocabularyEntity::Tag(usage) => VocabularyMutation::RenameTag {
+            id: usage.tag.id,
+            name: dialog.name.clone(),
+        },
+    })
+}
+
+fn merge_vocabulary_mutation(dialog: &MergeVocabularyDialog) -> Option<VocabularyMutation> {
+    dialog.impact?;
+    let target = dialog.target.as_ref()?;
+    match (&dialog.source, target) {
+        (VocabularyEntity::Contributor(source), VocabularyEntity::Contributor(target)) => {
+            Some(VocabularyMutation::MergeContributors {
+                source: source.contributor.id,
+                target: target.contributor.id,
+            })
+        }
+        (VocabularyEntity::Series(source), VocabularyEntity::Series(target)) => {
+            Some(VocabularyMutation::MergeSeries {
+                source: source.series.id,
+                target: target.series.id,
+            })
+        }
+        (VocabularyEntity::Tag(source), VocabularyEntity::Tag(target)) => {
+            Some(VocabularyMutation::MergeTags {
+                source: source.tag.id,
+                target: target.tag.id,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn delete_vocabulary_mutation(dialog: &DeleteVocabularyDialog) -> Option<VocabularyMutation> {
+    let impact = dialog.impact?;
+    Some(match &dialog.entity {
+        VocabularyEntity::Contributor(usage) => {
+            VocabularyMutation::DeleteContributor(usage.contributor.id)
+        }
+        VocabularyEntity::Series(usage) => VocabularyMutation::DeleteSeries(usage.series.id),
+        VocabularyEntity::Tag(usage) => VocabularyMutation::DeleteTag {
+            id: usage.tag.id,
+            confirmed: impact,
+        },
+    })
+}
+
+fn rewrite_tag_facet(tags: &mut Vec<TagId>, source: TagId, target: TagId) {
+    for tag in tags.iter_mut() {
+        if *tag == source {
+            *tag = target;
+        }
+    }
+    tags.sort_unstable();
+    tags.dedup();
 }
 
 fn apply_search_input(query: &mut LibraryQuery, input: &str) -> Result<bool, SearchParseError> {

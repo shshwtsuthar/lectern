@@ -659,6 +659,104 @@ pub trait LibraryService {
         limit: u32,
     ) -> Result<Vec<organisation::TagUsage>, Self::Error>;
 
+    /// Returns one bounded contributor vocabulary page with global usage counts.
+    fn search_contributors(
+        &mut self,
+        prefix: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<organisation::ContributorUsage>, Self::Error>;
+
+    /// Returns one bounded series vocabulary page with global usage counts.
+    fn search_series(
+        &mut self,
+        prefix: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<organisation::SeriesUsage>, Self::Error>;
+
+    /// Returns one bounded tag vocabulary page with global usage counts.
+    fn search_tags(
+        &mut self,
+        prefix: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<organisation::TagUsage>, Self::Error>;
+
+    /// Counts book and saved-search references affected by a contributor mutation.
+    fn contributor_mutation_impact(
+        &mut self,
+        id: organisation::ContributorId,
+    ) -> Result<organisation::VocabularyMutationResult, Self::Error>;
+
+    /// Counts book and saved-search references affected by a series mutation.
+    fn series_mutation_impact(
+        &mut self,
+        id: organisation::SeriesId,
+    ) -> Result<organisation::VocabularyMutationResult, Self::Error>;
+
+    /// Counts book and saved-search references affected by a tag mutation.
+    fn tag_mutation_impact(
+        &mut self,
+        id: organisation::TagId,
+    ) -> Result<organisation::VocabularyMutationResult, Self::Error>;
+
+    /// Renames a contributor and rebuilds affected projections atomically.
+    fn rename_contributor(
+        &mut self,
+        id: organisation::ContributorId,
+        display_name: &str,
+        sort_name: &str,
+    ) -> Result<organisation::VocabularyMutationResult, Self::Error>;
+
+    /// Merges a contributor source into an explicit target atomically.
+    fn merge_contributors(
+        &mut self,
+        source: organisation::ContributorId,
+        target: organisation::ContributorId,
+    ) -> Result<organisation::VocabularyMutationResult, Self::Error>;
+
+    /// Deletes one unused contributor.
+    fn delete_contributor(&mut self, id: organisation::ContributorId) -> Result<(), Self::Error>;
+
+    /// Renames a series and rebuilds affected projections atomically.
+    fn rename_series(
+        &mut self,
+        id: organisation::SeriesId,
+        name: &str,
+    ) -> Result<organisation::VocabularyMutationResult, Self::Error>;
+
+    /// Merges a series source into an explicit target atomically.
+    fn merge_series(
+        &mut self,
+        source: organisation::SeriesId,
+        target: organisation::SeriesId,
+    ) -> Result<organisation::VocabularyMutationResult, Self::Error>;
+
+    /// Deletes one unused series.
+    fn delete_series(&mut self, id: organisation::SeriesId) -> Result<(), Self::Error>;
+
+    /// Renames a tag and rebuilds affected search projections atomically.
+    fn rename_tag(
+        &mut self,
+        id: organisation::TagId,
+        name: &str,
+    ) -> Result<organisation::VocabularyMutationResult, Self::Error>;
+
+    /// Merges a tag source into an explicit target atomically.
+    fn merge_tags(
+        &mut self,
+        source: organisation::TagId,
+        target: organisation::TagId,
+    ) -> Result<organisation::VocabularyMutationResult, Self::Error>;
+
+    /// Deletes a tag only when its current usage matches the confirmed impact.
+    fn delete_tag(
+        &mut self,
+        id: organisation::TagId,
+        confirmed: organisation::VocabularyMutationResult,
+    ) -> Result<organisation::VocabularyMutationResult, Self::Error>;
+
     /// Discovers, parses, and imports publications using the application's merge policy.
     fn import_publications(
         &mut self,
