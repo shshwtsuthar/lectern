@@ -6093,6 +6093,10 @@ fn tag_editor(
             Err(error) => editor.error = Some(error),
         }
     }
+    pending_new_tag_notice(ui, editor);
+}
+
+fn pending_new_tag_notice(ui: &mut egui::Ui, editor: &BookEditor) {
     if editor
         .curation
         .tags
