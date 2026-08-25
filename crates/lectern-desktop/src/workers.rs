@@ -16,8 +16,8 @@ use lectern_core::{
     AssetHealthReport, AssetId, Book, BookFormat, BookId, BookSummary, ImportProgress,
     ImportSummary, LibraryQuery, LibraryService,
     organisation::{
-        BookEdit, ContributorId, ContributorUsage, SeriesId, SeriesUsage, TagId, TagUsage,
-        VocabularyMutationResult,
+        BookEdit, ContributorId, ContributorUsage, SelectionSnapshot, SeriesId, SeriesUsage, TagId,
+        TagUsage, VocabularyMutationResult,
     },
 };
 use lectern_desktop::export::{
@@ -51,6 +51,19 @@ pub(crate) enum QueryQueueResult {
     Queued,
     Full,
     Disconnected,
+}
+
+pub(crate) enum SelectionRequest {
+    Snapshot {
+        generation: u64,
+        query: LibraryQuery,
+    },
+    Range {
+        generation: u64,
+        query: LibraryQuery,
+        offset: u64,
+        limit: u32,
+    },
 }
 
 pub(crate) struct ImportRequest {
@@ -223,6 +236,14 @@ pub(crate) enum WorkerEvent {
         generation: u64,
         offset: u64,
     },
+    SelectionSnapshotFinished {
+        generation: u64,
+        result: Result<SelectionSnapshot, String>,
+    },
+    SelectionRangeFinished {
+        generation: u64,
+        result: Result<Vec<BookId>, String>,
+    },
     CoverFinished {
         id: BookId,
         result: Result<Option<DecodedCover>, String>,
@@ -330,6 +351,7 @@ pub(crate) enum WorkerEvent {
 
 pub(crate) struct WorkerSet {
     query_sender: Sender<QueryRequest>,
+    selection_sender: Sender<SelectionRequest>,
     cover_sender: Sender<BookId>,
     import_sender: Sender<ImportRequest>,
     metadata_sender: Sender<MetadataRequest>,
@@ -343,6 +365,7 @@ pub(crate) struct WorkerSet {
 impl WorkerSet {
     pub(crate) fn spawn(database_path: &Path, context: &egui::Context) -> Self {
         let (query_sender, query_receiver) = bounded(QUERY_QUEUE_CAPACITY);
+        let (selection_sender, selection_receiver) = bounded(1);
         let (cover_sender, cover_receiver) = bounded(COVER_QUEUE_CAPACITY);
         let (import_sender, import_receiver) = bounded(1);
         let (metadata_sender, metadata_receiver) = unbounded();
@@ -355,6 +378,12 @@ impl WorkerSet {
         spawn_query_worker(
             database_path.to_path_buf(),
             query_receiver,
+            event_sender.clone(),
+            context.clone(),
+        );
+        spawn_selection_worker(
+            database_path.to_path_buf(),
+            selection_receiver,
             event_sender.clone(),
             context.clone(),
         );
@@ -405,6 +434,7 @@ impl WorkerSet {
 
         Self {
             query_sender,
+            selection_sender,
             cover_sender,
             import_sender,
             metadata_sender,
@@ -422,6 +452,10 @@ impl WorkerSet {
             Err(TrySendError::Full(_)) => QueryQueueResult::Full,
             Err(TrySendError::Disconnected(_)) => QueryQueueResult::Disconnected,
         }
+    }
+
+    pub(crate) fn resolve_selection(&self, request: SelectionRequest) -> bool {
+        self.selection_sender.try_send(request).is_ok()
     }
 
     pub(crate) fn load_cover(&self, id: BookId) -> bool {
@@ -1293,6 +1327,86 @@ fn import_worker(
         });
         let result = result.map_err(|error| error.to_string());
         if !publish(events, context, WorkerEvent::ImportFinished(result)) {
+            break;
+        }
+    }
+}
+
+fn spawn_selection_worker(
+    database_path: PathBuf,
+    receiver: Receiver<SelectionRequest>,
+    events: Sender<WorkerEvent>,
+    context: egui::Context,
+) {
+    let failure_events = events.clone();
+    let failure_context = context.clone();
+    let result = thread::Builder::new()
+        .name("lectern-library-selection".into())
+        .spawn(move || selection_worker(&database_path, &receiver, &events, &context));
+    if let Err(error) = result {
+        publish(
+            &failure_events,
+            &failure_context,
+            WorkerEvent::Error(format!("Could not start selection worker: {error}")),
+        );
+    }
+}
+
+fn selection_worker(
+    database_path: &PathBuf,
+    receiver: &Receiver<SelectionRequest>,
+    events: &Sender<WorkerEvent>,
+    context: &egui::Context,
+) {
+    let mut service = None;
+    while let Ok(request) = receiver.recv() {
+        if service.is_none() {
+            match SqliteLibraryService::open(database_path) {
+                Ok(opened) => service = Some(opened),
+                Err(error) => {
+                    let error = error.to_string();
+                    let event = match request {
+                        SelectionRequest::Snapshot { generation, .. } => {
+                            WorkerEvent::SelectionSnapshotFinished {
+                                generation,
+                                result: Err(error),
+                            }
+                        }
+                        SelectionRequest::Range { generation, .. } => {
+                            WorkerEvent::SelectionRangeFinished {
+                                generation,
+                                result: Err(error),
+                            }
+                        }
+                    };
+                    if !publish(events, context, event) {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+        let service = service.as_mut().expect("selection service is initialized");
+        let event = match request {
+            SelectionRequest::Snapshot { generation, query } => {
+                let result = service
+                    .selection_snapshot(&query)
+                    .map_err(|error| error.to_string());
+                WorkerEvent::SelectionSnapshotFinished { generation, result }
+            }
+            SelectionRequest::Range {
+                generation,
+                query,
+                offset,
+                limit,
+            } => {
+                let result = service
+                    .query_library_ids_window(&query, offset, limit)
+                    .map_err(|error| error.to_string());
+                WorkerEvent::SelectionRangeFinished { generation, result }
+            }
+        };
+        if !publish(events, context, event) {
             break;
         }
     }

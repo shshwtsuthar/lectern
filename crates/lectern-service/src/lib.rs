@@ -12,8 +12,8 @@ use lectern_core::{
     ImportProgress, ImportSummary, LibraryDiagnostics, LibraryPage, LibraryQuery, LibraryService,
     LibraryStats,
     organisation::{
-        BookEdit, ContributorId, ContributorUsage, SeriesId, SeriesUsage, TagId, TagUsage,
-        VocabularyMutationResult,
+        BookEdit, ContributorId, ContributorUsage, SelectionSnapshot, SeriesId, SeriesUsage, TagId,
+        TagUsage, VocabularyMutationResult,
     },
 };
 use lectern_import::{import_paths_into, validate_publication};
@@ -89,6 +89,22 @@ impl LibraryService for SqliteLibraryService {
         limit: u32,
     ) -> Result<Vec<BookSummary>, Self::Error> {
         Ok(self.database.query_window(query, offset, limit)?)
+    }
+
+    fn selection_snapshot(
+        &mut self,
+        query: &LibraryQuery,
+    ) -> Result<SelectionSnapshot, Self::Error> {
+        Ok(self.database.selection_snapshot(query)?)
+    }
+
+    fn query_library_ids_window(
+        &mut self,
+        query: &LibraryQuery,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<BookId>, Self::Error> {
+        Ok(self.database.query_ids_window(query, offset, limit)?)
     }
 
     fn get_book(&mut self, id: BookId) -> Result<Option<Book>, Self::Error> {

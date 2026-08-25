@@ -34,6 +34,7 @@ const SORT_SCENARIOS: [SortOrder; 3] = [
 const SORT_TO_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
 const ASSET_ACTION_TO_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
 const EDITOR_OPEN_TO_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
+const SELECTION_DISPATCH_TO_BUSY_PAINT_P95_BUDGET_NS: u64 = 50_000_000;
 const ASSET_ACTIONS: [PlatformAction; 2] = [PlatformAction::Open, PlatformAction::Reveal];
 
 pub(crate) struct BenchmarkFrame {
@@ -43,6 +44,9 @@ pub(crate) struct BenchmarkFrame {
     pub(crate) cached_covers: usize,
     pub(crate) pending_covers: usize,
     pub(crate) missing_covers: usize,
+    pub(crate) selection_pending: bool,
+    pub(crate) selected_books: u64,
+    pub(crate) all_matching_selected: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -56,6 +60,8 @@ struct BenchmarkConfig {
     asset_action_iterations: usize,
     editor_warmup_iterations: usize,
     editor_iterations: usize,
+    selection_warmup_iterations: usize,
+    selection_iterations: usize,
 }
 
 impl BenchmarkConfig {
@@ -79,6 +85,11 @@ impl BenchmarkConfig {
                 0,
             )?,
             editor_iterations: usize_from_env("LECTERN_BENCHMARK_EDITOR_ITERATIONS", 0)?,
+            selection_warmup_iterations: usize_from_env(
+                "LECTERN_BENCHMARK_SELECTION_WARMUP_ITERATIONS",
+                0,
+            )?,
+            selection_iterations: usize_from_env("LECTERN_BENCHMARK_SELECTION_ITERATIONS", 0)?,
         };
         if config.scroll.is_zero() && !config.scroll_warmup.is_zero() {
             return Err(
@@ -105,6 +116,12 @@ impl BenchmarkConfig {
                     .into(),
             );
         }
+        if config.selection_iterations == 0 && config.selection_warmup_iterations > 0 {
+            return Err(
+                "LECTERN_BENCHMARK_SELECTION_WARMUP_ITERATIONS must be zero when selection interactions are disabled"
+                    .into(),
+            );
+        }
         Ok(config)
     }
 }
@@ -127,6 +144,10 @@ enum Phase {
     Editor {
         completed: usize,
         pending: Option<PendingEditor>,
+    },
+    Selection {
+        completed: usize,
+        pending: Option<PendingSelectionInteraction>,
     },
     Scroll {
         started: Instant,
@@ -152,6 +173,12 @@ struct PendingEditor {
     paint_frames_remaining: Option<u8>,
 }
 
+struct PendingSelectionInteraction {
+    started: Instant,
+    busy_painted: bool,
+    installed_count: Option<u64>,
+}
+
 pub(crate) struct DesktopBenchmark {
     output_path: PathBuf,
     config: BenchmarkConfig,
@@ -175,6 +202,8 @@ pub(crate) struct DesktopBenchmark {
     asset_action_to_paint_samples_ns: [Vec<u64>; ASSET_ACTIONS.len()],
     editor_open_to_paint_samples_ns: Vec<u64>,
     close_editor_requested: bool,
+    selection_dispatch_to_busy_paint_samples_ns: Vec<u64>,
+    clear_selection_requested: bool,
     validation_failure: Option<String>,
     memory: Option<PhaseMemorySampler>,
 }
@@ -211,6 +240,8 @@ impl DesktopBenchmark {
             asset_action_to_paint_samples_ns: array::from_fn(|_| Vec::new()),
             editor_open_to_paint_samples_ns: Vec::new(),
             close_editor_requested: false,
+            selection_dispatch_to_busy_paint_samples_ns: Vec::new(),
+            clear_selection_requested: false,
             validation_failure: None,
             memory: Some(memory),
         }))
@@ -354,6 +385,41 @@ impl DesktopBenchmark {
         std::mem::take(&mut self.close_editor_requested)
     }
 
+    pub(crate) fn next_selection_request(&mut self) -> bool {
+        let Phase::Selection { completed, pending } = &mut self.phase else {
+            return false;
+        };
+        let total = self.config.selection_warmup_iterations + self.config.selection_iterations;
+        if pending.is_some() || *completed >= total {
+            return false;
+        }
+        *pending = Some(PendingSelectionInteraction {
+            started: Instant::now(),
+            busy_painted: false,
+            installed_count: None,
+        });
+        true
+    }
+
+    pub(crate) fn selection_installed(&mut self, selected_books: u64) {
+        let Phase::Selection {
+            pending: Some(pending),
+            ..
+        } = &mut self.phase
+        else {
+            return;
+        };
+        pending.installed_count = Some(selected_books);
+    }
+
+    pub(crate) fn selection_dispatch_failed(&mut self) {
+        self.validation_failure = Some("query-backed selection request could not be queued".into());
+    }
+
+    pub(crate) fn take_selection_clear_request(&mut self) -> bool {
+        std::mem::take(&mut self.clear_selection_requested)
+    }
+
     pub(crate) fn frame_started(&mut self, cpu_usage_seconds: Option<f32>, unstable_dt: f32) {
         let now = Instant::now();
         let interval = self
@@ -397,10 +463,12 @@ impl DesktopBenchmark {
         let mut begin_sort = false;
         let mut begin_asset_actions = false;
         let mut begin_editor = false;
+        let mut begin_selection = false;
         let mut begin_scroll = false;
         let mut sort_finished = false;
         let mut asset_actions_finished = false;
         let mut editor_finished = false;
+        let mut selection_finished = false;
         let mut finish = false;
         let mut failure = None;
         let mut observed_scroll_duration = None;
@@ -435,6 +503,10 @@ impl DesktopBenchmark {
             Phase::Editor { .. } if timed_out => {
                 failure = Some("desktop benchmark timed out during editor interactions".to_owned());
             }
+            Phase::Selection { .. } if timed_out => {
+                failure =
+                    Some("desktop benchmark timed out during selection interactions".to_owned());
+            }
             Phase::Scroll { started } if timed_out => {
                 observed_scroll_duration = Some(now.duration_since(*started));
                 failure = Some("desktop benchmark timed out during scrolling".to_owned());
@@ -446,6 +518,8 @@ impl DesktopBenchmark {
                     begin_asset_actions = true;
                 } else if self.config.editor_iterations > 0 {
                     begin_editor = true;
+                } else if self.config.selection_iterations > 0 {
+                    begin_selection = true;
                 } else if self.config.scroll.is_zero() {
                     self.idle_end_rss_bytes = current_rss_bytes();
                     observed_scroll_duration = Some(Duration::ZERO);
@@ -518,6 +592,52 @@ impl DesktopBenchmark {
                     >= self.config.editor_warmup_iterations + self.config.editor_iterations;
                 context.request_repaint();
             }
+            Phase::Selection { completed, pending }
+                if pending
+                    .as_ref()
+                    .is_some_and(|pending| !pending.busy_painted && frame.selection_pending) =>
+            {
+                let pending = pending.as_mut().expect("pending selection is present");
+                if *completed >= self.config.selection_warmup_iterations {
+                    if let Some(latency) = elapsed_ns(now.duration_since(pending.started)) {
+                        self.selection_dispatch_to_busy_paint_samples_ns
+                            .push(latency);
+                    } else {
+                        failure = Some(
+                            "selection-dispatch-to-busy-paint latency exceeded the supported range"
+                                .to_owned(),
+                        );
+                    }
+                }
+                pending.busy_painted = true;
+                context.request_repaint();
+            }
+            Phase::Selection { completed, pending }
+                if pending.as_ref().is_some_and(|pending| {
+                    pending.busy_painted
+                        && pending.installed_count.is_some()
+                        && !frame.selection_pending
+                }) =>
+            {
+                let completed_selection = pending.take().expect("completed selection is present");
+                let expected = completed_selection
+                    .installed_count
+                    .expect("installed count is present");
+                if expected != self.library_books
+                    || frame.selected_books != expected
+                    || !frame.all_matching_selected
+                {
+                    failure = Some(format!(
+                        "selection painted {} books (all matching: {}); expected {}",
+                        frame.selected_books, frame.all_matching_selected, self.library_books,
+                    ));
+                }
+                *completed += 1;
+                self.clear_selection_requested = true;
+                selection_finished = *completed
+                    >= self.config.selection_warmup_iterations + self.config.selection_iterations;
+                context.request_repaint();
+            }
             Phase::Editor {
                 pending:
                     Some(PendingEditor {
@@ -541,7 +661,8 @@ impl DesktopBenchmark {
             | Phase::Idle { .. }
             | Phase::Sort { .. }
             | Phase::AssetActions { .. }
-            | Phase::Editor { .. } => {
+            | Phase::Editor { .. }
+            | Phase::Selection { .. } => {
                 context.request_repaint_after(MEMORY_SAMPLE_INTERVAL);
             }
             Phase::Scroll { started } if now.duration_since(*started) >= self.config.scroll => {
@@ -578,6 +699,8 @@ impl DesktopBenchmark {
                 begin_asset_actions = true;
             } else if self.config.editor_iterations > 0 {
                 begin_editor = true;
+            } else if self.config.selection_iterations > 0 {
+                begin_selection = true;
             } else if self.config.scroll.is_zero() {
                 observed_scroll_duration = Some(Duration::ZERO);
                 finish = true;
@@ -602,6 +725,8 @@ impl DesktopBenchmark {
         } else if asset_actions_finished {
             if self.config.editor_iterations > 0 {
                 begin_editor = true;
+            } else if self.config.selection_iterations > 0 {
+                begin_selection = true;
             } else if self.config.scroll.is_zero() {
                 observed_scroll_duration = Some(Duration::ZERO);
                 finish = true;
@@ -624,6 +749,30 @@ impl DesktopBenchmark {
             };
             context.request_repaint();
         } else if editor_finished {
+            if self.config.selection_iterations > 0 {
+                begin_selection = true;
+            } else if self.config.scroll.is_zero() {
+                observed_scroll_duration = Some(Duration::ZERO);
+                finish = true;
+            } else {
+                begin_scroll = true;
+            }
+        }
+
+        if begin_selection {
+            if self.idle_end_rss_bytes.is_none() {
+                self.idle_end_rss_bytes = current_rss_bytes();
+                if let Some(memory) = &self.memory {
+                    memory.record_sample(IDLE_PHASE, self.idle_end_rss_bytes);
+                    memory.set_phase(SORT_PHASE);
+                }
+            }
+            self.phase = Phase::Selection {
+                completed: 0,
+                pending: None,
+            };
+            context.request_repaint();
+        } else if selection_finished {
             if self.config.scroll.is_zero() {
                 observed_scroll_duration = Some(Duration::ZERO);
                 finish = true;
@@ -671,7 +820,7 @@ impl DesktopBenchmark {
             .ok_or_else(|| "memory sampler was already consumed".to_owned())?
             .finish()?;
         let result = DesktopBenchmarkResult {
-            schema_version: 4,
+            schema_version: 5,
             kind: "desktop",
             status: if failure.is_some() {
                 "failed"
@@ -722,6 +871,12 @@ impl DesktopBenchmark {
                 self.editor_book_id,
                 &self.editor_open_to_paint_samples_ns,
             ),
+            selection_interactions: SelectionInteractionsResult::new(
+                self.config.selection_warmup_iterations,
+                self.config.selection_iterations,
+                self.library_books,
+                &self.selection_dispatch_to_busy_paint_samples_ns,
+            ),
             scrolling: ScrollingResult::new(
                 self.config,
                 self.observed_scroll_duration_ns,
@@ -749,6 +904,9 @@ impl DesktopBenchmark {
                 cached_covers: frame.cached_covers,
                 pending_covers: frame.pending_covers,
                 missing_covers: frame.missing_covers,
+                selection_pending: frame.selection_pending,
+                selected_books: frame.selected_books,
+                all_matching_selected: frame.all_matching_selected,
             },
         };
         write_json(&self.output_path, &result)
@@ -789,6 +947,29 @@ impl DesktopBenchmark {
                     "editor open p95 was {:.3} ms, above the {:.3} ms budget",
                     milliseconds(summary.p95_ns),
                     milliseconds(EDITOR_OPEN_TO_PAINT_P95_BUDGET_NS),
+                )
+            })
+        })
+        .or_else(|| {
+            if self.config.selection_iterations == 0 {
+                return None;
+            }
+            if self.selection_dispatch_to_busy_paint_samples_ns.len()
+                != self.config.selection_iterations
+            {
+                return Some(format!(
+                    "selection dispatch retained {} samples; expected {}",
+                    self.selection_dispatch_to_busy_paint_samples_ns.len(),
+                    self.config.selection_iterations,
+                ));
+            }
+            let summary = summarize_samples(&self.selection_dispatch_to_busy_paint_samples_ns)
+                .expect("non-empty selection interaction samples");
+            (summary.p95_ns > SELECTION_DISPATCH_TO_BUSY_PAINT_P95_BUDGET_NS).then(|| {
+                format!(
+                    "selection dispatch p95 was {:.3} ms, above the {:.3} ms budget",
+                    milliseconds(summary.p95_ns),
+                    milliseconds(SELECTION_DISPATCH_TO_BUSY_PAINT_P95_BUDGET_NS),
                 )
             })
         })
@@ -911,6 +1092,32 @@ impl<'a> EditorInteractionsResult<'a> {
     }
 }
 
+impl<'a> SelectionInteractionsResult<'a> {
+    fn new(
+        warmup_iterations: usize,
+        measured_iterations: usize,
+        matching_books: u64,
+        samples: &'a [u64],
+    ) -> Self {
+        let latency = summarize_samples(samples);
+        let passed = measured_iterations == 0
+            || (samples.len() == measured_iterations
+                && latency.as_ref().is_some_and(|summary| {
+                    summary.p95_ns <= SELECTION_DISPATCH_TO_BUSY_PAINT_P95_BUDGET_NS
+                }));
+        Self {
+            endpoint: "query-backed selection dispatch through the first fully rendered busy state",
+            warmup_iterations,
+            measured_iterations,
+            max_p95_ns: SELECTION_DISPATCH_TO_BUSY_PAINT_P95_BUDGET_NS,
+            matching_books,
+            latency,
+            samples_ns: samples,
+            passed,
+        }
+    }
+}
+
 fn sort_for_interaction(completed: usize) -> SortOrder {
     SORT_SCENARIOS[completed % SORT_SCENARIOS.len()]
 }
@@ -1001,6 +1208,7 @@ struct DesktopBenchmarkResult<'a> {
     sort_interactions: SortInteractionsResult<'a>,
     asset_actions: AssetActionsResult<'a>,
     editor_interactions: EditorInteractionsResult<'a>,
+    selection_interactions: SelectionInteractionsResult<'a>,
     scrolling: ScrollingResult<'a>,
     memory: MemoryResult,
     final_frame: FinalFrameResult,
@@ -1025,6 +1233,8 @@ struct ConfigurationResult {
     asset_action_iterations: usize,
     editor_warmup_iterations: usize,
     editor_iterations: usize,
+    selection_warmup_iterations: usize,
+    selection_iterations: usize,
 }
 
 impl From<BenchmarkConfig> for ConfigurationResult {
@@ -1039,6 +1249,8 @@ impl From<BenchmarkConfig> for ConfigurationResult {
             asset_action_iterations: config.asset_action_iterations,
             editor_warmup_iterations: config.editor_warmup_iterations,
             editor_iterations: config.editor_iterations,
+            selection_warmup_iterations: config.selection_warmup_iterations,
+            selection_iterations: config.selection_iterations,
         }
     }
 }
@@ -1109,6 +1321,18 @@ struct EditorInteractionsResult<'a> {
 }
 
 #[derive(Serialize)]
+struct SelectionInteractionsResult<'a> {
+    endpoint: &'static str,
+    warmup_iterations: usize,
+    measured_iterations: usize,
+    max_p95_ns: u64,
+    matching_books: u64,
+    latency: Option<SampleSummary>,
+    samples_ns: &'a [u64],
+    passed: bool,
+}
+
+#[derive(Serialize)]
 struct ScrollingResult<'a> {
     configured_duration_ns: Option<u64>,
     observed_duration_ns: Option<u64>,
@@ -1158,6 +1382,9 @@ struct FinalFrameResult {
     cached_covers: usize,
     pending_covers: usize,
     missing_covers: usize,
+    selection_pending: bool,
+    selected_books: u64,
+    all_matching_selected: bool,
 }
 
 struct MemorySamples {
@@ -1414,6 +1641,8 @@ mod tests {
             asset_action_iterations: 40,
             editor_warmup_iterations: 10,
             editor_iterations: 40,
+            selection_warmup_iterations: 10,
+            selection_iterations: 40,
         };
         let result = ScrollingResult::new(
             config,

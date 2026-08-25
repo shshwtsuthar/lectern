@@ -13,8 +13,8 @@ use lectern_core::{
     ImportProgress, ImportSummary, LibraryQuery, SortOrder,
     organisation::{
         BookEdit, ContributorFacet, ContributorId, ContributorRole, ContributorUsage, ExactFacets,
-        SearchExpression, SearchParseError, SeriesId, SeriesIndex, SeriesUsage, TagId, TagUsage,
-        VocabularyMutationResult, identity_key,
+        LibraryGeneration, SearchExpression, SearchParseError, SelectionSnapshot, SeriesId,
+        SeriesIndex, SeriesUsage, TagId, TagUsage, VocabularyMutationResult, identity_key,
     },
 };
 use lectern_desktop::export::{ExportError, ExportProgress, OverwritePolicy};
@@ -26,8 +26,8 @@ use crate::{
     platform::{NoopAssetPlatform, PlatformAction, PlatformWorker, SystemAssetPlatform},
     workers::{
         DecodedCover, ExportRequest, ImportRequest, QueryQueueResult, QueryRequest,
-        VocabularyEntityId, VocabularyKind, VocabularyMutation, VocabularyRequest, VocabularyRows,
-        WorkerEvent, WorkerSet,
+        SelectionRequest, VocabularyEntityId, VocabularyKind, VocabularyMutation,
+        VocabularyRequest, VocabularyRows, WorkerEvent, WorkerSet,
     },
 };
 
@@ -55,6 +55,126 @@ struct CachedCover {
 struct CachedPage {
     books: Vec<BookSummary>,
     last_used: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GridSelectionMode {
+    Explicit(HashSet<BookId>),
+    AllMatching {
+        query: LibraryQuery,
+        generation: LibraryGeneration,
+        matching_books: u64,
+        excluded: HashSet<BookId>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SelectionAnchor {
+    index: usize,
+    book_id: BookId,
+}
+
+#[derive(Default)]
+struct GridSelection {
+    mode: Option<GridSelectionMode>,
+    anchor: Option<SelectionAnchor>,
+}
+
+impl GridSelection {
+    fn is_active(&self) -> bool {
+        self.mode.is_some()
+    }
+
+    fn contains(&self, id: BookId) -> bool {
+        match &self.mode {
+            Some(GridSelectionMode::Explicit(books)) => books.contains(&id),
+            Some(GridSelectionMode::AllMatching { excluded, .. }) => !excluded.contains(&id),
+            None => false,
+        }
+    }
+
+    fn selected_count(&self) -> u64 {
+        match &self.mode {
+            Some(GridSelectionMode::Explicit(books)) => {
+                u64::try_from(books.len()).unwrap_or(u64::MAX)
+            }
+            Some(GridSelectionMode::AllMatching {
+                matching_books,
+                excluded,
+                ..
+            }) => matching_books.saturating_sub(u64::try_from(excluded.len()).unwrap_or(u64::MAX)),
+            None => 0,
+        }
+    }
+
+    fn is_every_matching(&self) -> bool {
+        matches!(
+            &self.mode,
+            Some(GridSelectionMode::AllMatching { excluded, .. }) if excluded.is_empty()
+        )
+    }
+
+    fn matching_count(&self) -> Option<u64> {
+        match &self.mode {
+            Some(GridSelectionMode::AllMatching { matching_books, .. }) => Some(*matching_books),
+            Some(GridSelectionMode::Explicit(_)) | None => None,
+        }
+    }
+
+    fn toggle(&mut self, id: BookId, index: usize) {
+        match self
+            .mode
+            .get_or_insert_with(|| GridSelectionMode::Explicit(HashSet::with_capacity(1)))
+        {
+            GridSelectionMode::Explicit(books) => {
+                if !books.insert(id) {
+                    books.remove(&id);
+                }
+            }
+            GridSelectionMode::AllMatching { excluded, .. } => {
+                if !excluded.insert(id) {
+                    excluded.remove(&id);
+                }
+            }
+        }
+        self.anchor = Some(SelectionAnchor { index, book_id: id });
+        if self.selected_count() == 0 {
+            self.clear();
+        }
+    }
+
+    fn install_range(&mut self, books: Vec<BookId>) {
+        let books = books.into_iter().collect::<HashSet<_>>();
+        if books.is_empty() {
+            self.clear();
+        } else {
+            self.mode = Some(GridSelectionMode::Explicit(books));
+        }
+    }
+
+    fn install_all_matching(&mut self, query: LibraryQuery, snapshot: SelectionSnapshot) {
+        if snapshot.matching_books == 0 {
+            self.clear();
+            return;
+        }
+        self.mode = Some(GridSelectionMode::AllMatching {
+            query,
+            generation: snapshot.generation,
+            matching_books: snapshot.matching_books,
+            excluded: HashSet::new(),
+        });
+        self.anchor = None;
+    }
+
+    fn clear(&mut self) {
+        self.mode = None;
+        self.anchor = None;
+    }
+}
+
+enum PendingSelection {
+    Range,
+    AllMatching { query: LibraryQuery },
 }
 
 #[derive(Default)]
@@ -491,6 +611,10 @@ pub(crate) struct LecternApp {
     pages: HashMap<usize, CachedPage>,
     pending_pages: HashSet<usize>,
     selected: Option<BookId>,
+    grid_selection: GridSelection,
+    selection_generation: u64,
+    selection_pending: Option<PendingSelection>,
+    grid_focus_id: Option<egui::Id>,
     pending_covers: HashSet<BookId>,
     missing_covers: HashSet<BookId>,
     covers: HashMap<BookId, CachedCover>,
@@ -541,6 +665,10 @@ impl LecternApp {
             pages: HashMap::new(),
             pending_pages: HashSet::new(),
             selected: None,
+            grid_selection: GridSelection::default(),
+            selection_generation: 0,
+            selection_pending: None,
+            grid_focus_id: None,
             pending_covers: HashSet::new(),
             missing_covers: HashSet::new(),
             covers: HashMap::new(),
@@ -564,6 +692,7 @@ impl LecternApp {
     }
 
     fn refresh_library(&mut self) {
+        self.clear_grid_selection();
         self.query_generation = self.query_generation.wrapping_add(1);
         self.query_pending = false;
         self.library_total = None;
@@ -619,6 +748,16 @@ impl LecternApp {
                     if generation == self.query_generation =>
                 {
                     self.query_discarded(offset);
+                }
+                WorkerEvent::SelectionSnapshotFinished { generation, result }
+                    if generation == self.selection_generation =>
+                {
+                    self.selection_snapshot_finished(result);
+                }
+                WorkerEvent::SelectionRangeFinished { generation, result }
+                    if generation == self.selection_generation =>
+                {
+                    self.selection_range_finished(result);
                 }
                 WorkerEvent::CoverFinished { id, result } => {
                     self.pending_covers.remove(&id);
@@ -778,6 +917,8 @@ impl LecternApp {
                 } => self.export_finished(asset_id, source, destination, result),
                 WorkerEvent::QueryFinished { .. }
                 | WorkerEvent::QueryDiscarded { .. }
+                | WorkerEvent::SelectionSnapshotFinished { .. }
+                | WorkerEvent::SelectionRangeFinished { .. }
                 | WorkerEvent::BookLoaded { .. } => {}
                 WorkerEvent::Error(error) => self.status = format!("Background worker: {error}"),
             }
@@ -982,11 +1123,150 @@ impl LecternApp {
         }
     }
 
+    fn apply_benchmark_selection_request(&mut self) {
+        let clear = self
+            .benchmark
+            .as_mut()
+            .is_some_and(DesktopBenchmark::take_selection_clear_request);
+        if clear {
+            self.clear_grid_selection();
+        }
+        let select_all = self
+            .benchmark
+            .as_mut()
+            .is_some_and(DesktopBenchmark::next_selection_request);
+        if select_all {
+            self.select_all_matching();
+            if self.selection_pending.is_none()
+                && let Some(benchmark) = &mut self.benchmark
+            {
+                benchmark.selection_dispatch_failed();
+            }
+        }
+    }
+
+    fn selection_shortcuts(&mut self, context: &egui::Context) {
+        if (self.grid_selection.is_active() || self.selection_pending.is_some())
+            && context
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.clear_grid_selection();
+            "Selection cleared".clone_into(&mut self.status);
+            return;
+        }
+        let grid_focused = self
+            .grid_focus_id
+            .is_some_and(|id| context.memory(|memory| memory.focused() == Some(id)));
+        if grid_focused
+            && context.input_mut(|input| {
+                input.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::COMMAND,
+                    egui::Key::A,
+                ))
+            })
+        {
+            self.select_all_matching();
+        }
+    }
+
     fn query_discarded(&mut self, offset: u64) {
         if let Ok(offset) = usize::try_from(offset) {
             self.pending_pages.remove(&offset);
         }
         self.query_pending = self.library_total.is_none() || self.pending_pages.contains(&0);
+    }
+
+    fn clear_grid_selection(&mut self) {
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.selection_pending = None;
+        self.grid_selection.clear();
+        self.grid_focus_id = None;
+    }
+
+    fn toggle_grid_book(&mut self, id: BookId, index: usize) {
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.selection_pending = None;
+        self.grid_selection.toggle(id, index);
+        self.status = if self.grid_selection.is_active() {
+            format!("{} selected", self.grid_selection.selected_count())
+        } else {
+            "Selection cleared".to_owned()
+        };
+    }
+
+    fn select_range_to(&mut self, id: BookId, index: usize) {
+        let Some(anchor) = self.grid_selection.anchor else {
+            self.toggle_grid_book(id, index);
+            return;
+        };
+        let offset = anchor.index.min(index);
+        let length = anchor.index.max(index).saturating_sub(offset) + 1;
+        let (Ok(offset), Ok(limit)) = (u64::try_from(offset), u32::try_from(length)) else {
+            "Selection range exceeds this platform's supported size".clone_into(&mut self.status);
+            return;
+        };
+        let generation = self.selection_generation.wrapping_add(1);
+        let request = SelectionRequest::Range {
+            generation,
+            query: self.query.clone(),
+            offset,
+            limit,
+        };
+        if self.workers.resolve_selection(request) {
+            self.selection_generation = generation;
+            self.selection_pending = Some(PendingSelection::Range);
+            self.status = format!("Selecting {length} books…");
+        } else {
+            "Selection worker is busy; try the range again".clone_into(&mut self.status);
+        }
+    }
+
+    fn select_all_matching(&mut self) {
+        if self.library_total == Some(0) || self.selection_pending.is_some() {
+            return;
+        }
+        let generation = self.selection_generation.wrapping_add(1);
+        let query = self.query.clone();
+        let request = SelectionRequest::Snapshot {
+            generation,
+            query: query.clone(),
+        };
+        if self.workers.resolve_selection(request) {
+            self.selection_generation = generation;
+            self.selection_pending = Some(PendingSelection::AllMatching { query });
+            "Selecting all matching books…".clone_into(&mut self.status);
+        } else {
+            "Selection worker is busy; try again".clone_into(&mut self.status);
+        }
+    }
+
+    fn selection_snapshot_finished(&mut self, result: Result<SelectionSnapshot, String>) {
+        let Some(PendingSelection::AllMatching { query }) = self.selection_pending.take() else {
+            return;
+        };
+        match result {
+            Ok(snapshot) => {
+                self.grid_selection.install_all_matching(query, snapshot);
+                self.status = format!("All {} matching selected", snapshot.matching_books);
+                if let Some(benchmark) = &mut self.benchmark {
+                    benchmark.selection_installed(snapshot.matching_books);
+                }
+            }
+            Err(error) => self.status = format!("Could not select matching books: {error}"),
+        }
+    }
+
+    fn selection_range_finished(&mut self, result: Result<Vec<BookId>, String>) {
+        if !matches!(self.selection_pending.take(), Some(PendingSelection::Range)) {
+            return;
+        }
+        match result {
+            Ok(books) => {
+                self.grid_selection.install_range(books);
+                self.status = format!("{} selected", self.grid_selection.selected_count());
+            }
+            Err(error) => self.status = format!("Could not select range: {error}"),
+        }
     }
 
     fn book_saved(&mut self, id: BookId, result: Result<Book, String>) {
@@ -2303,6 +2583,7 @@ impl LecternApp {
     }
 
     fn select_book(&mut self, id: BookId) {
+        self.clear_grid_selection();
         self.book_removal.confirmation = None;
         self.asset_maintenance.detach_confirmation = None;
         self.asset_maintenance.replace_confirmation = None;
@@ -3286,6 +3567,9 @@ impl LecternApp {
             return;
         }
 
+        self.selection_bar(ui);
+        ui.add_space(10.0);
+
         let columns = column_count(ui.available_width());
         let row_count = book_count.div_ceil(columns);
         let mut scroll_area = egui::ScrollArea::vertical()
@@ -3316,7 +3600,7 @@ impl LecternApp {
                             egui::Layout::top_down(Align::Center),
                             |ui| {
                                 if let Some(book) = self.book_at(index) {
-                                    self.book_card(ui, &book);
+                                    self.book_card(ui, &book, index);
                                 } else {
                                     Self::loading_book_card(ui);
                                 }
@@ -3328,8 +3612,62 @@ impl LecternApp {
         });
     }
 
-    fn book_card(&mut self, ui: &mut egui::Ui, book: &BookSummary) {
-        let selected = self.selected == Some(book.id);
+    fn selection_bar(&mut self, ui: &mut egui::Ui) {
+        let active = self.grid_selection.is_active();
+        let pending = self.selection_pending.is_some();
+        let label = if pending {
+            "Resolving selection…".to_owned()
+        } else if self.grid_selection.is_every_matching() {
+            format!(
+                "All {} matching selected",
+                self.grid_selection.selected_count()
+            )
+        } else if let Some(matching) = self.grid_selection.matching_count() {
+            format!(
+                "{} selected from {matching} matching",
+                self.grid_selection.selected_count()
+            )
+        } else if active {
+            format!("{} selected", self.grid_selection.selected_count())
+        } else {
+            "Select books for bulk actions".to_owned()
+        };
+        let mut select_all = false;
+        let mut clear = false;
+        egui::Frame::new()
+            .fill(PANEL)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if pending {
+                        ui.spinner();
+                    }
+                    ui.label(RichText::new(label).strong());
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if active || pending {
+                            clear = ui.button("Clear selection").clicked();
+                        }
+                        if !self.grid_selection.is_every_matching() {
+                            select_all = ui
+                                .add_enabled(!pending, egui::Button::new("Select all matching"))
+                                .clicked();
+                        }
+                    });
+                });
+            });
+        if clear {
+            self.clear_grid_selection();
+            "Selection cleared".clone_into(&mut self.status);
+        } else if select_all {
+            self.select_all_matching();
+        }
+    }
+
+    fn book_card(&mut self, ui: &mut egui::Ui, book: &BookSummary, index: usize) {
+        let grid_selected = self.grid_selection.contains(book.id);
+        let selected = grid_selected || self.selected == Some(book.id);
         let fill = if selected { CARD_SELECTED } else { CARD };
         let frame = egui::Frame::new()
             .fill(fill)
@@ -3369,8 +3707,37 @@ impl LecternApp {
             .response
             .interact(Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
-        if response.clicked() {
-            self.select_book(book.id);
+        let mut checkbox_clicked = false;
+        let checkbox_response = self.grid_selection.is_active().then(|| {
+            let mut checked = grid_selected;
+            let checkbox_rect = egui::Rect::from_min_size(
+                response.rect.left_top() + egui::vec2(8.0, 8.0),
+                egui::vec2(24.0, 24.0),
+            );
+            ui.push_id(("grid-selection", book.id.value()), |ui| {
+                ui.put(checkbox_rect, egui::Checkbox::without_text(&mut checked))
+            })
+            .inner
+        });
+        if let Some(checkbox) = &checkbox_response
+            && checkbox.clicked()
+        {
+            checkbox.request_focus();
+            self.grid_focus_id = Some(checkbox.id);
+            checkbox_clicked = true;
+            self.toggle_grid_book(book.id, index);
+        }
+        if response.clicked() && !checkbox_clicked {
+            response.request_focus();
+            self.grid_focus_id = Some(response.id);
+            let modifiers = ui.input(|input| input.modifiers);
+            if modifiers.shift {
+                self.select_range_to(book.id, index);
+            } else if modifiers.command || self.grid_selection.is_active() {
+                self.toggle_grid_book(book.id, index);
+            } else {
+                self.select_book(book.id);
+            }
         }
         if response.hovered() && !selected {
             ui.painter().rect_stroke(
@@ -3480,9 +3847,11 @@ impl eframe::App for LecternApp {
             benchmark.frame_started(frame.info().cpu_usage, unstable_dt);
         }
         self.poll_workers(ui.ctx());
+        self.selection_shortcuts(ui.ctx());
         self.apply_benchmark_sort_request();
         self.apply_benchmark_asset_action_request();
         self.apply_benchmark_editor_request();
+        self.apply_benchmark_selection_request();
         self.accept_dropped_files(ui);
         let files_hovering = ui.input(|input| !input.raw.hovered_files.is_empty());
 
@@ -3544,6 +3913,9 @@ impl eframe::App for LecternApp {
                     cached_covers: self.covers.len(),
                     pending_covers: self.pending_covers.len(),
                     missing_covers: self.missing_covers.len(),
+                    selection_pending: self.selection_pending.is_some(),
+                    selected_books: self.grid_selection.selected_count(),
+                    all_matching_selected: self.grid_selection.is_every_matching(),
                 },
             );
         }
@@ -4534,6 +4906,7 @@ mod tests {
 
     use eframe::egui;
     use lectern_core::ImportProgress;
+    use lectern_core::organisation::{LibraryGeneration, SelectionSnapshot};
     use lectern_core::{
         AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId,
         LibraryQuery,
@@ -4541,9 +4914,9 @@ mod tests {
     use lectern_desktop::export::ExportProgress;
 
     use super::{
-        BookEditor, CARD_GAP, CARD_WIDTH, COVER_SIZE, QUERY_PAGE_SIZE, apply_search_input,
-        asset_health_status, column_count, cover_image, export_fraction, format_export_progress,
-        import_status, query_page_offset, removal_file_message,
+        BookEditor, CARD_GAP, CARD_WIDTH, COVER_SIZE, GridSelection, QUERY_PAGE_SIZE,
+        apply_search_input, asset_health_status, column_count, cover_image, export_fraction,
+        format_export_progress, import_status, query_page_offset, removal_file_message,
     };
 
     #[test]
@@ -4564,6 +4937,54 @@ mod tests {
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE - 1), 0);
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE), QUERY_PAGE_SIZE);
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE + 17), QUERY_PAGE_SIZE);
+    }
+
+    #[test]
+    fn explicit_grid_selection_toggles_stable_ids_and_tracks_the_anchor() {
+        let mut selection = GridSelection::default();
+        selection.toggle(BookId::new(7), 130);
+        selection.toggle(BookId::new(9), 131);
+
+        assert_eq!(selection.selected_count(), 2);
+        assert!(selection.contains(BookId::new(7)));
+        assert_eq!(selection.anchor.expect("selection anchor").index, 131);
+
+        selection.toggle(BookId::new(7), 130);
+        assert_eq!(selection.selected_count(), 1);
+        assert!(!selection.contains(BookId::new(7)));
+    }
+
+    #[test]
+    fn range_selection_installs_only_resolved_ids() {
+        let mut selection = GridSelection::default();
+        selection.toggle(BookId::new(1), 127);
+        selection.install_range(vec![BookId::new(1), BookId::new(2), BookId::new(3)]);
+
+        assert_eq!(selection.selected_count(), 3);
+        assert!(selection.contains(BookId::new(2)));
+        assert_eq!(selection.anchor.expect("selection anchor").index, 127);
+    }
+
+    #[test]
+    fn all_matching_selection_uses_exclusions_without_materializing_matches() {
+        let mut selection = GridSelection::default();
+        selection.install_all_matching(
+            LibraryQuery::default(),
+            SelectionSnapshot {
+                matching_books: 10_000,
+                generation: LibraryGeneration {
+                    connection_changes: 4,
+                    data_version: 9,
+                },
+            },
+        );
+
+        assert!(selection.is_every_matching());
+        assert_eq!(selection.selected_count(), 10_000);
+        selection.toggle(BookId::new(17), 17);
+        assert_eq!(selection.selected_count(), 9_999);
+        assert!(!selection.contains(BookId::new(17)));
+        assert!(!selection.is_every_matching());
     }
 
     #[test]

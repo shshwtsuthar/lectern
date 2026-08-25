@@ -629,6 +629,20 @@ pub trait LibraryService {
         limit: u32,
     ) -> Result<Vec<BookSummary>, Self::Error>;
 
+    /// Captures the exact matching count and invalidation token for a query-backed selection.
+    fn selection_snapshot(
+        &mut self,
+        query: &LibraryQuery,
+    ) -> Result<organisation::SelectionSnapshot, Self::Error>;
+
+    /// Returns only stable book identities for one ordered projection range.
+    fn query_library_ids_window(
+        &mut self,
+        query: &LibraryQuery,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<BookId>, Self::Error>;
+
     /// Loads complete metadata and assets for one book.
     fn get_book(&mut self, id: BookId) -> Result<Option<Book>, Self::Error>;
 

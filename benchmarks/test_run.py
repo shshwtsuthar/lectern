@@ -100,6 +100,8 @@ class RunnerTests(unittest.TestCase):
             asset_action_iterations=30,
             editor_warmup_iterations=10,
             editor_iterations=20,
+            selection_warmup_iterations=5,
+            selection_iterations=15,
             timeout_seconds=20.0,
         )
 
@@ -118,6 +120,10 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(
             calls[0][1]["environment"]["LECTERN_BENCHMARK_EDITOR_ITERATIONS"],
             "20",
+        )
+        self.assertEqual(
+            calls[0][1]["environment"]["LECTERN_BENCHMARK_SELECTION_ITERATIONS"],
+            "15",
         )
 
     def test_integrity_validators_accept_reconciled_counts(self) -> None:
@@ -167,9 +173,18 @@ class RunnerTests(unittest.TestCase):
                     "samples_ns": [12_000_000, 13_000_000],
                     "passed": True,
                 },
+                "selection_interactions": {
+                    "warmup_iterations": 1,
+                    "measured_iterations": 2,
+                    "matching_books": 50_000,
+                    "samples_ns": [7_000_000, 8_000_000],
+                    "passed": True,
+                },
             },
             50_000,
             2,
+            2,
+            1,
             2,
             1,
             2,
