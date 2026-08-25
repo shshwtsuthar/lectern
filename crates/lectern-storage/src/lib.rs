@@ -1342,6 +1342,21 @@ impl LibraryDatabase {
         organisation::list_saved_searches(&self.connection)
     }
 
+    /// Returns at most one hundred durable saved projections in normalized-name order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prefix is invalid, stored canonical state is corrupt, or the
+    /// bounded indexed query cannot be executed.
+    pub fn search_saved_searches(
+        &self,
+        prefix: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<SavedSearch>> {
+        organisation::search_saved_searches(&self.connection, prefix, offset, limit)
+    }
+
     /// Creates one named canonical query/filter/sort projection.
     ///
     /// # Errors
@@ -5204,6 +5219,23 @@ END;
             [first_id, saved_id]
         );
         assert_eq!(saved[1].query, replacement);
+        assert_eq!(
+            database
+                .search_saved_searches("", 0, 1)
+                .unwrap()
+                .iter()
+                .map(|value| value.id)
+                .collect::<Vec<_>>(),
+            [first_id]
+        );
+        assert_eq!(
+            database.search_saved_searches("zet", 0, 100).unwrap(),
+            [saved[1].clone()]
+        );
+        assert!(matches!(
+            database.search_saved_searches("bad\nprefix", 0, 100),
+            Err(StorageError::InvalidCuration(_))
+        ));
 
         let before_collision = saved.clone();
         assert!(matches!(

@@ -100,6 +100,7 @@ def main(arguments: list[str]) -> int:
             "organisation-query": "organisation-queries.json",
             "organisation-vocabulary": "organisation-vocabulary.json",
             "bulk-tags": "organisation-bulk-tags.json",
+            "saved-searches": "organisation-saved-searches.json",
             "maintenance": "maintenance.json",
         }
         query_output = output / result_names[mode]
@@ -107,7 +108,12 @@ def main(arguments: list[str]) -> int:
         seed = read_json(seed_output)
         if mode == "organisation-migration":
             validate_migration_seed_result(seed, workload)
-        elif mode in ("organisation-query", "organisation-vocabulary", "bulk-tags"):
+        elif mode in (
+            "organisation-query",
+            "organisation-vocabulary",
+            "bulk-tags",
+            "saved-searches",
+        ):
             validate_organisation_query_seed_result(seed, workload)
         else:
             validate_seed_result(seed, workload["books"])
@@ -144,6 +150,8 @@ def main(arguments: list[str]) -> int:
             )
             desktop_result = read_json(desktop_output)
             decisions += evaluate_bulk_tag_desktop_result(desktop_result, budget)
+        elif mode == "saved-searches":
+            decisions = evaluate_saved_search_result(query_result, budget)
         elif mode == "maintenance":
             decisions = evaluate_maintenance_result(query_result, budget)
         else:
@@ -186,7 +194,12 @@ def seed_command(
     command = ["cargo", "run", "--release", "--locked", "-p", "lectern-benchmark"]
     if mode == "organisation-migration":
         command += ["--bin", "organisation-benchmark", "--", "seed-migration"]
-    elif mode in ("organisation-query", "organisation-vocabulary", "bulk-tags"):
+    elif mode in (
+        "organisation-query",
+        "organisation-vocabulary",
+        "bulk-tags",
+        "saved-searches",
+    ):
         command += ["--bin", "organisation-query-benchmark", "--", "seed"]
     else:
         command += ["--", "seed"]
@@ -219,6 +232,8 @@ def workload_command(
         command += ["--bin", "organisation-vocabulary-benchmark", "--"]
     elif mode == "bulk-tags":
         command += ["--bin", "organisation-bulk-benchmark", "--"]
+    elif mode == "saved-searches":
+        command += ["--bin", "organisation-saved-search-benchmark", "--"]
     else:
         command += [
             "--",
@@ -235,7 +250,7 @@ def workload_command(
                 "maintenance": "maintenance",
             }[mode],
         ]
-    if mode == "bulk-tags":
+    if mode in ("bulk-tags", "saved-searches"):
         return command + [
             "--database",
             str(database),
@@ -312,13 +327,14 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "organisation-query",
         "organisation-vocabulary",
         "bulk-tags",
+        "saved-searches",
         "maintenance",
     ):
         raise RegressionError(
             "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
             "'remove', 'detach', 'attach', 'replace', 'export', 'reimport', "
             "'organisation-migration', 'organisation-query', "
-            "'organisation-vocabulary', 'bulk-tags', or 'maintenance'"
+            "'organisation-vocabulary', 'bulk-tags', 'saved-searches', or 'maintenance'"
         )
     if query_mode == "full":
         scenario_names = workload.get("full_library_scenarios")
@@ -420,6 +436,20 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 raise RegressionError(
                     "bulk-tag compositor warmup and measured operations must total an even number"
                 )
+        if query_mode == "saved-searches":
+            for field in (
+                "contributors",
+                "series",
+                "tags",
+                "tags_per_book",
+                "saved_searches",
+                "manager_page_size",
+                "query_page_size",
+            ):
+                if positive_or_zero_field(workload, field, "budget.workload") == 0:
+                    raise RegressionError(
+                        f"saved-search workload {field} must be greater than zero"
+                    )
         scenario_names = workload.get("scenarios")
         if not isinstance(scenario_names, list) or not all(
             isinstance(name, str) and name for name in scenario_names
@@ -1302,6 +1332,73 @@ def evaluate_organisation_vocabulary_result(
         }
         decision["passed"] = bool(decision["passed"] and peak_rss <= maximum_rss)
     return decisions
+
+
+def evaluate_saved_search_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "saved-search result"
+    if result.get("kind") != "organisation-saved-searches":
+        raise RegressionError("saved-search result kind is invalid")
+    expected_fields = {
+        "library_books": workload["books"],
+        "saved_searches": workload["saved_searches"],
+        "warmup_iterations": workload["warmup_iterations"],
+        "measured_iterations": workload["measured_iterations"],
+        "manager_page_size": workload["manager_page_size"],
+        "query_page_size": workload["query_page_size"],
+    }
+    for field, expected in expected_fields.items():
+        if positive_or_zero_field(result, field, context) != expected:
+            raise RegressionError(f"saved-search {field} does not match the budget")
+    checks = result.get("verified_checks")
+    if not isinstance(checks, list) or set(checks) != set(workload["correctness"]):
+        raise RegressionError("saved-search correctness checks did not reconcile")
+
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError("saved-search result must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    operations = workload["warmup_iterations"] + workload["measured_iterations"]
+    expected_results = {
+        "bounded_saved_search_manager_page": workload["manager_page_size"],
+        "saved_search_apply_first_page": workload["query_page_size"],
+        "saved_search_management_cycle": 1,
+    }
+    for index, scenario in enumerate(scenarios):
+        scenario_context = f"saved-search scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{scenario_context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{scenario_context}.name must be unique and non-empty")
+        if name not in expected_results:
+            raise RegressionError(f"{scenario_context}.name is not versioned by the workload")
+        if positive_or_zero_field(
+            scenario, "successful_operations", scenario_context
+        ) != operations:
+            raise RegressionError(f"{scenario_context} operation count does not reconcile")
+        if positive_or_zero_field(
+            scenario, "observed_results", scenario_context
+        ) != expected_results[name]:
+            raise RegressionError(f"{scenario_context} result count does not reconcile")
+        samples = scenario.get("samples_ns")
+        if not isinstance(samples, list) or len(samples) != workload["measured_iterations"]:
+            raise RegressionError(f"{scenario_context} sample count does not match the budget")
+        if any(
+            isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+            for sample in samples
+        ):
+            raise RegressionError(f"{scenario_context}.samples_ns must contain positive integers")
+        latency = object_field(scenario, "latency_ms", scenario_context)
+        positive_number_field(latency, "p95", f"{scenario_context}.latency_ms")
+        by_name[name] = scenario
+
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("saved-search scenarios do not match the versioned budget")
+    return evaluate_latency_budgets(by_name, budget)
 
 
 def evaluate_bulk_tag_result(

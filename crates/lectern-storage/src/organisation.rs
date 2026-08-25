@@ -1924,6 +1924,119 @@ pub(super) fn list_saved_searches(connection: &Connection) -> Result<Vec<SavedSe
         .collect()
 }
 
+/// Loads one bounded durable-projection page in normalized-name order.
+pub(super) fn search_saved_searches(
+    connection: &Connection,
+    prefix: &str,
+    offset: u64,
+    limit: u32,
+) -> Result<Vec<SavedSearch>> {
+    let limit = i64::from(limit.min(100));
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let offset = i64::try_from(offset).map_err(|_| StorageError::InvalidPageOffset(offset))?;
+    let (lower, upper) = prefix_bounds(NameKind::SavedSearch, prefix)?;
+    let base_rows = {
+        let mut statement = connection.prepare_cached(
+            "SELECT id, name, shape_version, search_expression, series_id, format, \
+                    file_health, sort_order \
+             FROM saved_searches \
+             WHERE identity_key >= ?1 AND identity_key < ?2 \
+             ORDER BY identity_key, id LIMIT ?3 OFFSET ?4",
+        )?;
+        let rows = statement.query_map(params![lower, upper, limit, offset], saved_search_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let ids = base_rows.iter().map(|row| row.id.value()).collect::<Vec<_>>();
+    let mut contributors = load_saved_contributor_facets_for(connection, &ids)?;
+    let mut included_tags =
+        load_saved_tag_facets_for(connection, "saved_search_included_tags", &ids)?;
+    let mut excluded_tags =
+        load_saved_tag_facets_for(connection, "saved_search_excluded_tags", &ids)?;
+    base_rows
+        .into_iter()
+        .map(|row| {
+            let id = row.id.value();
+            load_saved_search(
+                row,
+                contributors.remove(&id).unwrap_or_default(),
+                included_tags.remove(&id).unwrap_or_default(),
+                excluded_tags.remove(&id).unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+fn saved_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedSearchRow> {
+    Ok(SavedSearchRow {
+        id: SavedSearchId::new(row.get(0)?),
+        name: row.get(1)?,
+        shape_version: row.get(2)?,
+        search: row.get(3)?,
+        series: row.get(4)?,
+        format: row.get(5)?,
+        health: row.get(6)?,
+        sort: row.get(7)?,
+    })
+}
+
+fn load_saved_contributor_facets_for(
+    connection: &Connection,
+    ids: &[i64],
+) -> Result<HashMap<i64, Vec<lectern_core::organisation::ContributorFacet>>> {
+    let mut facets = HashMap::<i64, Vec<_>>::new();
+    if ids.is_empty() {
+        return Ok(facets);
+    }
+    let placeholders = vec!["?"; ids.len()].join(", ");
+    let sql = format!(
+        "SELECT saved_search_id, contributor_id, author_only \
+         FROM saved_search_contributors WHERE saved_search_id IN ({placeholders}) \
+         ORDER BY saved_search_id, contributor_id"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            lectern_core::organisation::ContributorFacet {
+                contributor: ContributorId::new(row.get(1)?),
+                author_only: row.get(2)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (saved_search, facet) = row?;
+        facets.entry(saved_search).or_default().push(facet);
+    }
+    Ok(facets)
+}
+
+fn load_saved_tag_facets_for(
+    connection: &Connection,
+    table: &'static str,
+    ids: &[i64],
+) -> Result<HashMap<i64, Vec<TagId>>> {
+    let mut facets = HashMap::<i64, Vec<_>>::new();
+    if ids.is_empty() {
+        return Ok(facets);
+    }
+    let placeholders = vec!["?"; ids.len()].join(", ");
+    let sql = format!(
+        "SELECT saved_search_id, tag_id FROM {table} \
+         WHERE saved_search_id IN ({placeholders}) ORDER BY saved_search_id, tag_id"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+        Ok((row.get::<_, i64>(0)?, TagId::new(row.get(1)?)))
+    })?;
+    for row in rows {
+        let (saved_search, tag) = row?;
+        facets.entry(saved_search).or_default().push(tag);
+    }
+    Ok(facets)
+}
+
 fn load_saved_contributor_facets(
     connection: &Connection,
 ) -> Result<HashMap<i64, Vec<lectern_core::organisation::ContributorFacet>>> {
