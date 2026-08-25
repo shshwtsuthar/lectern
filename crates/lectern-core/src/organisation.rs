@@ -288,6 +288,33 @@ pub struct ContributorCredit {
     pub position: u32,
 }
 
+/// One ordered contributor credit obtained directly from publication metadata.
+///
+/// Source adapters use this shape before stable library identities have been resolved. The
+/// storage boundary validates names, resolves identities, and writes every credit atomically.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportedContributorCredit {
+    /// Display-ready contributor name exactly as bounded and cleaned by the source adapter.
+    pub display_name: String,
+    /// Role declared by the source adapter.
+    pub role: ContributorRole,
+    /// Zero-based position within the declared role.
+    pub position: u32,
+}
+
+/// Normalized organisation metadata supplied by a publication adapter.
+///
+/// `Some` of this value is authoritative for a newly imported book, including an empty credit
+/// list. `None` retains compatibility with callers that only supply flattened author and series
+/// strings.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ImportedOrganisation {
+    /// Ordered source contributor credits.
+    pub contributors: Vec<ImportedContributorCredit>,
+    /// Optional exact source series position.
+    pub series_index: Option<SeriesIndex>,
+}
+
 /// One stable normalized series entity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Series {

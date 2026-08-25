@@ -1073,6 +1073,7 @@ fn removal_candidate(
             publisher: Some("Lectern Benchmark".into()),
             language: Some("en".into()),
             description: Some("Deterministic aggregate removed after every measurement.".into()),
+            imported_organisation: None,
         },
         assets: vec![
             BookAssetDraft {
@@ -1966,6 +1967,7 @@ fn replacement_candidate(round: usize, source: &Path, cover_thumbnail: Vec<u8>) 
             publisher: Some("Lectern Benchmark".into()),
             language: Some("en".into()),
             description: Some("Deterministic asset replaced after validation.".into()),
+            imported_organisation: None,
         },
         assets: vec![BookAssetDraft {
             format: BookFormat::Pdf,
@@ -2386,6 +2388,7 @@ fn prepare_reimport_candidates(
                     publisher: original.publisher.clone(),
                     language: original.language.clone(),
                     description: original.description.clone(),
+                    imported_organisation: None,
                 },
                 assets: original
                     .assets

@@ -1349,6 +1349,7 @@ struct MetadataInput<'a> {
     publisher: Option<&'a str>,
     language: Option<&'a str>,
     description: Option<&'a str>,
+    imported_organisation: Option<&'a lectern_core::organisation::ImportedOrganisation>,
 }
 
 impl<'a> From<&'a BookMetadataDraft> for MetadataInput<'a> {
@@ -1360,6 +1361,7 @@ impl<'a> From<&'a BookMetadataDraft> for MetadataInput<'a> {
             publisher: book.publisher.as_deref(),
             language: book.language.as_deref(),
             description: book.description.as_deref(),
+            imported_organisation: book.imported_organisation.as_ref(),
         }
     }
 }
@@ -1373,6 +1375,7 @@ impl<'a> From<&'a BookDraft> for MetadataInput<'a> {
             publisher: book.publisher.as_deref(),
             language: book.language.as_deref(),
             description: book.description.as_deref(),
+            imported_organisation: None,
         }
     }
 }
@@ -1490,11 +1493,12 @@ fn upsert_book<'a>(
     };
 
     if owner.is_none() {
-        organisation::replace_flattened_organisation(
+        organisation::replace_imported_organisation(
             transaction,
             id,
             metadata.authors,
             metadata.series,
+            metadata.imported_organisation,
         )?;
     }
 
@@ -1886,8 +1890,8 @@ mod tests {
         BookId, BookMetadataDraft, LibraryQuery, SortOrder,
         organisation::{
             BookEdit, ContributorCreditEdit, ContributorFacet, ContributorReference,
-            ContributorRole, ExactFacets, SeriesIndex, SeriesMembershipEdit, SeriesReference,
-            TagReference,
+            ContributorRole, ExactFacets, ImportedContributorCredit, ImportedOrganisation,
+            SeriesIndex, SeriesMembershipEdit, SeriesReference, TagReference,
         },
     };
     use rusqlite::Connection;
@@ -1972,6 +1976,7 @@ mod tests {
             publisher: None,
             language: Some("en".into()),
             description: None,
+            imported_organisation: None,
         }
     }
 
@@ -2655,6 +2660,68 @@ END;
     }
 
     #[test]
+    fn import_preserves_creator_boundaries_and_exact_series_index() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let mut imported = record(
+            "/books/earthsea.epub",
+            "The Books of Earthsea",
+            "Ursula K. Le Guin, Charles Vess",
+        );
+        imported.book.series = Some("Earthsea".into());
+        imported.book.imported_organisation = Some(ImportedOrganisation {
+            contributors: vec![
+                ImportedContributorCredit {
+                    display_name: "Ursula K. Le Guin".into(),
+                    role: ContributorRole::Author,
+                    position: 0,
+                },
+                ImportedContributorCredit {
+                    display_name: "Charles Vess".into(),
+                    role: ContributorRole::Author,
+                    position: 1,
+                },
+            ],
+            series_index: Some("1.25".parse::<SeriesIndex>().expect("series index")),
+        });
+
+        let id = database
+            .import_books(&[imported.clone()])
+            .expect("import book")[0];
+        let book = database.get_book(id).unwrap().unwrap();
+        assert_eq!(book.contributors.len(), 2);
+        assert_eq!(
+            book.contributors[0].contributor.display_name,
+            "Ursula K. Le Guin"
+        );
+        assert_eq!(
+            book.contributors[1].contributor.display_name,
+            "Charles Vess"
+        );
+        assert_eq!(book.authors, "Ursula K. Le Guin, Charles Vess");
+        assert_eq!(
+            book.series_membership
+                .as_ref()
+                .and_then(|membership| membership.index)
+                .map(|index| index.to_string()),
+            Some("1.25".into())
+        );
+
+        imported.book.imported_organisation = Some(ImportedOrganisation {
+            contributors: vec![ImportedContributorCredit {
+                display_name: "Replacement Creator".into(),
+                role: ContributorRole::Author,
+                position: 0,
+            }],
+            series_index: Some("9".parse::<SeriesIndex>().expect("series index")),
+        });
+        assert_eq!(
+            database.import_books(&[imported]).expect("re-import book")[0],
+            id
+        );
+        assert_eq!(database.get_book(id).unwrap().unwrap(), book);
+    }
+
+    #[test]
     fn reimport_by_known_path_preserves_user_metadata_assets_and_cover() {
         let mut database = LibraryDatabase::open_in_memory().expect("open library");
         let original_import = BookImport {
@@ -2692,6 +2759,7 @@ END;
             publisher: Some("Embedded Publisher".into()),
             language: Some("fr".into()),
             description: Some("Embedded file description.".into()),
+            imported_organisation: None,
         };
         reimport.assets.truncate(1);
         reimport.cover_thumbnail = None;

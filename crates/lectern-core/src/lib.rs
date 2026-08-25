@@ -376,6 +376,8 @@ pub struct BookMetadataDraft {
     pub language: Option<String>,
     /// Optional description or synopsis.
     pub description: Option<String>,
+    /// Publication-derived normalized organisation, when the adapter preserves source boundaries.
+    pub imported_organisation: Option<organisation::ImportedOrganisation>,
 }
 
 /// Metadata and location discovered from one publication file.

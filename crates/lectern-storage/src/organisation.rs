@@ -6,9 +6,10 @@ use lectern_core::{
     BookId,
     organisation::{
         BookEdit, Contributor, ContributorCredit, ContributorCreditEdit, ContributorId,
-        ContributorReference, ContributorRole, ContributorUsage, NameKind, Series, SeriesId,
-        SeriesIndex, SeriesMembership, SeriesMembershipEdit, SeriesReference, SeriesUsage, Tag,
-        TagId, TagReference, TagUsage, identity_key, normalize_name,
+        ContributorReference, ContributorRole, ContributorUsage, ImportedContributorCredit,
+        ImportedOrganisation, NameKind, Series, SeriesId, SeriesIndex, SeriesMembership,
+        SeriesMembershipEdit, SeriesReference, SeriesUsage, Tag, TagId, TagReference, TagUsage,
+        identity_key, normalize_name,
     },
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -364,6 +365,124 @@ pub(super) fn replace_flattened_organisation(
     }
 
     rebuild_book_projection(transaction, book_id)
+}
+
+/// Reconciles publication-derived organization for a newly imported or explicitly replaced book.
+///
+/// Adapters that preserve creator boundaries supply normalized source credits. Compatibility
+/// callers retain the conservative complete-string behavior.
+pub(super) fn replace_imported_organisation(
+    transaction: &Transaction<'_>,
+    book_id: i64,
+    authors: &str,
+    series: Option<&str>,
+    imported: Option<&ImportedOrganisation>,
+) -> Result<()> {
+    let Some(imported) = imported else {
+        return replace_flattened_organisation(transaction, book_id, authors, series);
+    };
+    validate_imported_credit_positions(&imported.contributors)?;
+
+    transaction.execute(
+        "DELETE FROM book_contributors WHERE book_id = ?1",
+        [book_id],
+    )?;
+    let mut unique_credits = HashSet::with_capacity(imported.contributors.len());
+    let mut insert_credit = transaction.prepare(
+        "INSERT INTO book_contributors( \
+             book_id, contributor_id, role, position, \
+             display_name_projection, sort_key_projection \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for credit in &imported.contributors {
+        let incoming_display = normalize_user_name(NameKind::Contributor, &credit.display_name)?;
+        let incoming_key = identity_key(&incoming_display);
+        let (contributor_id, display_name, sort_key) = transaction.query_row(
+            "INSERT INTO contributors(display_name, sort_name, identity_key, sort_key) \
+             VALUES (?1, ?1, ?2, ?2) \
+             ON CONFLICT(identity_key) DO UPDATE SET identity_key = excluded.identity_key \
+             RETURNING id, display_name, sort_key",
+            params![incoming_display, incoming_key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        if !unique_credits.insert((contributor_id, credit.role)) {
+            return Err(StorageError::InvalidCuration(format!(
+                "contributor {contributor_id} appears more than once as {}",
+                credit.role
+            )));
+        }
+        insert_credit.execute(params![
+            book_id,
+            contributor_id,
+            credit.role.as_str(),
+            credit.position,
+            display_name,
+            sort_key,
+        ])?;
+    }
+    drop(insert_credit);
+
+    transaction.execute(
+        "DELETE FROM series_memberships WHERE book_id = ?1",
+        [book_id],
+    )?;
+    if let Some(series) = series
+        && !series.trim().is_empty()
+    {
+        let incoming_name = normalize_user_name(NameKind::Series, series)?;
+        let incoming_key = identity_key(&incoming_name);
+        let (series_id, name, key) = transaction.query_row(
+            "INSERT INTO series_entities(name, identity_key) VALUES (?1, ?2) \
+             ON CONFLICT(identity_key) DO UPDATE SET identity_key = excluded.identity_key \
+             RETURNING id, name, identity_key",
+            params![incoming_name, incoming_key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        let series_index = imported
+            .series_index
+            .map(|index| i64::try_from(index.scaled()).expect("valid series index fits in SQLite"));
+        transaction.execute(
+            "INSERT INTO series_memberships( \
+                 book_id, series_id, series_index, name_projection, key_projection \
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![book_id, series_id, series_index, name, key],
+        )?;
+    }
+
+    rebuild_book_projection(transaction, book_id)
+}
+
+fn validate_imported_credit_positions(credits: &[ImportedContributorCredit]) -> Result<()> {
+    for role in ContributorRole::ALL {
+        let mut positions = credits
+            .iter()
+            .filter(|credit| credit.role == role)
+            .map(|credit| credit.position)
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
+        if positions
+            .iter()
+            .enumerate()
+            .any(|(expected, observed)| usize::try_from(*observed) != Ok(expected))
+        {
+            return Err(StorageError::InvalidCuration(format!(
+                "{role} imported credit positions must be contiguous from zero"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_user_name(kind: NameKind, value: &str) -> Result<String> {

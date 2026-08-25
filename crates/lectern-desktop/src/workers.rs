@@ -450,7 +450,7 @@ fn metadata_worker(
     events: &Sender<WorkerEvent>,
     context: &egui::Context,
 ) {
-    let database = match LibraryDatabase::open(database_path) {
+    let mut database = match LibraryDatabase::open(database_path) {
         Ok(database) => database,
         Err(error) => {
             publish(events, context, WorkerEvent::Error(error.to_string()));

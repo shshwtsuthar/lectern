@@ -11,7 +11,12 @@ use hayro::{
     vello_cpu::color::palette::css::WHITE,
 };
 use image::{ImageReader, Limits, codecs::jpeg::JpegEncoder};
-use lectern_core::{AssetStorage, BookAssetDraft, BookFormat, BookMetadataDraft};
+use lectern_core::{
+    AssetStorage, BookAssetDraft, BookFormat, BookMetadataDraft,
+    organisation::{
+        ContributorRole, ImportedContributorCredit, ImportedOrganisation, SeriesIndex, identity_key,
+    },
+};
 use lectern_storage::{BookImport, LibraryDatabase};
 use lopdf::Document;
 use percent_encoding::percent_decode_str;
@@ -291,6 +296,22 @@ pub fn parse_epub(path: impl AsRef<Path>) -> Result<BookImport> {
         .file_stem()
         .and_then(|name| name.to_str())
         .map_or_else(|| "Untitled".to_owned(), clean_text);
+    let series_index = metadata.series_index();
+    let imported_contributors = metadata
+        .creators
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(position, display_name)| {
+            Ok(ImportedContributorCredit {
+                display_name,
+                role: ContributorRole::Author,
+                position: u32::try_from(position).map_err(|_| {
+                    ImportError::InvalidPublication("too many EPUB creator elements")
+                })?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(BookImport {
         book: BookMetadataDraft {
@@ -300,6 +321,10 @@ pub fn parse_epub(path: impl AsRef<Path>) -> Result<BookImport> {
             publisher: metadata.publisher,
             language: metadata.language,
             description: metadata.description,
+            imported_organisation: Some(ImportedOrganisation {
+                contributors: imported_contributors,
+                series_index,
+            }),
         },
         assets: vec![BookAssetDraft {
             format: BookFormat::Epub,
@@ -351,6 +376,14 @@ pub fn parse_pdf(path: impl AsRef<Path>) -> Result<BookImport> {
     let authors = clean_optional(metadata.author).unwrap_or_default();
     let description = clean_optional(metadata.subject);
     let cover_thumbnail = render_pdf_cover(bytes);
+    let imported_contributors = (!authors.is_empty())
+        .then(|| ImportedContributorCredit {
+            display_name: authors.clone(),
+            role: ContributorRole::Author,
+            position: 0,
+        })
+        .into_iter()
+        .collect();
 
     Ok(BookImport {
         book: BookMetadataDraft {
@@ -360,6 +393,10 @@ pub fn parse_pdf(path: impl AsRef<Path>) -> Result<BookImport> {
             publisher: None,
             language: None,
             description,
+            imported_organisation: Some(ImportedOrganisation {
+                contributors: imported_contributors,
+                series_index: None,
+            }),
         },
         assets: vec![BookAssetDraft {
             format: BookFormat::Pdf,
@@ -392,6 +429,7 @@ enum TextField {
     Publisher,
     Description,
     Series,
+    SeriesIndex,
 }
 
 impl TextField {
@@ -402,7 +440,7 @@ impl TextField {
             Self::Language => b"language",
             Self::Publisher => b"publisher",
             Self::Description => b"description",
-            Self::Series => b"meta",
+            Self::Series | Self::SeriesIndex => b"meta",
         }
     }
 }
@@ -411,6 +449,7 @@ impl TextField {
 struct Capture {
     field: TextField,
     text: String,
+    reference: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -418,6 +457,9 @@ struct PackageMetadata {
     title: Option<String>,
     creators: Vec<String>,
     series: Option<String>,
+    series_reference: Option<String>,
+    legacy_series_index: Option<String>,
+    group_positions: Vec<(String, String)>,
     publisher: Option<String>,
     language: Option<String>,
     description: Option<String>,
@@ -426,7 +468,7 @@ struct PackageMetadata {
 }
 
 impl PackageMetadata {
-    fn accept(&mut self, field: TextField, value: &str) {
+    fn accept(&mut self, field: TextField, value: &str, reference: Option<String>) {
         let value = match field {
             TextField::Description => clean_description(value),
             _ => clean_text(value),
@@ -440,7 +482,12 @@ impl PackageMetadata {
                 self.title.get_or_insert(value);
             }
             TextField::Creator => {
-                if !self.creators.contains(&value) {
+                let key = identity_key(&value);
+                if !self
+                    .creators
+                    .iter()
+                    .any(|creator| identity_key(creator) == key)
+                {
                     self.creators.push(value);
                 }
             }
@@ -454,9 +501,34 @@ impl PackageMetadata {
                 self.description.get_or_insert(value);
             }
             TextField::Series => {
-                self.series.get_or_insert(value);
+                if self.series.is_none() {
+                    self.series = Some(value);
+                    self.series_reference = reference;
+                }
+            }
+            TextField::SeriesIndex => {
+                if let Some(reference) = reference {
+                    self.group_positions.push((reference, value));
+                }
             }
         }
+    }
+
+    fn series_index(&self) -> Option<SeriesIndex> {
+        self.series_reference
+            .as_deref()
+            .and_then(|series_reference| {
+                self.group_positions.iter().find_map(|(reference, value)| {
+                    (reference.trim_start_matches('#') == series_reference)
+                        .then(|| value.parse().ok())
+                        .flatten()
+                })
+            })
+            .or_else(|| {
+                self.legacy_series_index
+                    .as_deref()
+                    .and_then(|value| value.parse().ok())
+            })
     }
 
     fn cover_href(&self) -> Option<&str> {
@@ -566,7 +638,7 @@ fn parse_package(xml: &[u8]) -> Result<PackageMetadata> {
                     .is_some_and(|active| element.local_name().as_ref() == active.field.end_name());
                 if should_finish {
                     if let Some(active) = capture.take() {
-                        metadata.accept(active.field, &active.text);
+                        metadata.accept(active.field, &active.text, active.reference);
                     }
                 } else {
                     append_separator(&mut capture);
@@ -591,7 +663,7 @@ fn inspect_element(
         b"language" => Some(TextField::Language),
         b"publisher" => Some(TextField::Publisher),
         b"description" => Some(TextField::Description),
-        b"meta" => inspect_meta(element, metadata)?,
+        b"meta" => return inspect_meta(element, metadata),
         b"item" => {
             if let (Some(id), Some(href)) =
                 (attribute(element, b"id")?, attribute(element, b"href")?)
@@ -610,27 +682,38 @@ fn inspect_element(
     Ok(field.map(|field| Capture {
         field,
         text: String::new(),
+        reference: None,
     }))
 }
 
 fn inspect_meta(
     element: &BytesStart<'_>,
     metadata: &mut PackageMetadata,
-) -> Result<Option<TextField>> {
+) -> Result<Option<Capture>> {
     let name = attribute(element, b"name")?;
     let content = attribute(element, b"content")?;
     match name.as_deref() {
         Some("calibre:series") => {
             if let Some(value) = content {
-                metadata.accept(TextField::Series, &value);
+                metadata.accept(TextField::Series, &value, None);
             }
         }
+        Some("calibre:series_index") => metadata.legacy_series_index = content,
         Some("cover") => metadata.legacy_cover_id = content,
         _ => {}
     }
 
     let property = attribute(element, b"property")?;
-    Ok((property.as_deref() == Some("belongs-to-collection")).then_some(TextField::Series))
+    let (field, reference) = match property.as_deref() {
+        Some("belongs-to-collection") => (TextField::Series, attribute(element, b"id")?),
+        Some("group-position") => (TextField::SeriesIndex, attribute(element, b"refines")?),
+        _ => return Ok(None),
+    };
+    Ok(Some(Capture {
+        field,
+        text: String::new(),
+        reference,
+    }))
 }
 
 fn attribute(element: &BytesStart<'_>, name: &[u8]) -> Result<Option<String>> {
@@ -898,21 +981,23 @@ mod tests {
             .start_file("OEBPS/content.opf", compressed)
             .expect("start package");
         let package = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
+            r##"<?xml version="1.0" encoding="UTF-8"?>
             <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
               <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
                 <dc:title>{title} &amp; Dust</dc:title>
                 <dc:creator>Ursula K. Le Guin</dc:creator>
+                <dc:creator>Charles Vess</dc:creator>
                 <dc:language>en</dc:language>
                 <dc:publisher>Earthsea Press</dc:publisher>
                 <dc:description>&lt;p&gt;A wizard's journey.&lt;/p&gt;</dc:description>
-                <meta property="belongs-to-collection">Earthsea</meta>
+                <meta id="earthsea" property="belongs-to-collection">Earthsea</meta>
+                <meta refines="#earthsea" property="group-position">1.25</meta>
               </metadata>
               <manifest>
                 <item id="cover" href="images/cover%20art.jpg" media-type="image/jpeg"
                       properties="cover-image"/>
               </manifest>
-            </package>"#
+            </package>"##
         );
         writer.write_all(package.as_bytes()).expect("write package");
         writer
@@ -985,7 +1070,7 @@ mod tests {
         let record = parse_epub(&path).expect("parse EPUB");
 
         assert_eq!(record.book.title, "A Wizard & Dust");
-        assert_eq!(record.book.authors, "Ursula K. Le Guin");
+        assert_eq!(record.book.authors, "Ursula K. Le Guin, Charles Vess");
         assert_eq!(record.book.series.as_deref(), Some("Earthsea"));
         assert_eq!(record.book.publisher.as_deref(), Some("Earthsea Press"));
         assert_eq!(record.book.language.as_deref(), Some("en"));
@@ -994,6 +1079,19 @@ mod tests {
             Some("A wizard's journey.")
         );
         assert!(record.cover_thumbnail.is_some());
+        let imported = record
+            .book
+            .imported_organisation
+            .expect("EPUB supplies normalized source organization");
+        assert_eq!(imported.contributors.len(), 2);
+        assert_eq!(imported.contributors[0].display_name, "Ursula K. Le Guin");
+        assert_eq!(imported.contributors[0].position, 0);
+        assert_eq!(imported.contributors[1].display_name, "Charles Vess");
+        assert_eq!(imported.contributors[1].position, 1);
+        assert_eq!(
+            imported.series_index.map(|index| index.to_string()),
+            Some("1.25".into())
+        );
     }
 
     #[test]
@@ -1006,6 +1104,13 @@ mod tests {
 
         assert_eq!(record.book.title, "Field Guide");
         assert_eq!(record.book.authors, "Octavia E. Butler");
+        let imported = record
+            .book
+            .imported_organisation
+            .as_ref()
+            .expect("PDF supplies one source credit");
+        assert_eq!(imported.contributors.len(), 1);
+        assert_eq!(imported.contributors[0].display_name, "Octavia E. Butler");
         assert_eq!(
             record.book.description.as_deref(),
             Some("A field guide to many worlds.")
@@ -1016,6 +1121,20 @@ mod tests {
         let image = image::load_from_memory(&cover).expect("decode rendered cover");
         assert!(image.width() <= super::THUMBNAIL_WIDTH);
         assert!(image.height() <= super::THUMBNAIL_HEIGHT);
+    }
+
+    #[test]
+    fn ignores_malformed_source_series_indices() {
+        let metadata = super::parse_package(
+            br#"<package><metadata>
+                <meta name="calibre:series" content="Legacy Series"/>
+                <meta name="calibre:series_index" content="one-ish"/>
+            </metadata></package>"#,
+        )
+        .expect("parse otherwise valid package");
+
+        assert_eq!(metadata.series.as_deref(), Some("Legacy Series"));
+        assert_eq!(metadata.series_index(), None);
     }
 
     #[test]
