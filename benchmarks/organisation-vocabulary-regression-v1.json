@@ -17,11 +17,13 @@
     "warmup_iterations": 10,
     "measured_iterations": 40,
     "scenarios": [
+      "manager_search_page",
       "contributor_merge_and_refresh",
       "series_merge_and_refresh",
       "tag_merge_and_refresh"
     ],
     "correctness": [
+      "bounded_manager_page",
       "stable_target_identity",
       "source_identity_removed",
       "relationships_deduplicated",
@@ -38,6 +40,10 @@
     "minimum_p95_delta_ms": 0.25
   },
   "budgets": {
+    "manager_search_page": {
+      "max_p95_ms": 50,
+      "max_peak_rss_delta_bytes": 33554432
+    },
     "contributor_merge_and_refresh": {
       "max_p95_ms": 1000,
       "max_peak_rss_delta_bytes": 33554432

@@ -22,9 +22,11 @@ class OrganisationVocabularyContractTests(unittest.TestCase):
         self.assertEqual(workload["warmup_iterations"], 10)
         self.assertEqual(workload["measured_iterations"], 40)
         self.assertEqual(set(workload["scenarios"]), set(budget["budgets"]))
-        self.assertEqual(len(workload["correctness"]), 8)
-        for scenario in budget["budgets"].values():
-            self.assertEqual(scenario["max_p95_ms"], 1_000)
+        self.assertEqual(len(workload["correctness"]), 9)
+        self.assertEqual(budget["budgets"]["manager_search_page"]["max_p95_ms"], 50)
+        for name, scenario in budget["budgets"].items():
+            if name != "manager_search_page":
+                self.assertEqual(scenario["max_p95_ms"], 1_000)
             self.assertEqual(scenario["max_peak_rss_delta_bytes"], 32 * 1024 * 1024)
 
 
