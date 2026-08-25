@@ -145,6 +145,13 @@ impl GridSelection {
         }
     }
 
+    fn begin_explicit(&mut self) {
+        if self.mode.is_none() {
+            self.mode = Some(GridSelectionMode::Explicit(HashSet::with_capacity(1)));
+            self.anchor = None;
+        }
+    }
+
     fn install_range(&mut self, books: Vec<BookId>) {
         let books = books.into_iter().collect::<HashSet<_>>();
         if books.is_empty() {
@@ -1443,6 +1450,21 @@ impl LecternApp {
         self.grid_selection.clear();
         self.grid_focus_id = None;
         self.reset_bulk_tags();
+    }
+
+    fn begin_grid_selection(&mut self) {
+        if self.editor.as_ref().is_some_and(BookEditor::changed) {
+            "Save or reset the current Book details before selecting books"
+                .clone_into(&mut self.status);
+            return;
+        }
+        self.clear_selection();
+        self.reset_bulk_tags();
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.selection_pending = None;
+        self.grid_selection.begin_explicit();
+        "Selection mode: click books or their checkboxes to select them"
+            .clone_into(&mut self.status);
     }
 
     fn toggle_grid_book(&mut self, id: BookId, index: usize) {
@@ -5059,6 +5081,7 @@ impl LecternApp {
     fn selection_bar(&mut self, ui: &mut egui::Ui) {
         let active = self.grid_selection.is_active();
         let pending = self.selection_pending.is_some();
+        let selected_books = self.grid_selection.selected_count();
         let label = if pending {
             "Resolving selection…".to_owned()
         } else if self.grid_selection.is_every_matching() {
@@ -5077,6 +5100,7 @@ impl LecternApp {
             "Select books for bulk actions".to_owned()
         };
         let mut select_all = false;
+        let mut begin = false;
         let mut clear = false;
         let mut bulk_tags = false;
         egui::Frame::new()
@@ -5085,34 +5109,49 @@ impl LecternApp {
             .corner_radius(8)
             .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if pending {
-                        ui.spinner();
-                    }
-                    ui.label(RichText::new(label).strong());
-                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        if active || pending {
-                            clear = ui.button("Clear selection").clicked();
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        if pending {
+                            ui.spinner();
                         }
-                        if active {
-                            bulk_tags = ui
-                                .add_enabled(
-                                    !pending && !self.bulk_tags.is_open(),
-                                    egui::Button::new("Bulk tags"),
-                                )
-                                .clicked();
-                        }
-                        if !self.grid_selection.is_every_matching() {
-                            select_all = ui
-                                .add_enabled(!pending, egui::Button::new("Select all matching"))
-                                .clicked();
-                        }
+                        ui.label(RichText::new(label).strong());
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            if active || pending {
+                                clear = ui.button("Clear selection").clicked();
+                            }
+                            if active {
+                                bulk_tags = ui
+                                    .add_enabled(
+                                        selected_books > 0 && !pending && !self.bulk_tags.is_open(),
+                                        egui::Button::new("Bulk tags"),
+                                    )
+                                    .clicked();
+                            } else {
+                                begin = ui
+                                    .add_enabled(!pending, egui::Button::new("Select books"))
+                                    .on_hover_text("Show a checkbox on every visible book")
+                                    .clicked();
+                            }
+                            if !self.grid_selection.is_every_matching() {
+                                select_all = ui
+                                    .add_enabled(!pending, egui::Button::new("Select all matching"))
+                                    .clicked();
+                            }
+                        });
                     });
+                    let guidance = if active && selected_books == 0 {
+                        "Click a book or checkbox to select it; Shift-click extends a range."
+                    } else {
+                        "Tip: Ctrl-click toggles books; Shift-click selects an inclusive range."
+                    };
+                    ui.label(RichText::new(guidance).color(MUTED).size(11.0));
                 });
             });
         if clear {
             self.clear_grid_selection();
             "Selection cleared".clone_into(&mut self.status);
+        } else if begin {
+            self.begin_grid_selection();
         } else if select_all {
             self.select_all_matching();
         } else if bulk_tags {
@@ -5188,7 +5227,7 @@ impl LecternApp {
             let modifiers = ui.input(|input| input.modifiers);
             if modifiers.shift {
                 self.select_range_to(book.id, index);
-            } else if modifiers.command || self.grid_selection.is_active() {
+            } else if grid_toggle_modifier(modifiers) || self.grid_selection.is_active() {
                 self.toggle_grid_book(book.id, index);
             } else {
                 self.select_book(book.id);
@@ -5396,6 +5435,10 @@ impl eframe::App for LecternApp {
 
 fn interactive_menu_config() -> egui::menu::MenuConfig {
     egui::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+}
+
+const fn grid_toggle_modifier(modifiers: egui::Modifiers) -> bool {
+    modifiers.command || modifiers.ctrl || modifiers.mac_cmd
 }
 
 fn cover_image(texture: impl Into<egui::load::SizedTexture>) -> egui::Image<'static> {
@@ -6539,8 +6582,8 @@ mod tests {
         BookEditor, BulkTagIntent, CARD_GAP, CARD_WIDTH, COVER_SIZE, GridSelection,
         QUERY_PAGE_SIZE, apply_search_input, asset_health_status, build_bulk_tag_edit,
         bulk_tag_observed_state, column_count, cover_image, export_fraction,
-        format_export_progress, import_status, interactive_menu_config, query_page_offset,
-        removal_file_message, saved_search_is_modified, saved_search_summary,
+        format_export_progress, grid_toggle_modifier, import_status, interactive_menu_config,
+        query_page_offset, removal_file_message, saved_search_is_modified, saved_search_summary,
     };
 
     #[test]
@@ -6604,6 +6647,24 @@ mod tests {
         selection.toggle(BookId::new(7), 130);
         assert_eq!(selection.selected_count(), 1);
         assert!(!selection.contains(BookId::new(7)));
+    }
+
+    #[test]
+    fn explicit_selection_mode_can_start_before_the_first_book_is_chosen() {
+        let mut selection = GridSelection::default();
+        selection.begin_explicit();
+
+        assert!(selection.is_active());
+        assert_eq!(selection.selected_count(), 0);
+        assert!(!selection.is_every_matching());
+    }
+
+    #[test]
+    fn grid_toggle_accepts_platform_command_and_raw_control_modifiers() {
+        assert!(grid_toggle_modifier(egui::Modifiers::COMMAND));
+        assert!(grid_toggle_modifier(egui::Modifiers::CTRL));
+        assert!(grid_toggle_modifier(egui::Modifiers::MAC_CMD));
+        assert!(!grid_toggle_modifier(egui::Modifiers::SHIFT));
     }
 
     #[test]
