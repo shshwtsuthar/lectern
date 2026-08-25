@@ -233,6 +233,12 @@ struct BookEditor {
     error: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct BookEditorSaveState {
+    changed: bool,
+    can_save: bool,
+}
+
 struct ContributorLookup {
     generation: u64,
     row_id: u64,
@@ -696,11 +702,31 @@ impl BookEditor {
     }
 
     fn changed(&self) -> bool {
-        self.edit().map_or(true, |edit| edit != self.original_edit)
+        self.save_state().changed
     }
 
     fn can_save(&self) -> bool {
-        !self.saving && self.changed() && self.edit().is_ok()
+        self.save_state().can_save
+    }
+
+    fn save_state(&self) -> BookEditorSaveState {
+        match self.edit() {
+            Ok(edit) => {
+                let changed = edit != self.original_edit;
+                BookEditorSaveState {
+                    changed,
+                    can_save: !self.saving && changed,
+                }
+            }
+            Err(_) => BookEditorSaveState {
+                changed: true,
+                can_save: false,
+            },
+        }
+    }
+
+    fn switching_would_discard_changes(&self, next: BookId) -> bool {
+        self.original.id != next && self.changed()
     }
 }
 
@@ -3612,6 +3638,15 @@ impl LecternApp {
     }
 
     fn select_book(&mut self, id: BookId) {
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.switching_would_discard_changes(id))
+        {
+            "Save or reset the current Book details before opening another book"
+                .clone_into(&mut self.status);
+            return;
+        }
         self.clear_grid_selection();
         self.book_removal.confirmation = None;
         self.asset_maintenance.detach_confirmation = None;
@@ -5542,6 +5577,16 @@ fn metadata_form(
 ) -> MetadataActions {
     let mut actions = MetadataActions::default();
     let editing_enabled = !editor.saving && !state.removal_busy && !state.library_operation_busy;
+    let save_state = editor.save_state();
+    (actions.save, actions.reset) = metadata_save_controls(ui, editor, save_state, editing_enabled);
+    if save_state.changed {
+        ui.label(
+            RichText::new("Unsaved changes")
+                .color(Color32::LIGHT_YELLOW)
+                .size(11.0),
+        );
+    }
+    ui.separator();
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -5584,15 +5629,10 @@ fn metadata_form(
                 ui.add_space(8.0);
                 ui.label(RichText::new(error).color(Color32::LIGHT_RED));
             }
-            if editor.changed()
-                && let Err(error) = editor.edit()
-            {
+            if let Err(error) = editor.edit() {
                 ui.add_space(8.0);
                 ui.label(RichText::new(error).color(Color32::LIGHT_RED));
             }
-
-            ui.add_space(12.0);
-            (actions.save, actions.reset) = metadata_save_controls(ui, editor, editing_enabled);
 
             ui.add_space(12.0);
             ui.separator();
@@ -5986,7 +6026,7 @@ fn tag_editor(
         create_new = ui
             .add_enabled(
                 editing_enabled,
-                egui::Button::new(format!("Create and add ‘{}’", editor.tag_input.trim())),
+                egui::Button::new(format!("Add new tag ‘{}’", editor.tag_input.trim())),
             )
             .clicked();
     }
@@ -6009,6 +6049,18 @@ fn tag_editor(
             }
             Err(error) => editor.error = Some(error),
         }
+    }
+    if editor
+        .curation
+        .tags
+        .iter()
+        .any(|tag| tag.existing_id.is_none())
+    {
+        ui.label(
+            RichText::new("New tags are created in the library when you save this book.")
+                .color(MUTED)
+                .size(11.0),
+        );
     }
 }
 
@@ -6392,6 +6444,7 @@ fn format_attachment_controls(
 fn metadata_save_controls(
     ui: &mut egui::Ui,
     editor: &BookEditor,
+    save_state: BookEditorSaveState,
     editing_enabled: bool,
 ) -> (bool, bool) {
     let mut save = false;
@@ -6400,14 +6453,14 @@ fn metadata_save_controls(
         let button_text = if editor.saving { "Saving…" } else { "Save" };
         save = ui
             .add_enabled(
-                editor.can_save() && editing_enabled,
+                save_state.can_save && editing_enabled,
                 egui::Button::new(button_text),
             )
             .on_hover_text("Save metadata (Ctrl/Cmd-S)")
             .clicked();
         reset = ui
             .add_enabled(
-                editor.changed() && !editor.saving && editing_enabled,
+                save_state.changed && !editor.saving && editing_enabled,
                 egui::Button::new("Reset"),
             )
             .clicked();
@@ -6748,12 +6801,19 @@ mod tests {
         editor.curation.series.name = " Dune Chronicles ".into();
         editor.curation.series.confirm_new().unwrap();
         editor.curation.series.index = "2.000000".into();
+        editor.curation.add_new_tag("Science   Fiction").unwrap();
 
         let saved = editor.edit().unwrap();
 
         assert_eq!(saved.title, "Dune Messiah");
         assert_eq!(saved.series.unwrap().index.unwrap().to_string(), "2");
+        assert_eq!(
+            saved.tags,
+            vec![TagReference::New("Science Fiction".to_owned())]
+        );
         assert!(editor.changed());
+        assert!(!editor.switching_would_discard_changes(BookId::new(7)));
+        assert!(editor.switching_would_discard_changes(BookId::new(8)));
     }
 
     #[test]
