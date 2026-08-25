@@ -257,6 +257,29 @@ pub enum SortOrder {
 impl SortOrder {
     /// All sort orders exposed by the application.
     pub const ALL: [Self; 4] = [Self::Title, Self::Author, Self::RecentlyAdded, Self::Series];
+
+    /// Returns the stable lowercase persistence value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Author => "author",
+            Self::RecentlyAdded => "recently_added",
+            Self::Series => "series",
+        }
+    }
+
+    /// Parses a stable lowercase persistence value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "title" => Some(Self::Title),
+            "author" => Some(Self::Author),
+            "recently_added" => Some(Self::RecentlyAdded),
+            "series" => Some(Self::Series),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for SortOrder {

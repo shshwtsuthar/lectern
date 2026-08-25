@@ -5,6 +5,8 @@ use std::{fmt, ops::Range, str::FromStr};
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::BookId;
+
 macro_rules! stable_id {
     ($name:ident, $description:literal) => {
         #[doc = $description]
@@ -392,7 +394,7 @@ pub enum TagReference {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BookEdit {
     /// Stable logical-book identity.
-    pub id: crate::BookId,
+    pub id: BookId,
     /// Display title.
     pub title: String,
     /// Optional publisher.
@@ -435,6 +437,120 @@ pub struct TagUsage {
     /// Number of logical books assigned the tag.
     pub books: u64,
     /// Number of saved searches that include or exclude the tag.
+    pub saved_searches: u64,
+}
+
+/// Connection-visible library state used to invalidate query-backed selections.
+///
+/// The value is intentionally opaque to frontends. It changes after a serialized write on the
+/// current adapter and when another connection commits to the same library.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LibraryGeneration {
+    /// Changes made through the current database connection.
+    pub connection_changes: u64,
+    /// `SQLite` data-version observation for commits made by other connections.
+    pub data_version: u64,
+}
+
+/// Compact target set for a range or bulk operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BookSelection {
+    /// Explicit stable book identities, stored sorted and without duplicates.
+    Explicit(Vec<BookId>),
+    /// Every book in one canonical projection except explicit stable exclusions.
+    AllMatching {
+        /// Complete query/filter/sort state captured when selection was established.
+        query: crate::LibraryQuery,
+        /// Library state captured alongside the matching count.
+        generation: LibraryGeneration,
+        /// Stable book identities explicitly removed from the selection.
+        excluded: Vec<BookId>,
+    },
+}
+
+impl BookSelection {
+    /// Builds a canonical explicit selection.
+    #[must_use]
+    pub fn explicit(mut books: Vec<BookId>) -> Self {
+        books.sort_unstable();
+        books.dedup();
+        Self::Explicit(books)
+    }
+
+    /// Builds a canonical all-matching selection descriptor.
+    #[must_use]
+    pub fn all_matching(
+        query: crate::LibraryQuery,
+        generation: LibraryGeneration,
+        mut excluded: Vec<BookId>,
+    ) -> Self {
+        excluded.sort_unstable();
+        excluded.dedup();
+        Self::AllMatching {
+            query,
+            generation,
+            excluded,
+        }
+    }
+}
+
+/// Count and invalidation token captured without loading matching book summaries.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SelectionSnapshot {
+    /// Number of books in the current projection.
+    pub matching_books: u64,
+    /// Library generation at the same read boundary as `matching_books`.
+    pub generation: LibraryGeneration,
+}
+
+/// Atomic tag changes requested for one compact book selection.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BulkTagEdit {
+    /// Existing or newly named tags to assign to every target book.
+    pub add: Vec<TagReference>,
+    /// Existing tags to remove from every target book.
+    pub remove: Vec<TagId>,
+}
+
+/// Exact outcome of one committed bulk-tag operation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BulkTagResult {
+    /// Books matched by the target descriptor at transaction start.
+    pub books_matched: u64,
+    /// New book/tag relationships inserted.
+    pub relationships_added: u64,
+    /// Existing book/tag relationships removed.
+    pub relationships_removed: u64,
+    /// New normalized tag identities created.
+    pub tags_created: u64,
+}
+
+/// Observed state of one tag across a target selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectionTagUsage {
+    /// Stable tag and global usage counts.
+    pub usage: TagUsage,
+    /// Number of selected books currently assigned this tag.
+    pub selected_books: u64,
+}
+
+/// One durable named library projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SavedSearch {
+    /// Stable saved-search identity.
+    pub id: SavedSearchId,
+    /// Display-ready unique name.
+    pub name: String,
+    /// Complete canonical query/filter/sort state.
+    pub query: crate::LibraryQuery,
+}
+
+/// Counts presented before or after a library-wide vocabulary mutation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VocabularyMutationResult {
+    /// Distinct logical books whose relationships or projections were affected.
+    pub books: u64,
+    /// Durable saved searches whose exact facets were affected.
     pub saved_searches: u64,
 }
 

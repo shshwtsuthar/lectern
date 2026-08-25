@@ -3,6 +3,7 @@
 mod organisation;
 
 use std::{
+    cell::Cell,
     ffi::OsString,
     fs::File,
     path::{Component, Path, PathBuf},
@@ -15,8 +16,10 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 use lectern_core::organisation::{
-    BookEdit, ContributorId, ContributorUsage, SearchClause, SearchExpression, SearchParseError,
-    SeriesId, SeriesUsage, TagId, TagUsage, TextMatch,
+    BookEdit, BookSelection, BulkTagEdit, BulkTagResult, ContributorId, ContributorUsage,
+    LibraryGeneration, NameKind, SearchClause, SearchExpression, SearchParseError,
+    SelectionSnapshot, SelectionTagUsage, SeriesId, SeriesUsage, TagId, TagReference, TagUsage,
+    TextMatch, identity_key, normalize_name,
 };
 use lectern_core::{
     AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookAssetDraft,
@@ -402,6 +405,9 @@ pub enum StorageError {
     /// A requested library page began beyond `SQLite`'s signed integer range.
     #[error("library page offset {0} exceeds SQLite's supported range")]
     InvalidPageOffset(u64),
+    /// A query-backed selection was created against an older library state.
+    #[error("the selected projection changed; review the current match count before applying")]
+    StaleSelection,
     /// A logical import contained no file representation.
     #[error("a logical book must contain at least one asset")]
     EmptyAssets,
@@ -477,6 +483,7 @@ enum ReferencePathUpdate {
 /// Connection-scoped access to a Lectern library database.
 pub struct LibraryDatabase {
     connection: Connection,
+    logical_generation: Cell<u64>,
 }
 
 impl LibraryDatabase {
@@ -515,7 +522,15 @@ impl LibraryDatabase {
         }
 
         initialize_schema(&mut connection)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            logical_generation: Cell::new(0),
+        })
+    }
+
+    fn bump_generation(&self) {
+        self.logical_generation
+            .set(self.logical_generation.get().wrapping_add(1));
     }
 
     /// Returns the number of logical books in the library.
@@ -561,6 +576,7 @@ impl LibraryDatabase {
                 .collect::<Result<Vec<_>>>()?
         };
         transaction.commit()?;
+        self.bump_generation();
         Ok(ids)
     }
 
@@ -599,6 +615,7 @@ impl LibraryDatabase {
                 .collect::<Result<Vec<_>>>()?
         };
         transaction.commit()?;
+        self.bump_generation();
         Ok(ids)
     }
 
@@ -688,6 +705,215 @@ impl LibraryDatabase {
         let offset = i64::try_from(offset).map_err(|_| StorageError::InvalidPageOffset(offset))?;
         let plan = LibraryQueryPlan::new(query)?;
         query_window_with_plan(&self.connection, &plan, offset, limit)
+    }
+
+    /// Returns the matching count and invalidation generation without loading summaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the structured query or count cannot be evaluated.
+    pub fn selection_snapshot(&mut self, query: &LibraryQuery) -> Result<SelectionSnapshot> {
+        let plan = LibraryQueryPlan::new(query)?;
+        let transaction = self.connection.transaction()?;
+        let generation = current_generation(&transaction, self.logical_generation.get())?;
+        let sql = format!(
+            "SELECT count(*) FROM books b {} {}",
+            plan.joins, plan.where_clause
+        );
+        let count: i64 = transaction
+            .prepare_cached(&sql)?
+            .query_row(rusqlite::params_from_iter(plan.bindings), |row| row.get(0))?;
+        transaction.commit()?;
+        Ok(SelectionSnapshot {
+            matching_books: checked_count(count)?,
+            generation,
+        })
+    }
+
+    /// Returns only stable IDs for one ordered range in the current projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query is invalid or the offset exceeds `SQLite`'s range.
+    pub fn query_ids_window(
+        &self,
+        query: &LibraryQuery,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<BookId>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let offset = i64::try_from(offset).map_err(|_| StorageError::InvalidPageOffset(offset))?;
+        let plan = LibraryQueryPlan::new(query)?;
+        let sql = format!(
+            "SELECT b.id FROM books b {} {} ORDER BY {} LIMIT ?{} OFFSET ?{}",
+            plan.joins,
+            plan.where_clause,
+            plan.order,
+            plan.bindings.len() + 1,
+            plan.bindings.len() + 2,
+        );
+        let mut bindings = plan.bindings;
+        bindings.push(i64::from(limit).into());
+        bindings.push(offset.into());
+        let mut statement = self.connection.prepare_cached(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(bindings), |row| {
+            Ok(BookId::new(row.get(0)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Returns bounded tag usage across a compact target descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an all-matching descriptor is stale or its query cannot be resolved.
+    pub fn selection_tag_usage(
+        &mut self,
+        selection: &BookSelection,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<SelectionTagUsage>> {
+        let offset = i64::try_from(offset).map_err(|_| StorageError::InvalidPageOffset(offset))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        prepare_selection(&transaction, selection, self.logical_generation.get())?;
+        let mut statement = transaction.prepare_cached(
+            "SELECT t.id, t.name, \
+                    (SELECT count(*) FROM book_tags all_tags WHERE all_tags.tag_id = t.id), \
+                    (SELECT count(*) FROM saved_search_included_tags si \
+                     WHERE si.tag_id = t.id) + \
+                    (SELECT count(*) FROM saved_search_excluded_tags se \
+                     WHERE se.tag_id = t.id), \
+                    (SELECT count(*) FROM book_tags selected_tags \
+                     JOIN temp.lectern_selected_books selected \
+                       ON selected.book_id = selected_tags.book_id \
+                     WHERE selected_tags.tag_id = t.id) \
+             FROM tags t \
+             WHERE EXISTS (SELECT 1 FROM book_tags bt \
+                           JOIN temp.lectern_selected_books selected \
+                             ON selected.book_id = bt.book_id \
+                           WHERE bt.tag_id = t.id) \
+             ORDER BY t.identity_key, t.id LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = statement.query_map(params![i64::from(limit.min(100)), offset], |row| {
+            let books = row.get::<_, i64>(2)?;
+            let saved = row.get::<_, i64>(3)?;
+            let selected = row.get::<_, i64>(4)?;
+            Ok((
+                TagId::new(row.get(0)?),
+                row.get::<_, String>(1)?,
+                books,
+                saved,
+                selected,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (id, name, books, saved, selected) = row?;
+            result.push(SelectionTagUsage {
+                usage: TagUsage {
+                    tag: lectern_core::organisation::Tag { id, name },
+                    books: checked_count(books)?,
+                    saved_searches: checked_count(saved)?,
+                },
+                selected_books: checked_count(selected)?,
+            });
+        }
+        drop(statement);
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Applies disjoint tag additions and removals to a compact target in one durable transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target is stale, a tag is invalid or absent, add/remove sets
+    /// overlap, or any relationship/projection/FTS update cannot commit.
+    pub fn apply_bulk_tags(
+        &mut self,
+        selection: &BookSelection,
+        edit: &BulkTagEdit,
+    ) -> Result<BulkTagResult> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (books_matched, _) =
+            prepare_selection(&transaction, selection, self.logical_generation.get())?;
+        prepare_bulk_tag_tables(&transaction)?;
+
+        let mut tags_created = 0_u64;
+        for reference in &edit.add {
+            let (id, created) = resolve_bulk_tag(&transaction, reference)?;
+            tags_created += u64::from(created);
+            transaction.execute(
+                "INSERT OR IGNORE INTO temp.lectern_bulk_add_tags(tag_id) VALUES (?1)",
+                [id.value()],
+            )?;
+        }
+        let mut remove = edit.remove.clone();
+        remove.sort_unstable();
+        remove.dedup();
+        for id in remove {
+            let exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)",
+                [id.value()],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(StorageError::InvalidCuration(format!(
+                    "tag {id} does not exist"
+                )));
+            }
+            let overlaps = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM temp.lectern_bulk_add_tags WHERE tag_id = ?1)",
+                [id.value()],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if overlaps {
+                return Err(StorageError::InvalidCuration(format!(
+                    "tag {id} cannot be added and removed in one bulk operation"
+                )));
+            }
+            transaction.execute(
+                "INSERT INTO temp.lectern_bulk_remove_tags(tag_id) VALUES (?1)",
+                [id.value()],
+            )?;
+        }
+
+        let relationships_removed = transaction.execute(
+            "DELETE FROM book_tags \
+             WHERE book_id IN (SELECT book_id FROM temp.lectern_selected_books) \
+               AND tag_id IN (SELECT tag_id FROM temp.lectern_bulk_remove_tags)",
+            [],
+        )?;
+        let relationships_added = transaction.execute(
+            "INSERT OR IGNORE INTO book_tags(book_id, tag_id) \
+             SELECT selected.book_id, tags.tag_id \
+             FROM temp.lectern_selected_books selected \
+             CROSS JOIN temp.lectern_bulk_add_tags tags",
+            [],
+        )?;
+        if relationships_added > 0 || relationships_removed > 0 {
+            rebuild_selected_tag_projections(&transaction)?;
+        }
+        let relationships_added = u64::try_from(relationships_added).map_err(|_| {
+            StorageError::InvalidCuration("bulk added-row count exceeds u64".into())
+        })?;
+        let relationships_removed = u64::try_from(relationships_removed).map_err(|_| {
+            StorageError::InvalidCuration("bulk removed-row count exceeds u64".into())
+        })?;
+        transaction.commit()?;
+        self.bump_generation();
+        Ok(BulkTagResult {
+            books_matched,
+            relationships_added,
+            relationships_removed,
+            tags_created,
+        })
     }
 
     /// Loads complete editable metadata and every asset for one logical book.
@@ -789,6 +1015,7 @@ impl LibraryDatabase {
             book.series.as_deref(),
         )?;
         transaction.commit()?;
+        self.bump_generation();
         Ok(())
     }
 
@@ -807,6 +1034,7 @@ impl LibraryDatabase {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         organisation::save_book_edit(&transaction, edit)?;
         transaction.commit()?;
+        self.bump_generation();
         Ok(())
     }
 
@@ -923,6 +1151,7 @@ impl LibraryDatabase {
         )?;
         let asset = AssetId::new(transaction.last_insert_rowid());
         transaction.commit()?;
+        self.bump_generation();
         Ok(asset)
     }
 
@@ -963,6 +1192,7 @@ impl LibraryDatabase {
             return Err(StorageError::AssetNotFound(id));
         }
         transaction.commit()?;
+        self.bump_generation();
         Ok(book)
     }
 
@@ -979,6 +1209,9 @@ impl LibraryDatabase {
             .connection
             .prepare_cached("DELETE FROM books WHERE id = ?1")?
             .execute([id.value()])?;
+        if changed == 1 {
+            self.bump_generation();
+        }
         Ok(changed == 1)
     }
 
@@ -1043,6 +1276,7 @@ impl LibraryDatabase {
         }
         drop(update);
         transaction.commit()?;
+        self.bump_generation();
         Ok(report)
     }
 
@@ -1063,12 +1297,16 @@ impl LibraryDatabase {
         replacement_path: impl AsRef<Path>,
         replacement_format: BookFormat,
     ) -> Result<()> {
-        self.update_reference_asset_path(
+        let result = self.update_reference_asset_path(
             id,
             replacement_path.as_ref(),
             replacement_format,
             ReferencePathUpdate::Relink,
-        )
+        );
+        if result.is_ok() {
+            self.bump_generation();
+        }
+        result
     }
 
     /// Deliberately replaces the path of a validated, externally referenced asset.
@@ -1087,12 +1325,16 @@ impl LibraryDatabase {
         replacement_path: impl AsRef<Path>,
         replacement_format: BookFormat,
     ) -> Result<()> {
-        self.update_reference_asset_path(
+        let result = self.update_reference_asset_path(
             id,
             replacement_path.as_ref(),
             replacement_format,
             ReferencePathUpdate::Replace,
-        )
+        );
+        if result.is_ok() {
+            self.bump_generation();
+        }
+        result
     }
 
     fn update_reference_asset_path(
@@ -1672,6 +1914,175 @@ fn inspect_reference_asset(path: &Path) -> AssetHealth {
     }
 }
 
+fn checked_count(count: i64) -> Result<u64> {
+    u64::try_from(count).map_err(|_| StorageError::InvalidCount(count))
+}
+
+fn current_generation(
+    connection: &Connection,
+    logical_generation: u64,
+) -> Result<LibraryGeneration> {
+    let data_version: i64 =
+        connection.pragma_query_value(None, "data_version", |row| row.get(0))?;
+    Ok(LibraryGeneration {
+        connection_changes: logical_generation,
+        data_version: checked_count(data_version)?,
+    })
+}
+
+fn prepare_selection(
+    transaction: &Transaction<'_>,
+    selection: &BookSelection,
+    logical_generation: u64,
+) -> Result<(u64, u64)> {
+    if let BookSelection::AllMatching { generation, .. } = selection
+        && current_generation(transaction, logical_generation)? != *generation
+    {
+        return Err(StorageError::StaleSelection);
+    }
+
+    transaction.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS lectern_selected_books( \
+             book_id INTEGER PRIMARY KEY \
+         ) WITHOUT ROWID; \
+         CREATE TEMP TABLE IF NOT EXISTS lectern_selection_exclusions( \
+             book_id INTEGER PRIMARY KEY \
+         ) WITHOUT ROWID;",
+    )?;
+    let mut temporary_changes =
+        u64::try_from(transaction.execute("DELETE FROM temp.lectern_selected_books", [])?)
+            .expect("SQLite changed-row count fits u64");
+    temporary_changes +=
+        u64::try_from(transaction.execute("DELETE FROM temp.lectern_selection_exclusions", [])?)
+            .expect("SQLite changed-row count fits u64");
+
+    match selection {
+        BookSelection::Explicit(books) => {
+            let mut insert = transaction.prepare_cached(
+                "INSERT OR IGNORE INTO temp.lectern_selected_books(book_id) \
+                 SELECT id FROM books WHERE id = ?1",
+            )?;
+            for id in books {
+                temporary_changes += u64::try_from(insert.execute([id.value()])?)
+                    .expect("SQLite changed-row count fits u64");
+            }
+        }
+        BookSelection::AllMatching {
+            query, excluded, ..
+        } => {
+            let mut insert_exclusion = transaction.prepare_cached(
+                "INSERT OR IGNORE INTO temp.lectern_selection_exclusions(book_id) VALUES (?1)",
+            )?;
+            for id in excluded {
+                temporary_changes += u64::try_from(insert_exclusion.execute([id.value()])?)
+                    .expect("SQLite changed-row count fits u64");
+            }
+            drop(insert_exclusion);
+
+            let plan = LibraryQueryPlan::new(query)?;
+            let exclusion = "NOT EXISTS ( \
+                SELECT 1 FROM temp.lectern_selection_exclusions excluded \
+                WHERE excluded.book_id = b.id \
+            )";
+            let where_clause = if plan.where_clause.is_empty() {
+                format!("WHERE {exclusion}")
+            } else {
+                format!("{} AND {exclusion}", plan.where_clause)
+            };
+            let sql = format!(
+                "INSERT OR IGNORE INTO temp.lectern_selected_books(book_id) \
+                 SELECT b.id FROM books b {} {where_clause}",
+                plan.joins,
+            );
+            temporary_changes += u64::try_from(
+                transaction
+                    .prepare_cached(&sql)?
+                    .execute(rusqlite::params_from_iter(plan.bindings))?,
+            )
+            .expect("SQLite changed-row count fits u64");
+        }
+    }
+
+    let count: i64 = transaction.query_row(
+        "SELECT count(*) FROM temp.lectern_selected_books",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok((checked_count(count)?, temporary_changes))
+}
+
+fn prepare_bulk_tag_tables(transaction: &Transaction<'_>) -> Result<u64> {
+    transaction.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS lectern_bulk_add_tags( \
+             tag_id INTEGER PRIMARY KEY \
+         ) WITHOUT ROWID; \
+         CREATE TEMP TABLE IF NOT EXISTS lectern_bulk_remove_tags( \
+             tag_id INTEGER PRIMARY KEY \
+         ) WITHOUT ROWID;",
+    )?;
+    let cleared_add = transaction.execute("DELETE FROM temp.lectern_bulk_add_tags", [])?;
+    let cleared_remove = transaction.execute("DELETE FROM temp.lectern_bulk_remove_tags", [])?;
+    Ok(u64::try_from(cleared_add + cleared_remove).expect("SQLite changed-row count fits u64"))
+}
+
+fn resolve_bulk_tag(
+    transaction: &Transaction<'_>,
+    reference: &TagReference,
+) -> Result<(TagId, bool)> {
+    match reference {
+        TagReference::Existing(id) => {
+            let exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tags WHERE id = ?1)",
+                [id.value()],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if exists {
+                Ok((*id, false))
+            } else {
+                Err(StorageError::InvalidCuration(format!(
+                    "tag {id} does not exist"
+                )))
+            }
+        }
+        TagReference::New(name) => {
+            let name = normalize_name(NameKind::Tag, name)
+                .map_err(|error| StorageError::InvalidCuration(error.to_string()))?;
+            let key = identity_key(&name);
+            if let Some(id) = transaction
+                .query_row(
+                    "SELECT id FROM tags WHERE identity_key = ?1",
+                    [&key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+            {
+                return Ok((TagId::new(id), false));
+            }
+            transaction.execute(
+                "INSERT INTO tags(name, identity_key) VALUES (?1, ?2)",
+                params![name, key],
+            )?;
+            Ok((TagId::new(transaction.last_insert_rowid()), true))
+        }
+    }
+}
+
+fn rebuild_selected_tag_projections(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute(
+        "UPDATE books AS b SET tags_search = coalesce(( \
+             SELECT group_concat(name, ' ') FROM ( \
+                 SELECT t.name AS name FROM book_tags bt \
+                 JOIN tags t ON t.id = bt.tag_id \
+                 WHERE bt.book_id = b.id \
+                 ORDER BY t.identity_key, t.id \
+             ) \
+         ), '') \
+         WHERE b.id IN (SELECT book_id FROM temp.lectern_selected_books)",
+        [],
+    )?;
+    Ok(())
+}
+
 struct LibraryQueryPlan {
     bindings: Vec<rusqlite::types::Value>,
     joins: String,
@@ -1889,9 +2300,9 @@ mod tests {
         AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAssetDraft, BookFormat,
         BookId, BookMetadataDraft, LibraryQuery, SortOrder,
         organisation::{
-            BookEdit, ContributorCreditEdit, ContributorFacet, ContributorReference,
-            ContributorRole, ExactFacets, ImportedContributorCredit, ImportedOrganisation,
-            SeriesIndex, SeriesMembershipEdit, SeriesReference, TagReference,
+            BookEdit, BookSelection, BulkTagEdit, ContributorCreditEdit, ContributorFacet,
+            ContributorReference, ContributorRole, ExactFacets, ImportedContributorCredit,
+            ImportedOrganisation, SeriesIndex, SeriesMembershipEdit, SeriesReference, TagReference,
         },
     };
     use rusqlite::Connection;
@@ -3747,6 +4158,153 @@ END;
             1
         );
         assert!(database.autocomplete_tags("", &[], 500).unwrap().len() <= 50);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn query_backed_bulk_tags_are_atomic_exact_and_generation_safe() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        for index in 0..12 {
+            let title = if index < 10 {
+                format!("Target {index}")
+            } else {
+                format!("Other {index}")
+            };
+            database
+                .import_books(&[record(
+                    &format!("/books/bulk-{index}.epub"),
+                    &title,
+                    "Bulk Author",
+                )])
+                .expect("seed book");
+        }
+        let target_query = LibraryQuery {
+            search: "title:Target".into(),
+            ..LibraryQuery::default()
+        };
+        let snapshot = database
+            .selection_snapshot(&target_query)
+            .expect("selection snapshot");
+        assert_eq!(snapshot.matching_books, 10);
+        let target_ids = database
+            .query_ids_window(&target_query, 0, 20)
+            .expect("compact IDs");
+        assert_eq!(target_ids.len(), 10);
+        let excluded = target_ids[3];
+        let selection =
+            BookSelection::all_matching(target_query.clone(), snapshot.generation, vec![excluded]);
+
+        let result = database
+            .apply_bulk_tags(
+                &selection,
+                &BulkTagEdit {
+                    add: vec![
+                        TagReference::New("Science Fiction".into()),
+                        TagReference::New("Favourite".into()),
+                    ],
+                    remove: Vec::new(),
+                },
+            )
+            .expect("bulk add tags");
+        assert_eq!(result.books_matched, 9);
+        assert_eq!(result.relationships_added, 18);
+        assert_eq!(result.relationships_removed, 0);
+        assert_eq!(result.tags_created, 2);
+
+        let science = database
+            .autocomplete_tags("Science Fiction", &[], 50)
+            .unwrap()
+            .into_iter()
+            .find(|usage| usage.tag.name == "Science Fiction")
+            .expect("created tag");
+        let favourite = database
+            .autocomplete_tags("Favourite", &[], 50)
+            .unwrap()
+            .into_iter()
+            .find(|usage| usage.tag.name == "Favourite")
+            .expect("created tag");
+        assert_eq!(science.books, 9);
+        assert_eq!(favourite.books, 9);
+        assert_eq!(
+            database
+                .query(&LibraryQuery {
+                    facets: ExactFacets::new(
+                        Vec::new(),
+                        None,
+                        vec![science.tag.id, favourite.tag.id],
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                    ..LibraryQuery::default()
+                })
+                .unwrap()
+                .len(),
+            9
+        );
+        assert_eq!(
+            database
+                .query(&LibraryQuery {
+                    search: "tag:\"Science Fiction\"".into(),
+                    ..LibraryQuery::default()
+                })
+                .unwrap()
+                .len(),
+            9
+        );
+
+        let explicit = BookSelection::explicit(target_ids.clone());
+        let before_failure = database
+            .selection_tag_usage(&explicit, 0, 100)
+            .expect("tag states before failure");
+        assert!(
+            database
+                .apply_bulk_tags(
+                    &explicit,
+                    &BulkTagEdit {
+                        add: vec![TagReference::New("Rollback tag".into())],
+                        remove: vec![science.tag.id],
+                    }
+                )
+                .is_ok()
+        );
+        let after_success = database
+            .selection_tag_usage(&explicit, 0, 100)
+            .expect("tag states after success");
+        assert_ne!(before_failure, after_success);
+
+        let fresh = database.selection_snapshot(&target_query).unwrap();
+        let stale = BookSelection::all_matching(target_query.clone(), fresh.generation, Vec::new());
+        let mut changed = database.get_book(target_ids[0]).unwrap().unwrap();
+        changed.title = "Changed target".into();
+        database.save_book(&changed).expect("mutate generation");
+        assert!(matches!(
+            database.apply_bulk_tags(&stale, &BulkTagEdit::default()),
+            Err(StorageError::StaleSelection)
+        ));
+
+        let current = database.selection_snapshot(&target_query).unwrap();
+        let current = BookSelection::all_matching(target_query, current.generation, Vec::new());
+        let rollback_before = database.selection_tag_usage(&current, 0, 100).unwrap();
+        assert!(matches!(
+            database.apply_bulk_tags(
+                &current,
+                &BulkTagEdit {
+                    add: vec![TagReference::New("Invalid\nTag".into())],
+                    remove: vec![favourite.tag.id],
+                }
+            ),
+            Err(StorageError::InvalidCuration(_))
+        ));
+        assert_eq!(
+            database.selection_tag_usage(&current, 0, 100).unwrap(),
+            rollback_before
+        );
+        assert!(
+            database
+                .autocomplete_tags("Invalid", &[], 50)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
