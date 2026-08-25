@@ -2155,14 +2155,16 @@ impl LecternApp {
                 }
             }
 
-            ui.menu_button("Search help", |ui| {
-                ui.label(RichText::new("Safe fielded search").strong());
-                ui.label("title:foundation  author:le  contributor:\"ursula le guin\"");
-                ui.label("series:earthsea  tag:\"science fiction\"  publisher:ace");
-                ui.label("language:en  format:epub  file:missing");
-                ui.separator();
-                ui.label(RichText::new("Bare terms search all text fields. Clauses combine with AND; OR, regex, wildcards, grouping, and raw FTS are not accepted.").color(MUTED));
-            });
+            egui::menu::MenuButton::new("Search help")
+                .config(interactive_menu_config())
+                .ui(ui, |ui| {
+                    ui.label(RichText::new("Safe fielded search").strong());
+                    ui.label("title:foundation  author:le  contributor:\"ursula le guin\"");
+                    ui.label("series:earthsea  tag:\"science fiction\"  publisher:ace");
+                    ui.label("language:en  format:epub  file:missing");
+                    ui.separator();
+                    ui.label(RichText::new("Bare terms search all text fields. Clauses combine with AND; OR, regex, wildcards, grouping, and raw FTS are not accepted.").color(MUTED));
+                });
 
             saved_search_action = self.saved_search_menu(ui);
 
@@ -2175,14 +2177,16 @@ impl LecternApp {
             } else {
                 format!("Filters ({facet_count})")
             };
-            ui.menu_button(filter_label, |ui| {
-                query_changed |= self.filters_popover(
-                    ui,
-                    &mut contributor_lookup,
-                    &mut series_lookup,
-                    &mut tag_lookup,
-                );
-            });
+            egui::menu::MenuButton::new(filter_label)
+                .config(interactive_menu_config())
+                .ui(ui, |ui| {
+                    query_changed |= self.filters_popover(
+                        ui,
+                        &mut contributor_lookup,
+                        &mut series_lookup,
+                        &mut tag_lookup,
+                    );
+                });
 
             let previous_format = self.query.format;
             egui::ComboBox::from_id_salt("format-filter")
@@ -2262,80 +2266,82 @@ impl LecternApp {
         );
         let mut action = None;
         let mut request_load = false;
-        ui.menu_button(label, |ui| {
-            ui.set_min_width(310.0);
-            if !self.saved_searches.initialized {
-                request_load = true;
-            }
-            if self.saved_searches.pending || !self.saved_searches.initialized {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new("Loading saved searches…").color(MUTED));
-                });
-            }
-            if ui
-                .add_enabled(
-                    self.search_error.is_none()
-                        && self.saved_searches.initialized
-                        && !self.saved_searches.pending,
-                    egui::Button::new("Save current search…"),
-                )
-                .clicked()
-            {
-                action = Some(SavedSearchAction::Create);
-                ui.close();
-            }
-            if let Some(search) = active.as_ref() {
+        egui::menu::MenuButton::new(label)
+            .config(interactive_menu_config())
+            .ui(ui, |ui| {
+                ui.set_min_width(310.0);
+                if !self.saved_searches.initialized {
+                    request_load = true;
+                }
+                if self.saved_searches.pending || !self.saved_searches.initialized {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Loading saved searches…").color(MUTED));
+                    });
+                }
                 if ui
                     .add_enabled(
-                        modified && self.search_error.is_none() && !self.saved_searches.pending,
-                        egui::Button::new("Update saved search"),
+                        self.search_error.is_none()
+                            && self.saved_searches.initialized
+                            && !self.saved_searches.pending,
+                        egui::Button::new("Save current search…"),
                     )
                     .clicked()
                 {
-                    action = Some(SavedSearchAction::Update(search.id));
+                    action = Some(SavedSearchAction::Create);
                     ui.close();
                 }
-                if ui
-                    .add_enabled(!self.saved_searches.pending, egui::Button::new("Rename…"))
-                    .clicked()
+                if let Some(search) = active.as_ref() {
+                    if ui
+                        .add_enabled(
+                            modified && self.search_error.is_none() && !self.saved_searches.pending,
+                            egui::Button::new("Update saved search"),
+                        )
+                        .clicked()
+                    {
+                        action = Some(SavedSearchAction::Update(search.id));
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(!self.saved_searches.pending, egui::Button::new("Rename…"))
+                        .clicked()
+                    {
+                        action = Some(SavedSearchAction::Rename(search.clone()));
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(!self.saved_searches.pending, egui::Button::new("Delete…"))
+                        .clicked()
+                    {
+                        action = Some(SavedSearchAction::Delete(search.clone()));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if self.saved_searches.initialized
+                    && self.saved_searches.searches.is_empty()
+                    && !self.saved_searches.pending
                 {
-                    action = Some(SavedSearchAction::Rename(search.clone()));
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(!self.saved_searches.pending, egui::Button::new("Delete…"))
-                    .clicked()
-                {
-                    action = Some(SavedSearchAction::Delete(search.clone()));
-                    ui.close();
-                }
-            }
-            ui.separator();
-            if self.saved_searches.initialized
-                && self.saved_searches.searches.is_empty()
-                && !self.saved_searches.pending
-            {
-                ui.label(RichText::new("No saved searches").color(MUTED));
-            } else {
-                egui::ScrollArea::vertical()
-                    .id_salt("saved-search-toolbar-list")
-                    .max_height(320.0)
-                    .show(ui, |ui| {
-                        for search in &self.saved_searches.searches {
-                            let selected = self.saved_searches.active == Some(search.id);
-                            if ui
-                                .selectable_label(selected, &search.name)
-                                .on_hover_text(saved_search_summary(search))
-                                .clicked()
-                            {
-                                action = Some(SavedSearchAction::Apply(search.clone()));
-                                ui.close();
+                    ui.label(RichText::new("No saved searches").color(MUTED));
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("saved-search-toolbar-list")
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for search in &self.saved_searches.searches {
+                                let selected = self.saved_searches.active == Some(search.id);
+                                if ui
+                                    .selectable_label(selected, &search.name)
+                                    .on_hover_text(saved_search_summary(search))
+                                    .clicked()
+                                {
+                                    action = Some(SavedSearchAction::Apply(search.clone()));
+                                    ui.close();
+                                }
                             }
-                        }
-                    });
-            }
-        });
+                        });
+                }
+            });
         if request_load {
             self.reload_saved_searches();
         }
@@ -5353,6 +5359,10 @@ impl eframe::App for LecternApp {
     }
 }
 
+fn interactive_menu_config() -> egui::menu::MenuConfig {
+    egui::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+}
+
 fn cover_image(texture: impl Into<egui::load::SizedTexture>) -> egui::Image<'static> {
     egui::Image::from_texture(texture)
         .fit_to_exact_size(COVER_SIZE)
@@ -6476,8 +6486,8 @@ mod tests {
         BookEditor, BulkTagIntent, CARD_GAP, CARD_WIDTH, COVER_SIZE, GridSelection,
         QUERY_PAGE_SIZE, apply_search_input, asset_health_status, build_bulk_tag_edit,
         bulk_tag_observed_state, column_count, cover_image, export_fraction,
-        format_export_progress, import_status, query_page_offset, removal_file_message,
-        saved_search_is_modified, saved_search_summary,
+        format_export_progress, import_status, interactive_menu_config, query_page_offset,
+        removal_file_message, saved_search_is_modified, saved_search_summary,
     };
 
     #[test]
@@ -6498,6 +6508,14 @@ mod tests {
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE - 1), 0);
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE), QUERY_PAGE_SIZE);
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE + 17), QUERY_PAGE_SIZE);
+    }
+
+    #[test]
+    fn interactive_toolbar_menus_stay_open_for_internal_clicks() {
+        assert_eq!(
+            interactive_menu_config().close_behavior,
+            egui::PopupCloseBehavior::CloseOnClickOutside
+        );
     }
 
     #[test]
