@@ -1083,6 +1083,38 @@ impl LibraryDatabase {
         organisation::autocomplete_tags(&self.connection, prefix, selected, limit)
     }
 
+    /// Returns at most one hundred normalized-name contributor rows for vocabulary management.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prefix is invalid or the bounded indexed query fails.
+    pub fn search_contributors(
+        &self,
+        prefix: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<ContributorUsage>> {
+        organisation::search_contributors(&self.connection, prefix, offset, limit)
+    }
+
+    /// Returns at most one hundred normalized-name series rows for vocabulary management.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prefix is invalid or the bounded indexed query fails.
+    pub fn search_series(&self, prefix: &str, offset: u64, limit: u32) -> Result<Vec<SeriesUsage>> {
+        organisation::search_series(&self.connection, prefix, offset, limit)
+    }
+
+    /// Returns at most one hundred normalized-name tag rows for vocabulary management.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prefix is invalid or the bounded indexed query fails.
+    pub fn search_tags(&self, prefix: &str, offset: u64, limit: u32) -> Result<Vec<TagUsage>> {
+        organisation::search_tags(&self.connection, prefix, offset, limit)
+    }
+
     /// Lists durable saved projections alphabetically by normalized name.
     ///
     /// # Errors
@@ -2383,7 +2415,7 @@ mod tests {
             SeriesMembershipEdit, SeriesReference, TagId, TagReference,
         },
     };
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
 
     use super::{
         BookImport, ImportRecord, LibraryDatabase, SCHEMA, SCHEMA_VERSION, StorageError,
@@ -4236,6 +4268,82 @@ END;
             1
         );
         assert!(database.autocomplete_tags("", &[], 500).unwrap().len() <= 50);
+    }
+
+    #[test]
+    fn vocabulary_manager_searches_indexed_pages_without_rendering_over_one_hundred_rows() {
+        let database = LibraryDatabase::open_in_memory().expect("open library");
+        for index in 0..125 {
+            let display = format!("Writer {index:03}");
+            let key = format!("writer {index:03}");
+            database
+                .connection
+                .execute(
+                    "INSERT INTO contributors( \
+                         display_name, sort_name, identity_key, sort_key \
+                     ) VALUES (?1, ?1, ?2, ?2)",
+                    params![display, key],
+                )
+                .unwrap();
+            let display = format!("Series {index:03}");
+            let key = format!("series {index:03}");
+            database
+                .connection
+                .execute(
+                    "INSERT INTO series_entities(name, identity_key) VALUES (?1, ?2)",
+                    params![display, key],
+                )
+                .unwrap();
+            let display = format!("Tag {index:03}");
+            let key = format!("tag {index:03}");
+            database
+                .connection
+                .execute(
+                    "INSERT INTO tags(name, identity_key) VALUES (?1, ?2)",
+                    params![display, key],
+                )
+                .unwrap();
+        }
+
+        let first = database.search_tags("", 0, 500).unwrap();
+        let second = database.search_tags("", 100, 500).unwrap();
+        assert_eq!(first.len(), 100);
+        assert_eq!(second.len(), 25);
+        assert_eq!(first[0].tag.name, "Tag 000");
+        assert_eq!(second[0].tag.name, "Tag 100");
+        assert_eq!(second[24].tag.name, "Tag 124");
+        assert!(first.iter().all(|usage| usage.books == 0));
+        assert!(first.iter().all(|usage| usage.saved_searches == 0));
+
+        let contributors = database.search_contributors("writer 01", 0, 100).unwrap();
+        assert_eq!(contributors.len(), 10);
+        assert_eq!(contributors[0].contributor.display_name, "Writer 010");
+        assert!(contributors.iter().all(|usage| usage.books == 0));
+        let series = database.search_series("series 12", 0, 100).unwrap();
+        assert_eq!(series.len(), 5);
+        assert_eq!(series[4].series.name, "Series 124");
+        assert!(database.search_tags("", u64::MAX, 100).unwrap().is_empty());
+        assert!(matches!(
+            database.search_contributors("bad\nprefix", 0, 100),
+            Err(StorageError::InvalidCuration(_))
+        ));
+
+        for table in ["contributors", "series_entities", "tags"] {
+            let details = database
+                .connection
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN SELECT id FROM {table} \
+                     WHERE identity_key >= ?1 AND identity_key < ?2 \
+                     ORDER BY identity_key, id LIMIT 100 OFFSET 0"
+                ))
+                .unwrap()
+                .query_map(["a", "b"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("\n");
+            assert!(details.contains("COVERING INDEX"), "{details}");
+        }
     }
 
     #[test]

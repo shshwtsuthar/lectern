@@ -986,6 +986,110 @@ pub(super) fn autocomplete_tags(
     Ok(results)
 }
 
+/// Returns one bounded, normalized-name page for the contributor manager.
+pub(super) fn search_contributors(
+    connection: &Connection,
+    prefix: &str,
+    offset: u64,
+    limit: u32,
+) -> Result<Vec<ContributorUsage>> {
+    let limit = i64::from(limit.min(100));
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let (lower, upper) = prefix_bounds(NameKind::Contributor, prefix)?;
+    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare_cached(
+        "SELECT c.id, c.display_name, c.sort_name, ( \
+             SELECT count(*) FROM book_contributors bc WHERE bc.contributor_id = c.id \
+         ) FROM contributors c \
+         WHERE c.identity_key >= ?1 AND c.identity_key < ?2 \
+         ORDER BY c.identity_key, c.id LIMIT ?3 OFFSET ?4",
+    )?;
+    let rows = statement.query_map(params![lower, upper, limit, offset], |row| {
+        let id = ContributorId::new(row.get(0)?);
+        contributor_usage_row_offset(id, row, 1)
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Returns one bounded, normalized-name page for the series manager.
+pub(super) fn search_series(
+    connection: &Connection,
+    prefix: &str,
+    offset: u64,
+    limit: u32,
+) -> Result<Vec<SeriesUsage>> {
+    let limit = i64::from(limit.min(100));
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let (lower, upper) = prefix_bounds(NameKind::Series, prefix)?;
+    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare_cached(
+        "SELECT s.id, s.name, ( \
+             SELECT count(*) FROM series_memberships sm WHERE sm.series_id = s.id \
+         ) FROM series_entities s \
+         WHERE s.identity_key >= ?1 AND s.identity_key < ?2 \
+         ORDER BY s.identity_key, s.id LIMIT ?3 OFFSET ?4",
+    )?;
+    let rows = statement.query_map(params![lower, upper, limit, offset], |row| {
+        Ok((
+            SeriesId::new(row.get(0)?),
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (id, name, books) = row?;
+        Ok(SeriesUsage {
+            series: Series { id, name },
+            books: checked_count(books)?,
+        })
+    })
+    .collect()
+}
+
+/// Returns one bounded, normalized-name page for the tag manager.
+pub(super) fn search_tags(
+    connection: &Connection,
+    prefix: &str,
+    offset: u64,
+    limit: u32,
+) -> Result<Vec<TagUsage>> {
+    let limit = i64::from(limit.min(100));
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let (lower, upper) = prefix_bounds(NameKind::Tag, prefix)?;
+    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare_cached(
+        "SELECT t.id, t.name, \
+             (SELECT count(*) FROM book_tags bt WHERE bt.tag_id = t.id), \
+             (SELECT count(*) FROM saved_search_included_tags sti WHERE sti.tag_id = t.id) + \
+             (SELECT count(*) FROM saved_search_excluded_tags ste WHERE ste.tag_id = t.id) \
+         FROM tags t WHERE t.identity_key >= ?1 AND t.identity_key < ?2 \
+         ORDER BY t.identity_key, t.id LIMIT ?3 OFFSET ?4",
+    )?;
+    let rows = statement.query_map(params![lower, upper, limit, offset], |row| {
+        Ok((
+            TagId::new(row.get(0)?),
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (id, name, books, saved_searches) = row?;
+        Ok(TagUsage {
+            tag: Tag { id, name },
+            books: checked_count(books)?,
+            saved_searches: checked_count(saved_searches)?,
+        })
+    })
+    .collect()
+}
+
 fn contributor_usage_row(
     id: ContributorId,
     row: &rusqlite::Row<'_>,
