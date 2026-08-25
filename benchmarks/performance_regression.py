@@ -97,12 +97,15 @@ def main(arguments: list[str]) -> int:
             "export": "exports.json",
             "reimport": "reimports.json",
             "organisation-migration": "migrations.json",
+            "organisation-query": "organisation-queries.json",
         }
         query_output = output / result_names[mode]
         run_command(seed_command(mode, database, seed_output, workload), commands)
         seed = read_json(seed_output)
         if mode == "organisation-migration":
             validate_migration_seed_result(seed, workload)
+        elif mode == "organisation-query":
+            validate_organisation_query_seed_result(seed, workload)
         else:
             validate_seed_result(seed, workload["books"])
 
@@ -122,6 +125,8 @@ def main(arguments: list[str]) -> int:
             decisions = evaluate_reimport_result(query_result, budget)
         elif mode == "organisation-migration":
             decisions = evaluate_migration_result(query_result, budget)
+        elif mode == "organisation-query":
+            decisions = evaluate_organisation_query_result(query_result, budget)
         else:
             decisions = evaluate_query_result(query_result, budget)
         report["seed"] = seed
@@ -157,6 +162,8 @@ def seed_command(
     command = ["cargo", "run", "--release", "--locked", "-p", "lectern-benchmark"]
     if mode == "organisation-migration":
         command += ["--bin", "organisation-benchmark", "--", "seed-migration"]
+    elif mode == "organisation-query":
+        command += ["--bin", "organisation-query-benchmark", "--", "seed"]
     else:
         command += ["--", "seed"]
     return command + [
@@ -182,6 +189,8 @@ def workload_command(
     command = ["cargo", "run", "--release", "--locked", "-p", "lectern-benchmark"]
     if mode == "organisation-migration":
         command += ["--bin", "organisation-benchmark", "--", "migration"]
+    elif mode == "organisation-query":
+        command += ["--bin", "organisation-query-benchmark", "--", "query"]
     else:
         command += [
             "--",
@@ -212,7 +221,7 @@ def workload_command(
         str(workload["measured_iterations"]),
         "--warmup",
         str(workload["warmup_iterations"]),
-    ] if mode == "organisation-migration" else command + [
+    ] if mode in ("organisation-migration", "organisation-query") else command + [
         "--database",
         str(database),
         "--output",
@@ -258,6 +267,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "export",
         "reimport",
         "organisation-migration",
+        "organisation-query",
     ):
         raise RegressionError(
             "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
@@ -316,6 +326,20 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 raise RegressionError(
                     "organisation migration must use source schema version five"
                 )
+        if query_mode == "organisation-query":
+            for field in (
+                "page_size",
+                "contributors",
+                "series",
+                "tags",
+                "tags_per_book",
+                "saved_searches",
+                "autocomplete_limit",
+            ):
+                if positive_or_zero_field(workload, field, "budget.workload") == 0:
+                    raise RegressionError(
+                        f"organisation query workload {field} must be greater than zero"
+                    )
         scenario_names = workload.get("scenarios")
         if not isinstance(scenario_names, list) or not all(
             isinstance(name, str) and name for name in scenario_names
@@ -966,6 +990,81 @@ def evaluate_migration_result(
     return decisions
 
 
+def evaluate_organisation_query_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "organisation query result"
+    if result.get("kind") != "organisation-query":
+        raise RegressionError("organisation query result kind is invalid")
+    if positive_or_zero_field(result, "library_books", context) != workload["books"]:
+        raise RegressionError("organisation query library count does not match the budget")
+    warmup = positive_or_zero_field(result, "warmup_iterations", context)
+    measured = positive_or_zero_field(result, "measured_iterations", context)
+    if warmup != workload["warmup_iterations"] or measured != workload["measured_iterations"]:
+        raise RegressionError("organisation query iteration counts do not match the budget")
+    if positive_or_zero_field(result, "page_size", context) != workload["page_size"]:
+        raise RegressionError("organisation query page size does not match the budget")
+    if positive_or_zero_field(
+        result, "autocomplete_limit", context
+    ) != workload["autocomplete_limit"]:
+        raise RegressionError("organisation autocomplete limit does not match the budget")
+
+    checks = result.get("verified_checks")
+    if not isinstance(checks, list) or set(checks) != set(workload["correctness"]):
+        raise RegressionError("organisation query correctness checks did not reconcile")
+    plans = result.get("query_plans")
+    required_indexes = {
+        "book_contributors_contributor_role_book_idx",
+        "series_memberships_series_index_book_idx",
+        "book_tags_tag_book_idx",
+    }
+    if not isinstance(plans, list) or {
+        plan.get("required_index") for plan in plans if isinstance(plan, dict)
+    } != required_indexes:
+        raise RegressionError("organisation query plans did not cover every required index")
+    if any(
+        not isinstance(plan.get("details"), list) or not plan["details"]
+        for plan in plans
+        if isinstance(plan, dict)
+    ):
+        raise RegressionError("organisation query plan evidence is empty")
+
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError("organisation query result must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, scenario in enumerate(scenarios):
+        scenario_context = f"organisation query scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{scenario_context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{scenario_context}.name must be unique and non-empty")
+        operations = positive_or_zero_field(
+            scenario, "successful_operations", scenario_context
+        )
+        if operations != warmup + measured:
+            raise RegressionError(f"{scenario_context} operation count does not reconcile")
+        positive_or_zero_field(scenario, "observed_results", scenario_context)
+        samples = scenario.get("samples_ns")
+        if not isinstance(samples, list) or len(samples) != measured:
+            raise RegressionError(f"{scenario_context} sample count does not match the budget")
+        if any(
+            isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+            for sample in samples
+        ):
+            raise RegressionError(f"{scenario_context}.samples_ns must contain positive integers")
+        latency = object_field(scenario, "latency_ms", scenario_context)
+        positive_number_field(latency, "p95", f"{scenario_context}.latency_ms")
+        by_name[name] = scenario
+
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("organisation query scenarios do not match the versioned budget")
+    return evaluate_latency_budgets(by_name, budget)
+
+
 def evaluate_latency_budgets(
     by_name: dict[str, dict[str, Any]], budget: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -1048,6 +1147,26 @@ def validate_migration_seed_result(
     ):
         raise RegressionError("migration seed series distribution is invalid")
     positive_or_zero_field(result, "covers", context)
+    positive_or_zero_field(result, "database_bytes", context)
+
+
+def validate_organisation_query_seed_result(
+    result: dict[str, Any], workload: dict[str, Any]
+) -> None:
+    context = "organisation query seed"
+    if result.get("kind") != "organisation-query-seed":
+        raise RegressionError("organisation query seed kind is invalid")
+    expected = {
+        "library_books": workload["books"],
+        "contributors": workload["contributors"],
+        "series": workload["series"],
+        "tags": workload["tags"],
+        "tags_per_book": workload["tags_per_book"],
+        "saved_searches": workload["saved_searches"],
+    }
+    for field, value in expected.items():
+        if positive_or_zero_field(result, field, context) != value:
+            raise RegressionError(f"organisation query seed {field} does not match the budget")
     positive_or_zero_field(result, "database_bytes", context)
 
 

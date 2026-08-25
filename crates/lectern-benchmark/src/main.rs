@@ -16,6 +16,7 @@ use std::{
 };
 
 use image::{Rgb, RgbImage, codecs::jpeg::JpegEncoder};
+use lectern_core::organisation::ExactFacets;
 use lectern_core::{
     AssetHealth, AssetId, AssetStorage, Book, BookAssetDraft, BookDraft, BookFormat,
     BookMetadataDraft, BookSummary, LibraryQuery, SortOrder,
@@ -659,6 +660,7 @@ impl PageQueryScenario {
             search: self.search.into(),
             format: self.format,
             asset_health: self.asset_health,
+            facets: ExactFacets::default(),
             sort: self.sort,
         }
     }
@@ -670,6 +672,7 @@ impl QueryScenario {
             search: self.search.into(),
             format: self.format,
             asset_health: self.asset_health,
+            facets: ExactFacets::default(),
             sort: self.sort,
         }
     }
@@ -2939,6 +2942,7 @@ fn sort_name(sort: SortOrder) -> &'static str {
         SortOrder::Title => "title",
         SortOrder::Author => "author",
         SortOrder::RecentlyAdded => "recently_added",
+        SortOrder::Series => "series",
     }
 }
 

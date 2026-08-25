@@ -725,6 +725,7 @@ const fn sort_index(sort: SortOrder) -> usize {
         SortOrder::Author => 0,
         SortOrder::RecentlyAdded => 1,
         SortOrder::Title => 2,
+        SortOrder::Series => 3,
     }
 }
 
@@ -733,6 +734,7 @@ const fn sort_name(sort: SortOrder) -> &'static str {
         SortOrder::Author => "author",
         SortOrder::RecentlyAdded => "recently_added",
         SortOrder::Title => "title",
+        SortOrder::Series => "series",
     }
 }
 

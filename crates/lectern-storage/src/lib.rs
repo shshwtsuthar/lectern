@@ -14,6 +14,10 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
+use lectern_core::organisation::{
+    BookEdit, ContributorId, ContributorUsage, SearchClause, SearchExpression, SearchParseError,
+    SeriesId, SeriesUsage, TagId, TagUsage, TextMatch,
+};
 use lectern_core::{
     AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookAssetDraft,
     BookDraft, BookFormat, BookId, BookMetadataDraft, BookSummary, LibraryPage, LibraryQuery,
@@ -434,6 +438,9 @@ pub enum StorageError {
     /// User-entered or imported curation metadata violated the shared domain contract.
     #[error("invalid curation metadata: {0}")]
     InvalidCuration(String),
+    /// A structured library search was invalid and must not be dispatched.
+    #[error("invalid structured search: {0}")]
+    InvalidSearch(#[from] SearchParseError),
 }
 
 /// Result type returned by storage operations.
@@ -601,9 +608,9 @@ impl LibraryDatabase {
     ///
     /// Returns an error when the indexed query cannot be prepared or executed.
     pub fn query(&self, query: &LibraryQuery) -> Result<Vec<BookSummary>> {
-        let plan = LibraryQueryPlan::new(query);
+        let plan = LibraryQueryPlan::new(query)?;
         let sql = format!(
-            "SELECT b.id, b.title, b.authors, b.series, \
+            "SELECT b.id, b.title, b.authors, b.series, b.series_index, \
              b.has_cover, b.has_file_issue \
              FROM books b {} {where_clause} ORDER BY {order}",
             plan.joins,
@@ -636,7 +643,7 @@ impl LibraryDatabase {
     ) -> Result<LibraryPage> {
         let page_offset = offset;
         let offset = i64::try_from(offset).map_err(|_| StorageError::InvalidPageOffset(offset))?;
-        let plan = LibraryQueryPlan::new(query);
+        let plan = LibraryQueryPlan::new(query)?;
         let transaction = self.connection.transaction()?;
 
         let total = {
@@ -679,7 +686,7 @@ impl LibraryDatabase {
         limit: u32,
     ) -> Result<Vec<BookSummary>> {
         let offset = i64::try_from(offset).map_err(|_| StorageError::InvalidPageOffset(offset))?;
-        let plan = LibraryQueryPlan::new(query);
+        let plan = LibraryQueryPlan::new(query)?;
         query_window_with_plan(&self.connection, &plan, offset, limit)
     }
 
@@ -706,6 +713,9 @@ impl LibraryDatabase {
                     title: row.get(1)?,
                     authors: row.get(2)?,
                     series: row.get(3)?,
+                    contributors: Vec::new(),
+                    series_membership: None,
+                    tags: Vec::new(),
                     publisher: row.get(4)?,
                     language: row.get(5)?,
                     description: row.get(6)?,
@@ -733,6 +743,14 @@ impl LibraryDatabase {
             }
         }
 
+        if let Some(book) = &mut book {
+            let (contributors, series, tags) =
+                organisation::load_book_curation(&self.connection, book.id)?;
+            book.contributors = contributors;
+            book.series_membership = series;
+            book.tags = tags;
+        }
+
         Ok(book)
     }
 
@@ -750,8 +768,8 @@ impl LibraryDatabase {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE books SET title = ?1, sort_title = ?2, \
-             publisher = ?3, language = ?4, description = ?5, \
-             modified_at = unixepoch() WHERE id = ?6",
+             publisher = ?3, language = ?4, description = ?5, modified_at = unixepoch() \
+             WHERE id = ?6",
             params![
                 book.title.trim(),
                 sortable(&book.title),
@@ -772,6 +790,69 @@ impl LibraryDatabase {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Atomically persists ordinary metadata and normalized curation relationships.
+    ///
+    /// Existing and newly named contributors, series, and tags are resolved under the same
+    /// immediate transaction. Asset rows and publication files are never read or changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the book or an existing entity is absent, input validation fails,
+    /// credit ordering is invalid, or any database operation cannot commit.
+    pub fn save_book_edit(&mut self, edit: &BookEdit) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        organisation::save_book_edit(&transaction, edit)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Returns at most fifty contributor identity-prefix matches with selected values first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prefix violates the contributor-name input bound or the indexed
+    /// vocabulary query fails.
+    pub fn autocomplete_contributors(
+        &self,
+        prefix: &str,
+        selected: &[ContributorId],
+        limit: u32,
+    ) -> Result<Vec<ContributorUsage>> {
+        organisation::autocomplete_contributors(&self.connection, prefix, selected, limit)
+    }
+
+    /// Returns at most fifty series identity-prefix matches with selected values first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prefix violates the series-name input bound or the indexed
+    /// vocabulary query fails.
+    pub fn autocomplete_series(
+        &self,
+        prefix: &str,
+        selected: &[SeriesId],
+        limit: u32,
+    ) -> Result<Vec<SeriesUsage>> {
+        organisation::autocomplete_series(&self.connection, prefix, selected, limit)
+    }
+
+    /// Returns at most fifty tag identity-prefix matches with selected values first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prefix violates the tag-name input bound or the indexed
+    /// vocabulary query fails.
+    pub fn autocomplete_tags(
+        &self,
+        prefix: &str,
+        selected: &[TagId],
+        limit: u32,
+    ) -> Result<Vec<TagUsage>> {
+        organisation::autocomplete_tags(&self.connection, prefix, selected, limit)
     }
 
     /// Attaches one externally referenced publication to an existing logical book.
@@ -1595,34 +1676,69 @@ struct LibraryQueryPlan {
 }
 
 impl LibraryQueryPlan {
-    fn new(query: &LibraryQuery) -> Self {
-        let search = build_fts_query(&query.search);
+    fn new(query: &LibraryQuery) -> Result<Self> {
+        let expression = SearchExpression::parse(&query.search)?;
         let mut bindings = Vec::new();
         let mut predicates = Vec::new();
         let mut joins = Vec::new();
+        let mut full_text_clauses = Vec::new();
 
-        if let Some(search) = search {
-            bindings.push(search.into());
+        add_structured_search(
+            &expression,
+            &mut bindings,
+            &mut predicates,
+            &mut full_text_clauses,
+        );
+
+        let has_full_text_search = !full_text_clauses.is_empty();
+        if has_full_text_search {
+            bindings.push(full_text_clauses.join(" AND ").into());
             predicates.push(format!("books_fts MATCH ?{}", bindings.len()));
             joins.push("JOIN books_fts ON books_fts.rowid = b.id".to_owned());
         }
 
-        if let Some(format) = query.format {
-            bindings.push(format.as_str().to_owned().into());
-            joins.push(format!(
-                "JOIN book_assets filtered_assets \
-                 ON filtered_assets.book_id = b.id AND filtered_assets.format = ?{}",
+        for facet in &query.facets.contributors {
+            bindings.push(facet.contributor.value().into());
+            let contributor = bindings.len();
+            let role = if facet.author_only {
+                " AND bc.role = 'author'"
+            } else {
+                ""
+            };
+            predicates.push(format!(
+                "b.id IN (SELECT bc.book_id FROM book_contributors bc \
+                 WHERE bc.contributor_id = ?{contributor}{role})"
+            ));
+        }
+        if let Some(series) = query.facets.series {
+            bindings.push(series.value().into());
+            predicates.push(format!(
+                "b.id IN (SELECT sm.book_id FROM series_memberships sm \
+                 WHERE sm.series_id = ?{})",
+                bindings.len()
+            ));
+        }
+        for tag in &query.facets.included_tags {
+            bindings.push(tag.value().into());
+            predicates.push(format!(
+                "b.id IN (SELECT bt.book_id FROM book_tags bt WHERE bt.tag_id = ?{})",
+                bindings.len()
+            ));
+        }
+        for tag in &query.facets.excluded_tags {
+            bindings.push(tag.value().into());
+            predicates.push(format!(
+                "b.id NOT IN (SELECT bt.book_id FROM book_tags bt WHERE bt.tag_id = ?{})",
                 bindings.len()
             ));
         }
 
+        if let Some(format) = query.format {
+            push_asset_exists(&mut bindings, &mut predicates, "format", format.as_str());
+        }
+
         if let Some(health) = query.asset_health {
-            bindings.push(health.as_str().to_owned().into());
-            joins.push(format!(
-                "JOIN (SELECT book_id FROM book_assets WHERE health = ?{} GROUP BY book_id) \
-                 health_assets ON health_assets.book_id = b.id",
-                bindings.len()
-            ));
+            push_asset_exists(&mut bindings, &mut predicates, "health", health.as_str());
         }
 
         let where_clause = if predicates.is_empty() {
@@ -1632,16 +1748,87 @@ impl LibraryQueryPlan {
         };
         let order = match query.sort {
             SortOrder::Title => "b.sort_title, b.id",
-            SortOrder::Author => "b.sort_authors, b.sort_title, b.id",
+            SortOrder::Author => "b.sort_authors = '', b.sort_authors, b.sort_title, b.id",
             SortOrder::RecentlyAdded => "b.added_at DESC, b.id DESC",
+            SortOrder::Series => {
+                "b.series_key IS NULL, b.series_key, b.series_index IS NULL, \
+                 b.series_index, b.sort_title, b.id"
+            }
         };
-        Self {
+        Ok(Self {
             bindings,
             joins: joins.join(" "),
             where_clause,
             order,
+        })
+    }
+}
+
+fn add_structured_search(
+    expression: &SearchExpression,
+    bindings: &mut Vec<rusqlite::types::Value>,
+    predicates: &mut Vec<String>,
+    full_text_clauses: &mut Vec<String>,
+) {
+    for clause in expression.clauses() {
+        match clause {
+            SearchClause::Any(value) => full_text_clauses.push(fts_match(None, value)),
+            SearchClause::Title(value) => {
+                full_text_clauses.push(fts_match(Some("title"), value));
+            }
+            SearchClause::Author(value) => {
+                full_text_clauses.push(fts_match(Some("authors_search"), value));
+            }
+            SearchClause::Contributor(value) => {
+                full_text_clauses.push(fts_match(Some("contributors_search"), value));
+            }
+            SearchClause::Series(value) => {
+                full_text_clauses.push(fts_match(Some("series"), value));
+            }
+            SearchClause::Tag(value) => {
+                full_text_clauses.push(fts_match(Some("tags_search"), value));
+            }
+            SearchClause::Publisher(value) => {
+                full_text_clauses.push(fts_match(Some("publisher"), value));
+            }
+            SearchClause::Language(language) => {
+                bindings.push(language.clone().into());
+                predicates.push(format!("lower(b.language) = ?{}", bindings.len()));
+            }
+            SearchClause::Format(format) => {
+                push_asset_exists(bindings, predicates, "format", format.as_str());
+            }
+            SearchClause::File(health) => {
+                push_asset_exists(bindings, predicates, "health", health.as_str());
+            }
         }
     }
+}
+
+fn fts_match(column: Option<&str>, value: &TextMatch) -> String {
+    let (value, prefix) = match value {
+        TextMatch::Prefix(value) => (value, "*"),
+        TextMatch::Phrase(value) => (value, ""),
+    };
+    let value = value.replace('"', "\"\"");
+    column.map_or_else(
+        || format!("\"{value}\"{prefix}"),
+        |column| format!("{column} : \"{value}\"{prefix}"),
+    )
+}
+
+fn push_asset_exists(
+    bindings: &mut Vec<rusqlite::types::Value>,
+    predicates: &mut Vec<String>,
+    column: &'static str,
+    value: &str,
+) {
+    bindings.push(value.to_owned().into());
+    predicates.push(format!(
+        "EXISTS (SELECT 1 FROM book_assets ba \
+         WHERE ba.book_id = b.id AND ba.{column} = ?{})",
+        bindings.len()
+    ));
 }
 
 fn book_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<BookSummary> {
@@ -1650,8 +1837,9 @@ fn book_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<BookSummary> {
         title: row.get(1)?,
         authors: row.get(2)?,
         series: row.get(3)?,
-        has_cover: row.get(4)?,
-        has_file_issue: row.get(5)?,
+        series_index: organisation::series_index_from_database(row.get(4)?, 4)?,
+        has_cover: row.get(5)?,
+        has_file_issue: row.get(6)?,
     })
 }
 
@@ -1665,7 +1853,7 @@ fn query_window_with_plan(
         return Ok(Vec::new());
     }
     let sql = format!(
-        "SELECT b.id, b.title, b.authors, b.series, \
+        "SELECT b.id, b.title, b.authors, b.series, b.series_index, \
          b.has_cover, b.has_file_issue \
          FROM books b {} {} ORDER BY {} LIMIT ?{} OFFSET ?{}",
         plan.joins,
@@ -1682,16 +1870,6 @@ fn query_window_with_plan(
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-fn build_fts_query(input: &str) -> Option<String> {
-    let terms = input
-        .split_whitespace()
-        .map(|term| term.replace('"', "\"\""))
-        .filter(|term| !term.is_empty())
-        .map(|term| format!("\"{term}\"*"))
-        .collect::<Vec<_>>();
-    (!terms.is_empty()).then(|| terms.join(" AND "))
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1706,6 +1884,11 @@ mod tests {
     use lectern_core::{
         AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAssetDraft, BookFormat,
         BookId, BookMetadataDraft, LibraryQuery, SortOrder,
+        organisation::{
+            BookEdit, ContributorCreditEdit, ContributorFacet, ContributorReference,
+            ContributorRole, ExactFacets, SeriesIndex, SeriesMembershipEdit, SeriesReference,
+            TagReference,
+        },
     };
     use rusqlite::Connection;
 
@@ -2496,6 +2679,10 @@ END;
         curated.language = Some("en-AU".into());
         curated.description = Some("A carefully edited library description.".into());
         database.save_book(&curated).expect("save curated metadata");
+        let curated = database
+            .get_book(id)
+            .expect("reload curated metadata")
+            .expect("curated book exists");
 
         let mut reimport = original_import;
         reimport.book = BookMetadataDraft {
@@ -3242,6 +3429,292 @@ END;
         );
     }
 
+    fn earthsea_edit(id: BookId) -> BookEdit {
+        BookEdit {
+            id,
+            title: "A Wizard of Earthsea".into(),
+            publisher: Some("Parnassus".into()),
+            language: Some("EN".into()),
+            description: Some("An archipelago tale".into()),
+            contributors: vec![
+                ContributorCreditEdit {
+                    contributor: ContributorReference::New {
+                        display_name: "Ursula K. Le Guin".into(),
+                        sort_name: "Le Guin, Ursula K.".into(),
+                    },
+                    role: ContributorRole::Author,
+                    position: 0,
+                },
+                ContributorCreditEdit {
+                    contributor: ContributorReference::New {
+                        display_name: "Ruth Robbins".into(),
+                        sort_name: "Robbins, Ruth".into(),
+                    },
+                    role: ContributorRole::Illustrator,
+                    position: 0,
+                },
+            ],
+            series: Some(SeriesMembershipEdit {
+                series: SeriesReference::New("Earthsea Cycle".into()),
+                index: Some("1.250000".parse::<SeriesIndex>().expect("valid index")),
+            }),
+            tags: vec![
+                TagReference::New("Science Fiction".into()),
+                TagReference::New(" Fantasy ".into()),
+            ],
+        }
+    }
+
+    #[test]
+    fn normalized_book_edit_updates_detail_projection_search_and_facets_atomically() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let id = database
+            .import_books(&[record(
+                "/books/earthsea.epub",
+                "Legacy title",
+                "Combined author",
+            )])
+            .expect("import book")[0];
+        let original_asset = database
+            .get_book(id)
+            .expect("load original")
+            .expect("book exists")
+            .assets;
+        let edit = earthsea_edit(id);
+
+        database
+            .save_book_edit(&edit)
+            .expect("save normalized edit");
+        let stored = database
+            .get_book(id)
+            .expect("reload edited book")
+            .expect("book exists");
+
+        assert_eq!(stored.authors, "Ursula K. Le Guin");
+        assert_eq!(stored.contributors.len(), 2);
+        assert_eq!(stored.contributors[1].role, ContributorRole::Illustrator);
+        assert_eq!(
+            stored
+                .series_membership
+                .as_ref()
+                .and_then(|membership| membership.index)
+                .map(|index| index.to_string())
+                .as_deref(),
+            Some("1.25")
+        );
+        assert_eq!(
+            stored
+                .tags
+                .iter()
+                .map(|tag| tag.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Fantasy", "Science Fiction"]
+        );
+        assert_eq!(stored.assets, original_asset);
+
+        let contributor = stored.contributors[0].contributor.id;
+        let series = stored.series_membership.as_ref().expect("series").series.id;
+        let science_fiction = stored
+            .tags
+            .iter()
+            .find(|tag| tag.name == "Science Fiction")
+            .expect("science fiction tag")
+            .id;
+        let results = database
+            .query(&LibraryQuery {
+                search: "author:ursula tag:\"science fiction\" language:en format:epub".into(),
+                facets: ExactFacets::new(
+                    vec![ContributorFacet {
+                        contributor,
+                        author_only: true,
+                    }],
+                    Some(series),
+                    vec![science_fiction],
+                    Vec::new(),
+                )
+                .expect("valid facets"),
+                sort: SortOrder::Series,
+                ..LibraryQuery::default()
+            })
+            .expect("run structured exact query");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id);
+        assert_eq!(
+            results[0]
+                .series_index
+                .map(|index| index.to_string())
+                .as_deref(),
+            Some("1.25")
+        );
+    }
+
+    #[test]
+    fn invalid_normalized_edit_rolls_back_entities_metadata_and_projection() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let id = database
+            .import_books(&[record(
+                "/books/rollback.epub",
+                "Original",
+                "Original Author",
+            )])
+            .expect("import book")[0];
+        let before = database
+            .get_book(id)
+            .expect("load original")
+            .expect("book exists");
+        let invalid = BookEdit {
+            id,
+            title: "Must roll back".into(),
+            publisher: None,
+            language: None,
+            description: None,
+            contributors: vec![
+                ContributorCreditEdit {
+                    contributor: ContributorReference::New {
+                        display_name: "Duplicate Person".into(),
+                        sort_name: "Duplicate Person".into(),
+                    },
+                    role: ContributorRole::Author,
+                    position: 0,
+                },
+                ContributorCreditEdit {
+                    contributor: ContributorReference::New {
+                        display_name: " duplicate   person ".into(),
+                        sort_name: "Duplicate Person".into(),
+                    },
+                    role: ContributorRole::Author,
+                    position: 1,
+                },
+            ],
+            series: None,
+            tags: vec![TagReference::New("Should Not Persist".into())],
+        };
+
+        assert!(matches!(
+            database.save_book_edit(&invalid),
+            Err(StorageError::InvalidCuration(_))
+        ));
+        assert_eq!(
+            database
+                .get_book(id)
+                .expect("reload after rollback")
+                .expect("book exists"),
+            before
+        );
+        assert!(
+            database
+                .autocomplete_tags("Should", &[], 50)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            database
+                .query(&LibraryQuery {
+                    search: "Must".into(),
+                    ..LibraryQuery::default()
+                })
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bounded_autocomplete_reuses_identity_and_puts_selected_values_first() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let id = database
+            .import_books(&[record("/books/autocomplete.epub", "Book", "Legacy")])
+            .expect("import book")[0];
+        database
+            .save_book_edit(&BookEdit {
+                id,
+                title: "Book".into(),
+                publisher: None,
+                language: None,
+                description: None,
+                contributors: vec![ContributorCreditEdit {
+                    contributor: ContributorReference::New {
+                        display_name: "Alpha Writer".into(),
+                        sort_name: "Writer, Alpha".into(),
+                    },
+                    role: ContributorRole::Author,
+                    position: 0,
+                }],
+                series: Some(SeriesMembershipEdit {
+                    series: SeriesReference::New("Alpha Series".into()),
+                    index: None,
+                }),
+                tags: vec![
+                    TagReference::New("Alpha Tag".into()),
+                    TagReference::New("Alpine".into()),
+                ],
+            })
+            .expect("save curation");
+        let book = database.get_book(id).unwrap().unwrap();
+        let selected_tag = book
+            .tags
+            .iter()
+            .find(|tag| tag.name == "Alpine")
+            .expect("selected tag")
+            .id;
+
+        let tags = database
+            .autocomplete_tags("alpha", &[selected_tag], 2)
+            .expect("autocomplete tags");
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].tag.id, selected_tag);
+        assert_eq!(tags[1].tag.name, "Alpha Tag");
+        assert_eq!(tags[1].books, 1);
+        assert_eq!(
+            database
+                .autocomplete_contributors("alpha", &[], 50)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            database
+                .autocomplete_series("alpha", &[], 50)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(database.autocomplete_tags("", &[], 500).unwrap().len() <= 50);
+    }
+
+    #[test]
+    fn exact_facets_use_covering_relationship_indexes() {
+        let database = LibraryDatabase::open_in_memory().expect("open library");
+        for (sql, expected_index) in [
+            (
+                "SELECT 1 FROM book_contributors bc \
+                 WHERE bc.contributor_id = 1 AND bc.role = 'author'",
+                "book_contributors_contributor_role_book_idx",
+            ),
+            (
+                "SELECT 1 FROM series_memberships sm \
+                 WHERE sm.series_id = 1",
+                "series_memberships_series_index_book_idx",
+            ),
+            (
+                "SELECT 1 FROM book_tags bt WHERE bt.tag_id = 1",
+                "book_tags_tag_book_idx",
+            ),
+        ] {
+            let mut statement = database
+                .connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare query plan");
+            let details = statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .expect("explain query")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect query plan")
+                .join("\n");
+            assert!(details.contains(expected_index), "{details}");
+            assert!(details.contains("COVERING"), "{details}");
+        }
+    }
+
     #[test]
     fn saving_missing_book_is_reported() {
         let mut database = LibraryDatabase::open_in_memory().expect("open library");
@@ -3250,6 +3723,9 @@ END;
             title: "Missing".into(),
             authors: String::new(),
             series: None,
+            contributors: Vec::new(),
+            series_membership: None,
+            tags: Vec::new(),
             publisher: None,
             language: None,
             description: None,

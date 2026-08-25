@@ -306,6 +306,111 @@ pub struct Tag {
     pub name: String,
 }
 
+/// Existing or not-yet-persisted contributor selected in a book edit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContributorReference {
+    /// Reuse one stable library contributor.
+    Existing(ContributorId),
+    /// Create or reuse the contributor identified by these validated names.
+    New {
+        /// Display-ready contributor name.
+        display_name: String,
+        /// Independently editable sort name.
+        sort_name: String,
+    },
+}
+
+/// One ordered contributor credit submitted by the metadata editor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContributorCreditEdit {
+    /// Existing or new contributor identity.
+    pub contributor: ContributorReference,
+    /// Role held on this book.
+    pub role: ContributorRole,
+    /// Zero-based position within the selected role.
+    pub position: u32,
+}
+
+/// Existing or not-yet-persisted series selected in a book edit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SeriesReference {
+    /// Reuse one stable library series.
+    Existing(SeriesId),
+    /// Create or reuse the series identified by this name.
+    New(String),
+}
+
+/// Optional series relation submitted by the metadata editor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SeriesMembershipEdit {
+    /// Existing or new series identity.
+    pub series: SeriesReference,
+    /// Optional exact position within the series.
+    pub index: Option<SeriesIndex>,
+}
+
+/// Existing or not-yet-persisted tag selected in a book edit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TagReference {
+    /// Reuse one stable library tag.
+    Existing(TagId),
+    /// Create or reuse the tag identified by this name.
+    New(String),
+}
+
+/// Complete metadata-editor payload for one logical book.
+///
+/// Assets are intentionally absent: curation saves cannot detach, relink, replace, or mutate a
+/// publication file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BookEdit {
+    /// Stable logical-book identity.
+    pub id: crate::BookId,
+    /// Display title.
+    pub title: String,
+    /// Optional publisher.
+    pub publisher: Option<String>,
+    /// Optional publication language.
+    pub language: Option<String>,
+    /// Optional description or synopsis.
+    pub description: Option<String>,
+    /// Ordered contributor credits.
+    pub contributors: Vec<ContributorCreditEdit>,
+    /// Optional series relation and index.
+    pub series: Option<SeriesMembershipEdit>,
+    /// Unordered set of tags.
+    pub tags: Vec<TagReference>,
+}
+
+/// Contributor autocomplete or vocabulary row with a global usage count.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContributorUsage {
+    /// Stable contributor entity.
+    pub contributor: Contributor,
+    /// Number of distinct logical books crediting the contributor.
+    pub books: u64,
+}
+
+/// Series autocomplete or vocabulary row with a global usage count.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SeriesUsage {
+    /// Stable series entity.
+    pub series: Series,
+    /// Number of logical books in the series.
+    pub books: u64,
+}
+
+/// Tag autocomplete or vocabulary row with global usage counts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TagUsage {
+    /// Stable tag entity.
+    pub tag: Tag,
+    /// Number of logical books assigned the tag.
+    pub books: u64,
+    /// Number of saved searches that include or exclude the tag.
+    pub saved_searches: u64,
+}
+
 /// Exact fixed-point series position in millionths.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SeriesIndex(u64);

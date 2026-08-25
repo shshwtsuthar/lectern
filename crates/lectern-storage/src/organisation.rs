@@ -1,11 +1,19 @@
 //! Normalized curation schema, conservative migration, and projection integrity.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use lectern_core::organisation::{NameKind, identity_key, normalize_name};
-use rusqlite::{OptionalExtension, Transaction, params};
+use lectern_core::{
+    BookId,
+    organisation::{
+        BookEdit, Contributor, ContributorCredit, ContributorCreditEdit, ContributorId,
+        ContributorReference, ContributorRole, ContributorUsage, NameKind, Series, SeriesId,
+        SeriesIndex, SeriesMembership, SeriesMembershipEdit, SeriesReference, SeriesUsage, Tag,
+        TagId, TagReference, TagUsage, identity_key, normalize_name,
+    },
+};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use super::{Result, StorageError};
+use super::{Result, StorageError, optional_text, sortable};
 
 const ORGANISATION_SCHEMA: &str = r"
 DROP TRIGGER books_after_insert;
@@ -360,6 +368,568 @@ pub(super) fn replace_flattened_organisation(
 
 fn normalize_user_name(kind: NameKind, value: &str) -> Result<String> {
     normalize_name(kind, value).map_err(|error| StorageError::InvalidCuration(error.to_string()))
+}
+
+/// Loads authoritative contributor, series, and tag records for one complete book.
+pub(super) fn load_book_curation(
+    connection: &Connection,
+    book_id: BookId,
+) -> Result<(Vec<ContributorCredit>, Option<SeriesMembership>, Vec<Tag>)> {
+    let contributors = {
+        let mut statement = connection.prepare_cached(
+            "SELECT c.id, c.display_name, c.sort_name, bc.role, bc.position \
+             FROM book_contributors bc \
+             JOIN contributors c ON c.id = bc.contributor_id \
+             WHERE bc.book_id = ?1 \
+             ORDER BY \
+                 CASE bc.role \
+                     WHEN 'author' THEN 0 WHEN 'editor' THEN 1 WHEN 'translator' THEN 2 \
+                     WHEN 'illustrator' THEN 3 ELSE 4 \
+                 END, bc.position, c.id",
+        )?;
+        let rows = statement.query_map([book_id.value()], |row| {
+            let role = row.get::<_, String>(3)?;
+            let role = ContributorRole::parse(&role).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    format!("invalid contributor role {role:?}").into(),
+                )
+            })?;
+            Ok(ContributorCredit {
+                contributor: Contributor {
+                    id: ContributorId::new(row.get(0)?),
+                    display_name: row.get(1)?,
+                    sort_name: row.get(2)?,
+                },
+                role,
+                position: row.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let series = connection
+        .query_row(
+            "SELECT s.id, s.name, sm.series_index \
+             FROM series_memberships sm \
+             JOIN series_entities s ON s.id = sm.series_id \
+             WHERE sm.book_id = ?1",
+            [book_id.value()],
+            |row| {
+                let index = series_index_from_database(row.get(2)?, 2)?;
+                Ok(SeriesMembership {
+                    series: Series {
+                        id: SeriesId::new(row.get(0)?),
+                        name: row.get(1)?,
+                    },
+                    index,
+                })
+            },
+        )
+        .optional()?;
+
+    let tags = {
+        let mut statement = connection.prepare_cached(
+            "SELECT t.id, t.name FROM book_tags bt \
+             JOIN tags t ON t.id = bt.tag_id \
+             WHERE bt.book_id = ?1 ORDER BY t.identity_key, t.id",
+        )?;
+        let rows = statement.query_map([book_id.value()], |row| {
+            Ok(Tag {
+                id: TagId::new(row.get(0)?),
+                name: row.get(1)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    Ok((contributors, series, tags))
+}
+
+/// Atomically stores ordinary metadata and every authoritative curation relationship.
+pub(super) fn save_book_edit(transaction: &Transaction<'_>, edit: &BookEdit) -> Result<()> {
+    validate_credit_positions(&edit.contributors)?;
+
+    let changed = transaction.execute(
+        "UPDATE books SET title = ?1, sort_title = ?2, \
+         publisher = ?3, language = ?4, description = ?5, modified_at = unixepoch() \
+         WHERE id = ?6",
+        params![
+            edit.title.trim(),
+            sortable(&edit.title),
+            optional_text(edit.publisher.as_deref()),
+            optional_text(edit.language.as_deref()),
+            optional_text(edit.description.as_deref()),
+            edit.id.value(),
+        ],
+    )?;
+    if changed == 0 {
+        return Err(StorageError::BookNotFound(edit.id));
+    }
+
+    let resolved_credits = edit
+        .contributors
+        .iter()
+        .map(|credit| resolve_credit(transaction, credit))
+        .collect::<Result<Vec<_>>>()?;
+    let mut unique_credits = HashSet::with_capacity(resolved_credits.len());
+    for (contributor, role, _, _, _) in &resolved_credits {
+        if !unique_credits.insert((*contributor, *role)) {
+            return Err(StorageError::InvalidCuration(format!(
+                "contributor {contributor} appears more than once as {role}"
+            )));
+        }
+    }
+
+    let resolved_series = edit
+        .series
+        .as_ref()
+        .map(|membership| resolve_series(transaction, membership))
+        .transpose()?;
+    let mut resolved_tags = edit
+        .tags
+        .iter()
+        .map(|tag| resolve_tag(transaction, tag))
+        .collect::<Result<Vec<_>>>()?;
+    resolved_tags.sort_unstable_by_key(|(id, _, _)| *id);
+    resolved_tags.dedup_by_key(|(id, _, _)| *id);
+
+    transaction.execute(
+        "DELETE FROM book_contributors WHERE book_id = ?1",
+        [edit.id.value()],
+    )?;
+    {
+        let mut insert = transaction.prepare(
+            "INSERT INTO book_contributors( \
+                 book_id, contributor_id, role, position, \
+                 display_name_projection, sort_key_projection \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for (id, role, position, display_name, sort_key) in resolved_credits {
+            insert.execute(params![
+                edit.id.value(),
+                id.value(),
+                role.as_str(),
+                position,
+                display_name,
+                sort_key,
+            ])?;
+        }
+    }
+
+    transaction.execute(
+        "DELETE FROM series_memberships WHERE book_id = ?1",
+        [edit.id.value()],
+    )?;
+    if let Some((series_id, name, key, index)) = resolved_series {
+        transaction.execute(
+            "INSERT INTO series_memberships( \
+                 book_id, series_id, series_index, name_projection, key_projection \
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                edit.id.value(),
+                series_id.value(),
+                index.map(|value| {
+                    i64::try_from(value.scaled()).expect("valid series index fits in SQLite")
+                }),
+                name,
+                key,
+            ],
+        )?;
+    }
+
+    transaction.execute(
+        "DELETE FROM book_tags WHERE book_id = ?1",
+        [edit.id.value()],
+    )?;
+    {
+        let mut insert =
+            transaction.prepare("INSERT INTO book_tags(book_id, tag_id) VALUES (?1, ?2)")?;
+        for (tag_id, _, _) in resolved_tags {
+            insert.execute(params![edit.id.value(), tag_id.value()])?;
+        }
+    }
+
+    rebuild_book_projection(transaction, edit.id.value())
+}
+
+fn validate_credit_positions(credits: &[ContributorCreditEdit]) -> Result<()> {
+    for role in ContributorRole::ALL {
+        let mut positions = credits
+            .iter()
+            .filter(|credit| credit.role == role)
+            .map(|credit| credit.position)
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
+        if positions
+            .iter()
+            .enumerate()
+            .any(|(expected, observed)| usize::try_from(*observed) != Ok(expected))
+        {
+            return Err(StorageError::InvalidCuration(format!(
+                "{role} credit positions must be contiguous from zero"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_credit(
+    transaction: &Transaction<'_>,
+    credit: &ContributorCreditEdit,
+) -> Result<(ContributorId, ContributorRole, u32, String, String)> {
+    let (id, display_name, sort_key) = match &credit.contributor {
+        ContributorReference::Existing(id) => transaction
+            .query_row(
+                "SELECT display_name, sort_key FROM contributors WHERE id = ?1",
+                [id.value()],
+                |row| Ok((*id, row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StorageError::InvalidCuration(format!("contributor {id} does not exist"))
+            })?,
+        ContributorReference::New {
+            display_name,
+            sort_name,
+        } => {
+            let display_name = normalize_user_name(NameKind::Contributor, display_name)?;
+            let sort_name = normalize_user_name(NameKind::Contributor, sort_name)?;
+            let key = identity_key(&display_name);
+            let sort_key = identity_key(&sort_name);
+            transaction.query_row(
+                "INSERT INTO contributors(display_name, sort_name, identity_key, sort_key) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(identity_key) DO UPDATE SET identity_key = excluded.identity_key \
+                 RETURNING id, display_name, sort_key",
+                params![display_name, sort_name, key, sort_key],
+                |row| Ok((ContributorId::new(row.get(0)?), row.get(1)?, row.get(2)?)),
+            )?
+        }
+    };
+    Ok((id, credit.role, credit.position, display_name, sort_key))
+}
+
+fn resolve_series(
+    transaction: &Transaction<'_>,
+    membership: &SeriesMembershipEdit,
+) -> Result<(SeriesId, String, String, Option<SeriesIndex>)> {
+    let (id, name, key) = match &membership.series {
+        SeriesReference::Existing(id) => transaction
+            .query_row(
+                "SELECT name, identity_key FROM series_entities WHERE id = ?1",
+                [id.value()],
+                |row| Ok((*id, row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::InvalidCuration(format!("series {id} does not exist")))?,
+        SeriesReference::New(name) => {
+            let name = normalize_user_name(NameKind::Series, name)?;
+            let key = identity_key(&name);
+            transaction.query_row(
+                "INSERT INTO series_entities(name, identity_key) VALUES (?1, ?2) \
+                 ON CONFLICT(identity_key) DO UPDATE SET identity_key = excluded.identity_key \
+                 RETURNING id, name, identity_key",
+                params![name, key],
+                |row| Ok((SeriesId::new(row.get(0)?), row.get(1)?, row.get(2)?)),
+            )?
+        }
+    };
+    Ok((id, name, key, membership.index))
+}
+
+fn resolve_tag(
+    transaction: &Transaction<'_>,
+    tag: &TagReference,
+) -> Result<(TagId, String, String)> {
+    match tag {
+        TagReference::Existing(id) => transaction
+            .query_row(
+                "SELECT name, identity_key FROM tags WHERE id = ?1",
+                [id.value()],
+                |row| Ok((*id, row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::InvalidCuration(format!("tag {id} does not exist"))),
+        TagReference::New(name) => {
+            let name = normalize_user_name(NameKind::Tag, name)?;
+            let key = identity_key(&name);
+            transaction
+                .query_row(
+                    "INSERT INTO tags(name, identity_key) VALUES (?1, ?2) \
+                 ON CONFLICT(identity_key) DO UPDATE SET identity_key = excluded.identity_key \
+                 RETURNING id, name, identity_key",
+                    params![name, key],
+                    |row| Ok((TagId::new(row.get(0)?), row.get(1)?, row.get(2)?)),
+                )
+                .map_err(Into::into)
+        }
+    }
+}
+
+/// Returns selected contributors first, followed by bounded identity-prefix matches.
+pub(super) fn autocomplete_contributors(
+    connection: &Connection,
+    prefix: &str,
+    selected: &[ContributorId],
+    limit: u32,
+) -> Result<Vec<ContributorUsage>> {
+    let limit = usize::try_from(limit.min(50)).expect("limit is at most fifty");
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut results = Vec::with_capacity(limit);
+    let mut seen = HashSet::with_capacity(selected.len());
+    let mut selected_statement = connection.prepare_cached(
+        "SELECT c.display_name, c.sort_name, count(DISTINCT bc.book_id) \
+         FROM contributors c LEFT JOIN book_contributors bc ON bc.contributor_id = c.id \
+         WHERE c.id = ?1 GROUP BY c.id",
+    )?;
+    for id in selected.iter().copied().take(limit) {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(entry) = selected_statement
+            .query_row([id.value()], |row| contributor_usage_row(id, row))
+            .optional()?
+        {
+            results.push(entry);
+        }
+    }
+    if results.len() == limit {
+        return Ok(results);
+    }
+
+    let (lower, upper) = prefix_bounds(NameKind::Contributor, prefix)?;
+    let candidate_limit = i64::try_from(limit + seen.len()).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare_cached(
+        "SELECT c.id, c.display_name, c.sort_name, count(DISTINCT bc.book_id) \
+         FROM contributors c LEFT JOIN book_contributors bc ON bc.contributor_id = c.id \
+         WHERE c.identity_key >= ?1 AND c.identity_key < ?2 \
+         GROUP BY c.id ORDER BY c.identity_key, c.id LIMIT ?3",
+    )?;
+    let rows = statement.query_map(params![lower, upper, candidate_limit], |row| {
+        let id = ContributorId::new(row.get(0)?);
+        contributor_usage_row_offset(id, row, 1)
+    })?;
+    for row in rows {
+        let entry = row?;
+        if seen.insert(entry.contributor.id) {
+            results.push(entry);
+            if results.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// Returns selected series first, followed by bounded identity-prefix matches.
+pub(super) fn autocomplete_series(
+    connection: &Connection,
+    prefix: &str,
+    selected: &[SeriesId],
+    limit: u32,
+) -> Result<Vec<SeriesUsage>> {
+    let limit = usize::try_from(limit.min(50)).expect("limit is at most fifty");
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut results = Vec::with_capacity(limit);
+    let mut seen = HashSet::with_capacity(selected.len());
+    let mut selected_statement = connection.prepare_cached(
+        "SELECT s.name, count(sm.book_id) FROM series_entities s \
+         LEFT JOIN series_memberships sm ON sm.series_id = s.id \
+         WHERE s.id = ?1 GROUP BY s.id",
+    )?;
+    for id in selected.iter().copied().take(limit) {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some((name, books)) = selected_statement
+            .query_row([id.value()], |row| Ok((row.get(0)?, row.get::<_, i64>(1)?)))
+            .optional()?
+        {
+            results.push(SeriesUsage {
+                series: Series { id, name },
+                books: checked_count(books)?,
+            });
+        }
+    }
+    if results.len() == limit {
+        return Ok(results);
+    }
+
+    let (lower, upper) = prefix_bounds(NameKind::Series, prefix)?;
+    let candidate_limit = i64::try_from(limit + seen.len()).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare_cached(
+        "SELECT s.id, s.name, count(sm.book_id) FROM series_entities s \
+         LEFT JOIN series_memberships sm ON sm.series_id = s.id \
+         WHERE s.identity_key >= ?1 AND s.identity_key < ?2 \
+         GROUP BY s.id ORDER BY s.identity_key, s.id LIMIT ?3",
+    )?;
+    let rows = statement.query_map(params![lower, upper, candidate_limit], |row| {
+        Ok((
+            SeriesId::new(row.get(0)?),
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, name, books) = row?;
+        if seen.insert(id) {
+            results.push(SeriesUsage {
+                series: Series { id, name },
+                books: checked_count(books)?,
+            });
+            if results.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// Returns selected tags first, followed by bounded identity-prefix matches.
+pub(super) fn autocomplete_tags(
+    connection: &Connection,
+    prefix: &str,
+    selected: &[TagId],
+    limit: u32,
+) -> Result<Vec<TagUsage>> {
+    let limit = usize::try_from(limit.min(50)).expect("limit is at most fifty");
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut results = Vec::with_capacity(limit);
+    let mut seen = HashSet::with_capacity(selected.len());
+    let sql = "SELECT t.name, count(DISTINCT bt.book_id), \
+                      count(DISTINCT sti.saved_search_id) + count(DISTINCT ste.saved_search_id) \
+               FROM tags t LEFT JOIN book_tags bt ON bt.tag_id = t.id \
+               LEFT JOIN saved_search_included_tags sti ON sti.tag_id = t.id \
+               LEFT JOIN saved_search_excluded_tags ste ON ste.tag_id = t.id \
+               WHERE t.id = ?1 GROUP BY t.id";
+    let mut selected_statement = connection.prepare_cached(sql)?;
+    for id in selected.iter().copied().take(limit) {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some((name, books, searches)) = selected_statement
+            .query_row([id.value()], |row| {
+                Ok((row.get(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+            })
+            .optional()?
+        {
+            results.push(TagUsage {
+                tag: Tag { id, name },
+                books: checked_count(books)?,
+                saved_searches: checked_count(searches)?,
+            });
+        }
+    }
+    if results.len() == limit {
+        return Ok(results);
+    }
+
+    let (lower, upper) = prefix_bounds(NameKind::Tag, prefix)?;
+    let candidate_limit = i64::try_from(limit + seen.len()).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare_cached(
+        "SELECT t.id, t.name, count(DISTINCT bt.book_id), \
+                count(DISTINCT sti.saved_search_id) + count(DISTINCT ste.saved_search_id) \
+         FROM tags t LEFT JOIN book_tags bt ON bt.tag_id = t.id \
+         LEFT JOIN saved_search_included_tags sti ON sti.tag_id = t.id \
+         LEFT JOIN saved_search_excluded_tags ste ON ste.tag_id = t.id \
+         WHERE t.identity_key >= ?1 AND t.identity_key < ?2 \
+         GROUP BY t.id ORDER BY t.identity_key, t.id LIMIT ?3",
+    )?;
+    let rows = statement.query_map(params![lower, upper, candidate_limit], |row| {
+        Ok((
+            TagId::new(row.get(0)?),
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, name, books, searches) = row?;
+        if seen.insert(id) {
+            results.push(TagUsage {
+                tag: Tag { id, name },
+                books: checked_count(books)?,
+                saved_searches: checked_count(searches)?,
+            });
+            if results.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(results)
+}
+
+fn contributor_usage_row(
+    id: ContributorId,
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ContributorUsage> {
+    contributor_usage_row_offset(id, row, 0)
+}
+
+fn contributor_usage_row_offset(
+    id: ContributorId,
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<ContributorUsage> {
+    let count = row.get::<_, i64>(offset + 2)?;
+    let books = u64::try_from(count)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(offset + 2, count))?;
+    Ok(ContributorUsage {
+        contributor: Contributor {
+            id,
+            display_name: row.get(offset)?,
+            sort_name: row.get(offset + 1)?,
+        },
+        books,
+    })
+}
+
+fn prefix_bounds(kind: NameKind, prefix: &str) -> Result<(String, String)> {
+    if let Some((scalar_index, _)) = prefix
+        .chars()
+        .enumerate()
+        .find(|(_, character)| character.is_control())
+    {
+        return Err(StorageError::InvalidCuration(format!(
+            "{kind} prefix contains a control character at position {scalar_index}"
+        )));
+    }
+    if prefix.chars().count() > kind.maximum_scalars() {
+        return Err(StorageError::InvalidCuration(format!(
+            "{kind} prefix exceeds {} Unicode scalar values",
+            kind.maximum_scalars()
+        )));
+    }
+    let lower = identity_key(prefix);
+    let mut upper = lower.clone();
+    upper.push(char::MAX);
+    Ok((lower, upper))
+}
+
+fn checked_count(count: i64) -> Result<u64> {
+    u64::try_from(count).map_err(|_| StorageError::InvalidCount(count))
+}
+
+pub(super) fn series_index_from_database(
+    value: Option<i64>,
+    column: usize,
+) -> rusqlite::Result<Option<SeriesIndex>> {
+    value
+        .map(|value| {
+            let scaled = u64::try_from(value)
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))?;
+            SeriesIndex::from_scaled(scaled)
+                .ok_or(rusqlite::Error::IntegralValueOutOfRange(column, value))
+        })
+        .transpose()
 }
 
 /// Rebuilds every bounded browser and FTS projection for one logical book from database state.

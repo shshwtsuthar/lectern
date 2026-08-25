@@ -45,6 +45,10 @@
     {
       "name": "organisation-migration-v1",
       "budget": "benchmarks/organisation-migration-regression-v1.json"
+    },
+    {
+      "name": "organisation-query-v1",
+      "budget": "benchmarks/organisation-query-regression-v1.json"
     }
   ]
 }

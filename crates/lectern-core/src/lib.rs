@@ -250,11 +250,13 @@ pub enum SortOrder {
     Author,
     /// Show the most recently added books first.
     RecentlyAdded,
+    /// Sort by series identity and exact index, with books outside a series last.
+    Series,
 }
 
 impl SortOrder {
     /// All sort orders exposed by the application.
-    pub const ALL: [Self; 3] = [Self::Title, Self::Author, Self::RecentlyAdded];
+    pub const ALL: [Self; 4] = [Self::Title, Self::Author, Self::RecentlyAdded, Self::Series];
 }
 
 impl fmt::Display for SortOrder {
@@ -263,6 +265,7 @@ impl fmt::Display for SortOrder {
             Self::Title => formatter.write_str("Title"),
             Self::Author => formatter.write_str("Author"),
             Self::RecentlyAdded => formatter.write_str("Recently added"),
+            Self::Series => formatter.write_str("Series"),
         }
     }
 }
@@ -276,6 +279,8 @@ pub struct LibraryQuery {
     pub format: Option<BookFormat>,
     /// Optional last-observed asset-health filter.
     pub asset_health: Option<AssetHealth>,
+    /// Exact normalized entity facets combined conjunctively with search and asset filters.
+    pub facets: organisation::ExactFacets,
     /// Requested result order.
     pub sort: SortOrder,
 }
@@ -291,6 +296,8 @@ pub struct BookSummary {
     pub authors: String,
     /// Optional series name.
     pub series: Option<String>,
+    /// Optional exact series position.
+    pub series_index: Option<organisation::SeriesIndex>,
     /// Whether a cached cover thumbnail is available.
     pub has_cover: bool,
     /// Whether any attached asset was last found missing or unreadable.
@@ -338,6 +345,12 @@ pub struct Book {
     pub authors: String,
     /// Optional series name.
     pub series: Option<String>,
+    /// Authoritative ordered normalized contributor credits.
+    pub contributors: Vec<organisation::ContributorCredit>,
+    /// Authoritative optional normalized series relation.
+    pub series_membership: Option<organisation::SeriesMembership>,
+    /// Authoritative normalized tags in display-name order.
+    pub tags: Vec<organisation::Tag>,
     /// Optional publisher.
     pub publisher: Option<String>,
     /// Optional publication language.
