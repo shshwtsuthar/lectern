@@ -63,3 +63,25 @@ Use established types such as `feat`, `fix`, `perf`, `refactor`, `test`, `docs`,
 Before each commit, run the fastest relevant validation for the change. Each commit should be reviewable and leave the repository in a working state. Never rewrite, squash, or discard commits belonging to the user or another contributor unless the user explicitly requests it.
 
 If Git is unavailable or a commit cannot be created, report the exact blocker immediately. Preserve the intended commit boundary so the change can be committed separately as soon as Git is usable.
+
+## Rule #3: Follow Lectern's visual foundations
+
+Every UI implementation and review must follow `docs/ui/visual-foundations.md`. Lectern's primary
+brand color is Lectern Mauve (`#9B6AA6`), with Lectern Lavender (`#D8C4E1`) as its supporting light
+tint. Introduce these through explicitly named Lectern theme tokens rather than component-local
+literals or imported Primer names.
+
+Lectern's design system is Primer-derived, not an exact Primer implementation. Lectern Mauve
+replaces GitHub green in brand-primary roles, including primary actions. Preserve green for
+independent semantic meanings such as success; do not use it as Lectern's default primary-action
+color merely because Primer does.
+
+Nested rounded surfaces that visually follow the same corner and have a uniform inset must use
+concentric radii:
+
+```text
+innerRadius = max(outerRadius - inset, 0)
+```
+
+Do not reuse the outer radius blindly. Check the actual inset and the exceptions in the visual
+foundations before implementing or approving nested corner geometry.

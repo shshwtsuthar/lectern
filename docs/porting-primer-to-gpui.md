@@ -14,14 +14,19 @@ possible future use.
 The architectural decision is recorded in
 [ADR 0004](adr/0004-own-a-primer-inspired-gpui-ui-layer.md).
 
+Lectern's product-specific brand color and nested-surface geometry rules are defined in the
+[visual foundations](ui/visual-foundations.md). These rules supplement Primer and apply to every
+Lectern UI implementation and review. Primer is a derived starting point, not Lectern's final visual
+authority: product-specific foundations take precedence where the systems intentionally differ.
+
 ## The boundary
 
 Primer, `lectern-ui`, and GPUI answer different questions:
 
 | Layer | Owns | Does not own |
 | --- | --- | --- |
-| Primer sources | Design intent, tokens, variants, sizes, state appearance, usage guidance, accessibility expectations | Lectern's Rust API or native implementation |
-| `lectern-ui` | Typed component APIs, Primer token mapping, presentation, component composition, accessible product semantics | Low-level text editing, IME, focus machinery, platform event translation |
+| Primer sources | Derived design intent, tokens, variants, sizes, state appearance, usage guidance, accessibility expectations | Lectern's brand identity, Rust API, or native implementation |
+| `lectern-ui` | Typed component APIs, Primer token mapping, Lectern brand tokens and visual differentiation, presentation, component composition, accessible product semantics | Low-level text editing, IME, focus machinery, platform event translation |
 | `gpui-base` | Reusable control behavior, controlled state, keyboard and pointer activation, focus, accessibility roles, overlay and input infrastructure | Primer presentation or Lectern product concepts |
 | GPUI | Rendering, layout, windows, assets, actions, typed global state, and platform integration | Primer compatibility |
 | Lectern product UI | Ebook workflows such as the library grid, sidebar, book card, metadata editor, and reader toolbar | Pretending product-specific components belong to Primer |
