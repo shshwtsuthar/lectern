@@ -41,8 +41,9 @@ rules, sequence, performance evidence, and exclusions are defined in
 The target GPUI interface will use an internal, token-generated Primer design-system layer. It is a
 one-component-at-a-time application architecture rather than a general Primer port; see the
 [Primer-to-GPUI porting guide](docs/porting-primer-to-gpui.md) and
-[ADR 0004](docs/adr/0004-own-a-primer-inspired-gpui-ui-layer.md). The currently implemented desktop
-still uses egui/eframe.
+[ADR 0004](docs/adr/0004-own-a-primer-inspired-gpui-ui-layer.md). The production desktop remains on
+egui/eframe while the additive `lectern-gpui` executable carries the first migrated empty-library
+slice.
 
 The first broad library-management slice is **Organisation**: normalized contributors and series,
 flat tags, safe multi-selection and bulk tagging, exact filters, fielded search, and saved searches.
@@ -56,6 +57,8 @@ the latest stable toolchain for day-to-day development.
 
 ```sh
 cargo run
+cargo run --release -p lectern-desktop --bin lectern-gpui
+cargo run -p lectern-ui --example component_gallery
 cargo run -p lectern-cli -- stats
 cargo run -p lectern-cli -- doctor
 cargo run -p lectern-cli -- backup /path/to/library-backup.sqlite3
@@ -65,6 +68,9 @@ cargo test-all
 cargo clippy-all
 cargo fmt --all --check
 ```
+
+On Debian or Ubuntu, the GPUI executable additionally needs the XKB development libraries:
+`libxkbcommon-dev` and `libxkbcommon-x11-dev`.
 
 For a normal optimized build, run `cargo run --release`. Lectern stores its database in the
 platform application-data directory. Set `LECTERN_DATA_DIR` to use an explicit location during
@@ -92,17 +98,19 @@ crates/
 ├── lectern-core/     # Domain language and workflow contract
 ├── lectern-service/  # Application policy and workflow orchestration
 ├── lectern-desktop/  # Native application
+├── lectern-ui/       # Generated Primer tokens and native GPUI components
 ├── lectern-import/   # EPUB and PDF discovery and ingestion
 ├── lectern-storage/  # SQLite persistence
-└── lectern-cli/      # Command-line diagnostics and automation
+├── lectern-cli/      # Command-line diagnostics and automation
+└── xtask/            # Deterministic source and asset generation
 docs/
 └── adr/           # Architecture decision records
 ```
 
 Shared dependency versions live at the workspace root, while adapter-specific dependencies stay in
-their owning crates. The desktop uses egui/eframe, storage uses bundled SQLite through rusqlite,
-EPUB ingestion uses bounded ZIP, XML, and image processing, and PDF ingestion uses bounded parsing
-with a native CPU renderer.
+their owning crates. The production desktop uses egui/eframe, the additive migration target uses
+GPUI and `lectern-ui`, storage uses bundled SQLite through rusqlite, EPUB ingestion uses bounded
+ZIP, XML, and image processing, and PDF ingestion uses bounded parsing with a native CPU renderer.
 
 The storage model keeps logical metadata and cover data separate from format-specific file assets.
 Current file and folder import remains conservative and does not guess that similarly named files
