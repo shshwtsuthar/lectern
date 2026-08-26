@@ -78,6 +78,13 @@ projections. It measures a bounded 100-row manager page, application through the
 book IDs, and create/update/rename/delete lifecycle while proving that book, vocabulary, asset, and
 FTS state remains intact.
 
+The GPUI bootstrap workload in
+[`ui-bootstrap-regression-v1.json`](ui-bootstrap-regression-v1.json) launches the optimized
+`lectern-gpui` binary in 5 warmup and 40 measured fresh processes. It retains each process's raw
+sample, verifies the exact empty-library and busy-state copy, measures main entry to the first
+painted frame and Add-books dispatch to the painted busy state, and gates p95 latency plus peak RSS.
+It requires an active X11 or Wayland display.
+
 Performance-sensitive pull requests additionally run the base and candidate revisions three times
 each on the same runner. The gate compares the median of their run-level p95 values and fails a
 scenario when it exceeds both the versioned percentage limit and minimum material latency delta.
@@ -119,6 +126,8 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/bulk-tags-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/saved-searches-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/ui-bootstrap-regression-v1.json
 ```
 
 Use `--output-dir PATH` to choose a new artifact directory, or `--budget PATH` to evaluate a

@@ -64,6 +64,10 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Install GPUI Linux development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libxkbcommon-dev libxkbcommon-x11-dev
       - name: Prepare pull-request base worktree
         if: ${{ github.event_name == 'pull_request' }}
         env:

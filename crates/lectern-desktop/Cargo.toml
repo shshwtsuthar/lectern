@@ -1,6 +1,7 @@
 [package]
 name = "lectern-desktop"
 description = "Native desktop application for Lectern"
+default-run = "lectern"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,11 +11,19 @@ publish.workspace = true
 name = "lectern"
 path = "src/main.rs"
 
+[[bin]]
+name = "lectern-gpui"
+path = "src/bin/lectern_gpui.rs"
+
 [dependencies]
 crossbeam-channel.workspace = true
 eframe.workspace = true
+gpui.workspace = true
+gpui-base.workspace = true
+gpui_platform.workspace = true
 image.workspace = true
 lectern-core.workspace = true
+lectern-ui.workspace = true
 lectern-service.workspace = true
 rfd.workspace = true
 serde.workspace = true

@@ -1,0 +1,369 @@
+schema_version = 1
+
+[[tokens]]
+name = "bgColor-default"
+rust_name = "BG_COLOR_DEFAULT"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "bgColor-muted"
+rust_name = "BG_COLOR_MUTED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "fgColor-default"
+rust_name = "FG_COLOR_DEFAULT"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "fgColor-muted"
+rust_name = "FG_COLOR_MUTED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "focus-outlineColor"
+rust_name = "FOCUS_OUTLINE_COLOR"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-default-bgColor-rest"
+rust_name = "BUTTON_DEFAULT_BG_REST"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-default-bgColor-hover"
+rust_name = "BUTTON_DEFAULT_BG_HOVER"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-default-bgColor-active"
+rust_name = "BUTTON_DEFAULT_BG_ACTIVE"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-default-bgColor-disabled"
+rust_name = "BUTTON_DEFAULT_BG_DISABLED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-default-borderColor-rest"
+rust_name = "BUTTON_DEFAULT_BORDER_REST"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-default-borderColor-hover"
+rust_name = "BUTTON_DEFAULT_BORDER_HOVER"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-default-borderColor-active"
+rust_name = "BUTTON_DEFAULT_BORDER_ACTIVE"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-default-borderColor-disabled"
+rust_name = "BUTTON_DEFAULT_BORDER_DISABLED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-default-fgColor-rest"
+rust_name = "BUTTON_DEFAULT_FG_REST"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-default-fgColor-disabled"
+rust_name = "BUTTON_DEFAULT_FG_DISABLED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-primary-bgColor-rest"
+rust_name = "BUTTON_PRIMARY_BG_REST"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-primary-bgColor-hover"
+rust_name = "BUTTON_PRIMARY_BG_HOVER"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-primary-bgColor-active"
+rust_name = "BUTTON_PRIMARY_BG_ACTIVE"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-primary-bgColor-disabled"
+rust_name = "BUTTON_PRIMARY_BG_DISABLED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-primary-borderColor-rest"
+rust_name = "BUTTON_PRIMARY_BORDER_REST"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-primary-borderColor-hover"
+rust_name = "BUTTON_PRIMARY_BORDER_HOVER"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-primary-borderColor-active"
+rust_name = "BUTTON_PRIMARY_BORDER_ACTIVE"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-primary-borderColor-disabled"
+rust_name = "BUTTON_PRIMARY_BORDER_DISABLED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-primary-fgColor-rest"
+rust_name = "BUTTON_PRIMARY_FG_REST"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-primary-fgColor-disabled"
+rust_name = "BUTTON_PRIMARY_FG_DISABLED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-primary-iconColor-rest"
+rust_name = "BUTTON_PRIMARY_ICON_REST"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-primary-iconColor-disabled"
+rust_name = "BUTTON_PRIMARY_ICON_DISABLED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "borderRadius-medium"
+rust_name = "BORDER_RADIUS_MEDIUM"
+source = "functional/size/radius.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "borderWidth-thin"
+rust_name = "BORDER_WIDTH_THIN"
+source = "functional/size/border.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "base-size-16"
+rust_name = "ICON_SIZE_SMALL"
+source = "base/size/size.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "base-text-weight-semibold"
+rust_name = "TEXT_WEIGHT_SEMIBOLD"
+source = "base/typography/typography.json"
+kind = "fontWeight"
+scope = "common"
+
+[[tokens]]
+name = "focus-outline-width"
+rust_name = "FOCUS_OUTLINE_WIDTH"
+source = "functional/size/border.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "focus-outline-offset"
+rust_name = "FOCUS_OUTLINE_OFFSET"
+source = "functional/size/border.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "control-small-gap"
+rust_name = "CONTROL_SMALL_GAP"
+source = "functional/size/size.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "control-small-paddingInline-normal"
+rust_name = "CONTROL_SMALL_PADDING_INLINE"
+source = "functional/size/size.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "control-small-size"
+rust_name = "CONTROL_SMALL_SIZE"
+source = "functional/size/size.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "control-medium-gap"
+rust_name = "CONTROL_MEDIUM_GAP"
+source = "functional/size/size.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "control-medium-paddingInline-normal"
+rust_name = "CONTROL_MEDIUM_PADDING_INLINE"
+source = "functional/size/size.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "control-medium-size"
+rust_name = "CONTROL_MEDIUM_SIZE"
+source = "functional/size/size.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "control-large-gap"
+rust_name = "CONTROL_LARGE_GAP"
+source = "functional/size/size.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "control-large-paddingInline-normal"
+rust_name = "CONTROL_LARGE_PADDING_INLINE"
+source = "functional/size/size.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "control-large-size"
+rust_name = "CONTROL_LARGE_SIZE"
+source = "functional/size/size.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "space-sm"
+rust_name = "SPACE_SM"
+source = "functional/spacing/space.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "space-md"
+rust_name = "SPACE_MD"
+source = "functional/spacing/space.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "space-lg"
+rust_name = "SPACE_LG"
+source = "functional/spacing/space.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "space-xl"
+rust_name = "SPACE_XL"
+source = "functional/spacing/space.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "text-body-size-medium"
+rust_name = "TEXT_BODY_SIZE_MEDIUM"
+source = "functional/typography/typography.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "text-body-lineHeight-medium"
+rust_name = "TEXT_BODY_LINE_HEIGHT_MEDIUM"
+source = "functional/typography/typography.json"
+kind = "number"
+scope = "common"
+
+[[tokens]]
+name = "text-body-weight"
+rust_name = "TEXT_BODY_WEIGHT"
+source = "functional/typography/typography.json"
+kind = "fontWeight"
+scope = "common"
+
+[[tokens]]
+name = "text-title-size-medium"
+rust_name = "TEXT_TITLE_SIZE_MEDIUM"
+source = "functional/typography/typography.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
+name = "text-title-lineHeight-medium"
+rust_name = "TEXT_TITLE_LINE_HEIGHT_MEDIUM"
+source = "functional/typography/typography.json"
+kind = "number"
+scope = "common"
+
+[[tokens]]
+name = "text-title-weight-medium"
+rust_name = "TEXT_TITLE_WEIGHT_MEDIUM"
+source = "functional/typography/typography.json"
+kind = "fontWeight"
+scope = "common"
+
+[[icons]]
+name = "upload"
+rust_name = "Upload"

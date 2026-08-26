@@ -39,6 +39,7 @@ class CiPerformanceTests(unittest.TestCase):
                 "organisation-vocabulary-v1",
                 "bulk-tags-v1",
                 "saved-searches-v1",
+                "ui-bootstrap-v1",
             ],
         )
         self.assertIn(
@@ -59,6 +60,13 @@ class CiPerformanceTests(unittest.TestCase):
             {
                 "name": "saved-searches-v1",
                 "budget": "benchmarks/saved-searches-regression-v1.json",
+            },
+            registry["suites"],
+        )
+        self.assertIn(
+            {
+                "name": "ui-bootstrap-v1",
+                "budget": "benchmarks/ui-bootstrap-regression-v1.json",
             },
             registry["suites"],
         )

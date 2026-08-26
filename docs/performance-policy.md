@@ -71,6 +71,18 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/saved-searches-regression-v1.json
 ```
 
+GPUI bootstrap, theme, component, asset, and empty-library rendering changes require the native
+empty-library suite:
+
+```sh
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/ui-bootstrap-regression-v1.json
+```
+
+It uses release-mode fresh processes, retains 40 measured samples after 5 warmups, verifies exact
+ready and busy presentation markers, and gates first-frame and click-to-painted-busy-state p95 plus
+peak RSS. It requires an active X11 or Wayland display.
+
 The export suite is also mandatory for changes to copy buffers, publication, overwrite behavior,
 export scheduling, or export progress. Import, startup, scrolling, rendering, or memory changes
 must also run the applicable workload from

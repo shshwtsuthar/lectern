@@ -65,6 +65,10 @@
     {
       "name": "saved-searches-v1",
       "budget": "benchmarks/saved-searches-regression-v1.json"
+    },
+    {
+      "name": "ui-bootstrap-v1",
+      "budget": "benchmarks/ui-bootstrap-regression-v1.json"
     }
   ]
 }

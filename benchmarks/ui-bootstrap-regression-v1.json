@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-ui-regression-budget",
+  "workload": {
+    "query_mode": "ui-bootstrap",
+    "books": 0,
+    "seed": 0,
+    "cover_every": 0,
+    "warmup_iterations": 5,
+    "measured_iterations": 40,
+    "scenarios": [
+      "initial_render",
+      "click_to_painted_busy_state"
+    ],
+    "correctness": [
+      "exact_empty_state_copy",
+      "ready_button_label",
+      "initial_state_presented",
+      "busy_button_label",
+      "busy_state_presented"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 1.0
+  },
+  "budgets": {
+    "initial_render": {
+      "max_p95_ms": 500,
+      "max_peak_rss_bytes": 536870912
+    },
+    "click_to_painted_busy_state": {
+      "max_p95_ms": 50,
+      "max_peak_rss_bytes": 536870912
+    }
+  }
+}

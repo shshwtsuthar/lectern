@@ -2,6 +2,11 @@
 check-all = "check --workspace --all-targets --all-features --locked"
 clippy-all = "clippy --workspace --all-targets --all-features --locked -- -D warnings"
 test-all = "test --workspace --all-targets --all-features --locked"
+xtask = "run --package xtask --"
+
+[env]
+# GPUI supports loading the runtime Fontconfig library without requiring development headers.
+RUST_FONTCONFIG_DLOPEN = "1"
 
 [term]
 color = "auto"

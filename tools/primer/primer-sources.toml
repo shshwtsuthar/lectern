@@ -1,0 +1,30 @@
+schema_version = 1
+
+[primer_primitives]
+package = "@primer/primitives"
+version = "11.10.0"
+archive_url = "https://registry.npmjs.org/@primer/primitives/-/primitives-11.10.0.tgz"
+integrity = "sha512-ihZxIst4Izry284StKFjpbYvX6R/IBFTLu+qiuAmR93PsKF2hdjoabhSYwKI8iCxOUx94jVP55bI3NoY7STjYQ=="
+
+[tabler_icons]
+package = "@tabler/icons"
+version = "3.46.0"
+archive_url = "https://registry.npmjs.org/@tabler/icons/-/icons-3.46.0.tgz"
+integrity = "sha512-f2RYFl3fzPwj5WO82x6en0dmkjefxEfOm16D1ByM6cj/McNiwOkL4VaPUoP9VVIrXAD9WnTSVFr70px703b//A=="
+
+[primer_react]
+git = "https://github.com/primer/react"
+rev = "b1117811cebfb9463f20fe76f77cdf13917ae6b2"
+
+[gpui]
+git = "https://github.com/zed-industries/zed"
+rev = "8b1497dbd22fb06f5838a7c0b84a1e54fafa71bc"
+
+[gpui_platform]
+git = "https://github.com/zed-industries/zed"
+rev = "8b1497dbd22fb06f5838a7c0b84a1e54fafa71bc"
+
+[gpui_base]
+git = "https://github.com/longbridge/gpui-component"
+rev = "ff3eb1128ac1058f1bb88e777744ce1237aa3b79"
+resolved_gpui_rev = "8b1497dbd22fb06f5838a7c0b84a1e54fafa71bc"

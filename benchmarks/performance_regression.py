@@ -24,6 +24,7 @@ from typing import Any
 
 CONFIGURATION_KIND = "lectern-query-regression-budget"
 ORGANISATION_CONFIGURATION_KIND = "lectern-organisation-regression-budget"
+UI_CONFIGURATION_KIND = "lectern-ui-regression-budget"
 RESULT_KIND = "lectern-query-performance-regression"
 SCRIPT_DIRECTORY = pathlib.Path(__file__).resolve().parent
 REPOSITORY = SCRIPT_DIRECTORY.parent
@@ -83,9 +84,32 @@ def main(arguments: list[str]) -> int:
 
     try:
         workload = budget["workload"]
+        mode = workload.get("query_mode", "full")
+        if mode == "ui-bootstrap":
+            query_output = output / "ui-bootstrap.json"
+            ui_result = run_ui_bootstrap(query_output, output, workload, commands)
+            decisions = evaluate_ui_bootstrap_result(ui_result, budget)
+            report["seed"] = {
+                "requested_books": 0,
+                "stored_books": 0,
+                "metadata_seed": 0,
+                "cover_every": 0,
+            }
+            report["query"] = {
+                "path": str(query_output),
+                "library_books": 0,
+                "decisions": decisions,
+            }
+            failures = [decision for decision in decisions if not decision["passed"]]
+            if failures:
+                failed_names = ", ".join(decision["name"] for decision in failures)
+                raise RegressionError(f"UI-performance budget exceeded: {failed_names}")
+            report["status"] = "passed"
+            print(f"Performance regression passed: {output / 'performance-regression.json'}")
+            return 0
+
         database = output / "library.sqlite3"
         seed_output = output / "seed.json"
-        mode = workload.get("query_mode", "full")
         result_names = {
             "full": "queries.json",
             "page": "queries.json",
@@ -298,7 +322,11 @@ def load_budget(path: pathlib.Path) -> dict[str, Any]:
 def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
     if budget.get("schema_version") != 1:
         raise RegressionError("budget.schema_version must be 1")
-    if budget.get("kind") not in (CONFIGURATION_KIND, ORGANISATION_CONFIGURATION_KIND):
+    if budget.get("kind") not in (
+        CONFIGURATION_KIND,
+        ORGANISATION_CONFIGURATION_KIND,
+        UI_CONFIGURATION_KIND,
+    ):
         raise RegressionError(
             "budget.kind must identify a supported query or organisation workload"
         )
@@ -306,13 +334,18 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
     workload = object_field(budget, "workload", "budget")
     for field in ("books", "seed", "cover_every", "warmup_iterations", "measured_iterations"):
         positive_or_zero_field(workload, field, "budget.workload")
-    if workload["books"] == 0:
+    query_mode = workload.get("query_mode", "full")
+    if query_mode == "ui-bootstrap":
+        if any(workload[field] != 0 for field in ("books", "seed", "cover_every")):
+            raise RegressionError(
+                "UI bootstrap workload books, seed, and cover_every must be zero"
+            )
+    elif workload["books"] == 0:
         raise RegressionError("budget.workload.books must be greater than zero")
     if workload["measured_iterations"] == 0:
         raise RegressionError(
             "budget.workload.measured_iterations must be greater than zero"
         )
-    query_mode = workload.get("query_mode", "full")
     if query_mode not in (
         "full",
         "page",
@@ -329,12 +362,18 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "bulk-tags",
         "saved-searches",
         "maintenance",
+        "ui-bootstrap",
     ):
         raise RegressionError(
             "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
             "'remove', 'detach', 'attach', 'replace', 'export', 'reimport', "
             "'organisation-migration', 'organisation-query', "
-            "'organisation-vocabulary', 'bulk-tags', 'saved-searches', or 'maintenance'"
+            "'organisation-vocabulary', 'bulk-tags', 'saved-searches', 'maintenance', "
+            "or 'ui-bootstrap'"
+        )
+    if (query_mode == "ui-bootstrap") != (budget["kind"] == UI_CONFIGURATION_KIND):
+        raise RegressionError(
+            "ui-bootstrap query_mode and lectern-ui-regression-budget kind must be used together"
         )
     if query_mode == "full":
         scenario_names = workload.get("full_library_scenarios")
@@ -482,6 +521,12 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(scenario_budget, dict):
             raise RegressionError(f"budget for {name!r} must be an object")
         positive_number_field(scenario_budget, "max_p95_ms", f"budget {name!r}")
+        if query_mode == "ui-bootstrap":
+            positive_or_zero_field(
+                scenario_budget,
+                "max_peak_rss_bytes",
+                f"budget {name!r}",
+            )
         if query_mode == "export":
             positive_number_field(
                 scenario_budget,
@@ -1470,6 +1515,210 @@ def evaluate_bulk_tag_result(
             "passed": p95_ms <= maximum_ms and peak_rss <= maximum_rss,
         }
     ]
+
+
+def run_ui_bootstrap(
+    output: pathlib.Path,
+    artifact_directory: pathlib.Path,
+    workload: dict[str, Any],
+    commands: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Measure GPUI startup and the Add-books ready-to-busy paint transition."""
+
+    run_command(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "lectern-desktop",
+            "--bin",
+            "lectern-gpui",
+        ],
+        commands,
+        timeout_seconds=1_800,
+    )
+    target_directory = pathlib.Path(
+        os.environ.get("CARGO_TARGET_DIR", str(REPOSITORY / "target"))
+    )
+    if not target_directory.is_absolute():
+        target_directory = REPOSITORY / target_directory
+    executable = target_directory / "release/lectern-gpui"
+    if sys.platform == "win32":
+        executable = executable.with_suffix(".exe")
+    if not executable.is_file():
+        raise RegressionError(f"release GPUI executable is missing: {executable}")
+
+    warmup = workload["warmup_iterations"]
+    measured = workload["measured_iterations"]
+    samples_directory = artifact_directory / "ui-samples"
+    samples_directory.mkdir()
+    measured_samples: list[dict[str, Any]] = []
+    raw_paths: list[str] = []
+    for index in range(warmup + measured):
+        phase = "warmup" if index < warmup else "measured"
+        phase_index = index if phase == "warmup" else index - warmup
+        sample_path = samples_directory / f"{phase}-{phase_index:03d}.json"
+        environment = os.environ.copy()
+        environment["LECTERN_GPUI_BENCHMARK_OUTPUT"] = str(sample_path)
+        run_command(
+            [str(executable)],
+            commands,
+            environment=environment,
+            timeout_seconds=15,
+        )
+        sample = read_json(sample_path)
+        validate_ui_bootstrap_sample(sample, sample_path)
+        raw_paths.append(str(sample_path))
+        if phase == "measured":
+            measured_samples.append(sample)
+
+    initial_ns = [
+        round(float(sample["initial_render_ms"]) * 1_000_000)
+        for sample in measured_samples
+    ]
+    busy_ns = [
+        round(float(sample["click_to_busy_paint_ms"]) * 1_000_000)
+        for sample in measured_samples
+    ]
+    peak_samples = [
+        sample["peak_rss_bytes"]
+        for sample in measured_samples
+        if sample.get("peak_rss_bytes") is not None
+    ]
+    peak_rss = max(peak_samples) if peak_samples else None
+    result = {
+        "kind": "lectern-ui-bootstrap-performance",
+        "library_books": 0,
+        "warmup_iterations": warmup,
+        "measured_iterations": measured,
+        "raw_samples": raw_paths,
+        "correctness": measured_samples[0]["correctness"],
+        "scenarios": [
+            ui_scenario("initial_render", initial_ns, peak_rss),
+            ui_scenario("click_to_painted_busy_state", busy_ns, peak_rss),
+        ],
+    }
+    write_json(output, result)
+    return result
+
+
+def validate_ui_bootstrap_sample(sample: dict[str, Any], path: pathlib.Path) -> None:
+    context = f"UI sample {path.name}"
+    if sample.get("schema_version") != 1:
+        raise RegressionError(f"{context} schema_version must be 1")
+    if sample.get("workload") != "empty-library-add-books":
+        raise RegressionError(f"{context} workload identity is invalid")
+    positive_number_field(sample, "initial_render_ms", context)
+    positive_number_field(sample, "click_to_busy_paint_ms", context)
+    peak_rss = sample.get("peak_rss_bytes")
+    if peak_rss is not None and positive_or_zero_field(sample, "peak_rss_bytes", context) == 0:
+        raise RegressionError(f"{context} peak_rss_bytes must be positive when present")
+    if sample.get("correctness") != expected_ui_correctness():
+        raise RegressionError(f"{context} correctness markers are invalid")
+
+
+def expected_ui_correctness() -> dict[str, Any]:
+    return {
+        "heading": "Your library is empty",
+        "explanation": "Add EPUB or PDF files to start building your library.",
+        "ready_button_label": "Add books",
+        "busy_button_label": "Adding books…",
+        "initial_state_presented": True,
+        "busy_state_presented": True,
+    }
+
+
+def ui_scenario(name: str, samples_ns: list[int], peak_rss: int | None) -> dict[str, Any]:
+    return {
+        "name": name,
+        "samples_ns": samples_ns,
+        "latency_ms": {"p95": nearest_rank_p95(samples_ns) / 1_000_000},
+        "peak_rss_bytes": peak_rss,
+    }
+
+
+def nearest_rank_p95(samples: list[int]) -> int:
+    if not samples:
+        raise RegressionError("p95 requires at least one retained sample")
+    ordered = sorted(samples)
+    return ordered[math.ceil(len(ordered) * 0.95) - 1]
+
+
+def evaluate_ui_bootstrap_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "UI bootstrap result"
+    if result.get("kind") != "lectern-ui-bootstrap-performance":
+        raise RegressionError(f"{context} kind is invalid")
+    if positive_or_zero_field(result, "library_books", context) != 0:
+        raise RegressionError(f"{context} must use an empty library")
+    if result.get("correctness") != expected_ui_correctness():
+        raise RegressionError(f"{context} correctness markers are invalid")
+    warmup = positive_or_zero_field(result, "warmup_iterations", context)
+    measured = positive_or_zero_field(result, "measured_iterations", context)
+    if warmup != workload["warmup_iterations"] or measured != workload["measured_iterations"]:
+        raise RegressionError(f"{context} iteration counts do not match the budget")
+    raw_samples = result.get("raw_samples")
+    if (
+        not isinstance(raw_samples, list)
+        or len(raw_samples) != warmup + measured
+        or not all(isinstance(path, str) and path for path in raw_samples)
+    ):
+        raise RegressionError(f"{context} must retain every raw sample path")
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError(f"{context} must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, scenario in enumerate(scenarios):
+        scenario_context = f"UI scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{scenario_context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{scenario_context}.name must be unique")
+        samples = positive_samples(scenario, scenario_context, measured)
+        p95_ms = positive_number_field(
+            object_field(scenario, "latency_ms", scenario_context),
+            "p95",
+            f"{scenario_context}.latency_ms",
+        )
+        expected_p95_ms = nearest_rank_p95(samples) / 1_000_000
+        if not math.isclose(p95_ms, expected_p95_ms, rel_tol=0.0, abs_tol=1e-9):
+            raise RegressionError(f"{scenario_context} p95 does not match retained samples")
+        peak_rss = scenario.get("peak_rss_bytes")
+        if peak_rss is not None and positive_or_zero_field(
+            scenario, "peak_rss_bytes", scenario_context
+        ) == 0:
+            raise RegressionError(f"{scenario_context} peak RSS must be positive")
+        by_name[name] = scenario
+
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("UI scenarios do not match the versioned budget")
+    decisions = []
+    for name in sorted(expected_names):
+        scenario = by_name[name]
+        scenario_budget = budget["budgets"][name]
+        p95_ms = float(scenario["latency_ms"]["p95"])
+        maximum_ms = float(scenario_budget["max_p95_ms"])
+        peak_rss = scenario.get("peak_rss_bytes")
+        maximum_rss = scenario_budget["max_peak_rss_bytes"]
+        memory_passed = peak_rss is None or peak_rss <= maximum_rss
+        decisions.append(
+            {
+                "name": name,
+                "p95_ms": p95_ms,
+                "max_p95_ms": maximum_ms,
+                "sample_count": measured,
+                "peak_rss_bytes": peak_rss,
+                "max_peak_rss_bytes": maximum_rss,
+                "passed": p95_ms <= maximum_ms and memory_passed,
+            }
+        )
+    return decisions
 
 
 def run_bulk_tag_desktop(
