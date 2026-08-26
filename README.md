@@ -38,12 +38,12 @@ single-asset export without adding another parser or deleting externally referen
 rules, sequence, performance evidence, and exclusions are defined in
 [`docs/asset-management-scope.md`](docs/asset-management-scope.md).
 
-The target GPUI interface will use an internal, token-generated Primer design-system layer. It is a
+The target GPUI interface uses an internal, token-generated Primer design-system layer. It is a
 one-component-at-a-time application architecture rather than a general Primer port; see the
 [Primer-to-GPUI porting guide](docs/porting-primer-to-gpui.md) and
-[ADR 0004](docs/adr/0004-own-a-primer-inspired-gpui-ui-layer.md). The production desktop remains on
-egui/eframe while the additive `lectern-gpui` executable carries the first migrated empty-library
-slice.
+[ADR 0004](docs/adr/0004-own-a-primer-inspired-gpui-ui-layer.md). The default desktop launch now
+shows the first migrated GPUI empty-library slice. The existing egui/eframe interface remains
+available explicitly as the `lectern` binary while its journeys are ported incrementally.
 
 The first broad library-management slice is **Organisation**: normalized contributors and series,
 flat tags, safe multi-selection and bulk tagging, exact filters, fielded search, and saved searches.
@@ -57,7 +57,7 @@ the latest stable toolchain for day-to-day development.
 
 ```sh
 cargo run
-cargo run --release -p lectern-desktop --bin lectern-gpui
+cargo run --release --bin lectern
 cargo run -p lectern-ui --example component_gallery
 cargo run -p lectern-cli -- stats
 cargo run -p lectern-cli -- doctor
