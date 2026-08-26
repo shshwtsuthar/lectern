@@ -68,6 +68,8 @@ python3 benchmarks/performance_regression.py \
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/bulk-tags-regression-v1.json
 python3 benchmarks/performance_regression.py \
+  --budget benchmarks/bulk-remove-regression-v1.json
+python3 benchmarks/performance_regression.py \
   --budget benchmarks/saved-searches-regression-v1.json
 ```
 

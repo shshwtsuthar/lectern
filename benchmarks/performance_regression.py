@@ -124,6 +124,7 @@ def main(arguments: list[str]) -> int:
             "organisation-query": "organisation-queries.json",
             "organisation-vocabulary": "organisation-vocabulary.json",
             "bulk-tags": "organisation-bulk-tags.json",
+            "bulk-remove": "organisation-bulk-remove.json",
             "saved-searches": "organisation-saved-searches.json",
             "maintenance": "maintenance.json",
         }
@@ -136,6 +137,7 @@ def main(arguments: list[str]) -> int:
             "organisation-query",
             "organisation-vocabulary",
             "bulk-tags",
+            "bulk-remove",
             "saved-searches",
         ):
             validate_organisation_query_seed_result(seed, workload)
@@ -174,6 +176,8 @@ def main(arguments: list[str]) -> int:
             )
             desktop_result = read_json(desktop_output)
             decisions += evaluate_bulk_tag_desktop_result(desktop_result, budget)
+        elif mode == "bulk-remove":
+            decisions = evaluate_bulk_remove_result(query_result, budget)
         elif mode == "saved-searches":
             decisions = evaluate_saved_search_result(query_result, budget)
         elif mode == "maintenance":
@@ -222,6 +226,7 @@ def seed_command(
         "organisation-query",
         "organisation-vocabulary",
         "bulk-tags",
+        "bulk-remove",
         "saved-searches",
     ):
         command += ["--bin", "organisation-query-benchmark", "--", "seed"]
@@ -254,7 +259,7 @@ def workload_command(
         command += ["--bin", "organisation-query-benchmark", "--", "query"]
     elif mode == "organisation-vocabulary":
         command += ["--bin", "organisation-vocabulary-benchmark", "--"]
-    elif mode == "bulk-tags":
+    elif mode in ("bulk-tags", "bulk-remove"):
         command += ["--bin", "organisation-bulk-benchmark", "--"]
     elif mode == "saved-searches":
         command += ["--bin", "organisation-saved-search-benchmark", "--"]
@@ -274,8 +279,8 @@ def workload_command(
                 "maintenance": "maintenance",
             }[mode],
         ]
-    if mode in ("bulk-tags", "saved-searches"):
-        return command + [
+    if mode in ("bulk-tags", "bulk-remove", "saved-searches"):
+        command += [
             "--database",
             str(database),
             "--output",
@@ -287,6 +292,9 @@ def workload_command(
             "--warmup",
             str(workload["warmup_iterations"]),
         ]
+        if mode == "bulk-remove":
+            command += ["--operation", "remove"]
+        return command
     return command + [
         "--database",
         str(database),
@@ -360,6 +368,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "organisation-query",
         "organisation-vocabulary",
         "bulk-tags",
+        "bulk-remove",
         "saved-searches",
         "maintenance",
         "ui-bootstrap",
@@ -368,7 +377,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
             "'remove', 'detach', 'attach', 'replace', 'export', 'reimport', "
             "'organisation-migration', 'organisation-query', "
-            "'organisation-vocabulary', 'bulk-tags', 'saved-searches', 'maintenance', "
+            "'organisation-vocabulary', 'bulk-tags', 'bulk-remove', 'saved-searches', 'maintenance', "
             "or 'ui-bootstrap'"
         )
     if (query_mode == "ui-bootstrap") != (budget["kind"] == UI_CONFIGURATION_KIND):
@@ -475,6 +484,12 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 raise RegressionError(
                     "bulk-tag compositor warmup and measured operations must total an even number"
                 )
+        if query_mode == "bulk-remove":
+            for field in ("page_size", "matching_books"):
+                if positive_or_zero_field(workload, field, "budget.workload") == 0:
+                    raise RegressionError(
+                        f"bulk removal workload {field} must be greater than zero"
+                    )
         if query_mode == "saved-searches":
             for field in (
                 "contributors",
@@ -551,6 +566,12 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 f"budget {name!r}",
             )
         if query_mode == "bulk-tags" and name == "bulk_tag_apply_and_refresh":
+            positive_or_zero_field(
+                scenario_budget,
+                "max_peak_rss_delta_bytes",
+                f"budget {name!r}",
+            )
+        if query_mode == "bulk-remove" and name == "bulk_remove_and_refresh":
             positive_or_zero_field(
                 scenario_budget,
                 "max_peak_rss_delta_bytes",
@@ -1508,6 +1529,81 @@ def evaluate_bulk_tag_result(
     return [
         {
             "name": "bulk_tag_apply_and_refresh",
+            "p95_ms": p95_ms,
+            "max_p95_ms": maximum_ms,
+            "peak_rss_delta_bytes": peak_rss,
+            "max_peak_rss_delta_bytes": maximum_rss,
+            "passed": p95_ms <= maximum_ms and peak_rss <= maximum_rss,
+        }
+    ]
+
+
+def evaluate_bulk_remove_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "bulk removal result"
+    if result.get("kind") != "organisation-bulk-remove":
+        raise RegressionError("bulk removal result kind is invalid")
+    expected_fields = {
+        "library_books": workload["books"],
+        "matching_books": workload["matching_books"],
+        "final_library_books": workload["books"] - workload["matching_books"],
+        "warmup_iterations": workload["warmup_iterations"],
+        "measured_iterations": workload["measured_iterations"],
+        "page_size": workload["page_size"],
+    }
+    for field, expected in expected_fields.items():
+        if positive_or_zero_field(result, field, context) != expected:
+            raise RegressionError(f"bulk removal {field} does not match the budget")
+    checks = result.get("verified_checks")
+    if not isinstance(checks, list) or set(checks) != set(workload["correctness"]):
+        raise RegressionError("bulk removal correctness checks did not reconcile")
+    if positive_or_zero_field(result, "selection_materialized_summaries", context) != 0:
+        raise RegressionError("bulk removal selection materialized book summaries")
+    if result.get("source_bytes_unchanged") is not True:
+        raise RegressionError("bulk removal changed publication source bytes")
+    source_file = result.get("source_file")
+    if not isinstance(source_file, str) or not source_file:
+        raise RegressionError("bulk removal source-file evidence is missing")
+    peak_rss = positive_or_zero_field(result, "peak_rss_delta_bytes", context)
+
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or len(scenarios) != 1:
+        raise RegressionError("bulk removal result must contain one storage scenario")
+    scenario = scenarios[0]
+    if not isinstance(scenario, dict) or scenario.get("name") != "bulk_remove_and_refresh":
+        raise RegressionError("bulk removal storage scenario is invalid")
+    operations = workload["warmup_iterations"] + workload["measured_iterations"]
+    exact_counts = {
+        "successful_operations": operations,
+        "books_removed_per_operation": workload["matching_books"],
+        "refreshed_library_books": workload["books"] - workload["matching_books"],
+        "refreshed_result_count": workload["page_size"],
+    }
+    for field, expected in exact_counts.items():
+        if positive_or_zero_field(scenario, field, "bulk removal scenario") != expected:
+            raise RegressionError(f"bulk removal scenario {field} did not reconcile")
+    for field in ("samples_ns", "removal_samples_ns", "refresh_samples_ns"):
+        samples = scenario.get(field)
+        if not isinstance(samples, list) or len(samples) != workload["measured_iterations"]:
+            raise RegressionError(f"bulk removal {field} count does not match the budget")
+        if any(
+            isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+            for sample in samples
+        ):
+            raise RegressionError(f"bulk removal {field} must contain positive integers")
+    latency = object_field(scenario, "latency_ms", "bulk removal scenario")
+    p95_ms = positive_number_field(latency, "p95", "bulk removal scenario latency")
+    for field in ("removal_latency_ms", "refresh_latency_ms"):
+        component = object_field(scenario, field, "bulk removal scenario")
+        positive_number_field(component, "p95", f"bulk removal scenario {field}")
+    scenario_budget = budget["budgets"]["bulk_remove_and_refresh"]
+    maximum_ms = float(scenario_budget["max_p95_ms"])
+    maximum_rss = scenario_budget["max_peak_rss_delta_bytes"]
+    return [
+        {
+            "name": "bulk_remove_and_refresh",
             "p95_ms": p95_ms,
             "max_p95_ms": maximum_ms,
             "peak_rss_delta_bytes": peak_rss,

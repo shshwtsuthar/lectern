@@ -17,10 +17,11 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 use lectern_core::organisation::{
-    BookEdit, BookSelection, BulkTagEdit, BulkTagResult, ContributorId, ContributorUsage,
-    LibraryGeneration, NameKind, SavedSearch, SavedSearchId, SearchClause, SearchExpression,
-    SearchParseError, SelectionSnapshot, SelectionTagUsage, SeriesId, SeriesUsage, TagId,
-    TagReference, TagUsage, TextMatch, VocabularyMutationResult, identity_key, normalize_name,
+    BookEdit, BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, ContributorId,
+    ContributorUsage, LibraryGeneration, NameKind, SavedSearch, SavedSearchId, SearchClause,
+    SearchExpression, SearchParseError, SelectionSnapshot, SelectionTagUsage, SeriesId,
+    SeriesUsage, TagId, TagReference, TagUsage, TextMatch, VocabularyMutationResult, identity_key,
+    normalize_name,
 };
 use lectern_core::{
     AssetHealth, AssetHealthReport, AssetId, AssetStorage, BackupReport, Book, BookAsset,
@@ -943,6 +944,77 @@ impl LibraryDatabase {
             relationships_removed,
             tags_created,
         })
+    }
+
+    /// Removes a compact target set in one durable transaction.
+    ///
+    /// Cascading foreign keys remove the selected books' asset relationships, cached covers, and
+    /// organization relationships. Publication files are never opened, modified, or deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target is stale or the deletion cannot commit atomically.
+    pub fn remove_books(&mut self, selection: &BookSelection) -> Result<BulkRemovalResult> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (books_matched, _) =
+            prepare_selection(&transaction, selection, self.logical_generation.get())?;
+        let suspended_triggers = suspend_bulk_removal_triggers(&transaction)?;
+        transaction.execute(
+            "INSERT INTO books_fts( \
+                 books_fts, rowid, title, authors_search, contributors_search, \
+                 series, publisher, tags_search \
+             ) \
+             SELECT \
+                 'delete', b.id, b.title, b.authors_search, b.contributors_search, \
+                 b.series, b.publisher, b.tags_search \
+             FROM books b \
+             JOIN temp.lectern_selected_books selected ON selected.book_id = b.id",
+            [],
+        )?;
+        transaction.execute(
+            "DELETE FROM book_tags \
+             WHERE book_id IN (SELECT book_id FROM temp.lectern_selected_books)",
+            [],
+        )?;
+        transaction.execute(
+            "DELETE FROM series_memberships \
+             WHERE book_id IN (SELECT book_id FROM temp.lectern_selected_books)",
+            [],
+        )?;
+        transaction.execute(
+            "DELETE FROM book_contributors \
+             WHERE book_id IN (SELECT book_id FROM temp.lectern_selected_books)",
+            [],
+        )?;
+        transaction.execute(
+            "DELETE FROM book_covers \
+             WHERE book_id IN (SELECT book_id FROM temp.lectern_selected_books)",
+            [],
+        )?;
+        transaction.execute(
+            "DELETE FROM book_assets \
+             WHERE book_id IN (SELECT book_id FROM temp.lectern_selected_books)",
+            [],
+        )?;
+        let books_removed = u64::try_from(transaction.execute(
+            "DELETE FROM books \
+             WHERE id IN (SELECT book_id FROM temp.lectern_selected_books)",
+            [],
+        )?)
+        .map_err(|_| StorageError::InvalidCuration("bulk removed-row count exceeds u64".into()))?;
+        if books_removed != books_matched {
+            return Err(StorageError::Integrity(format!(
+                "bulk removal matched {books_matched} books but removed {books_removed}"
+            )));
+        }
+        restore_bulk_removal_triggers(&transaction, &suspended_triggers)?;
+        transaction.commit()?;
+        if books_removed > 0 {
+            self.bump_generation();
+        }
+        Ok(BulkRemovalResult { books_removed })
     }
 
     /// Loads complete editable metadata and every asset for one logical book.
@@ -2743,6 +2815,45 @@ fn prepare_bulk_tag_tables(transaction: &Transaction<'_>) -> Result<u64> {
     Ok(u64::try_from(cleared_add + cleared_remove).expect("SQLite changed-row count fits u64"))
 }
 
+const BULK_REMOVAL_TRIGGERS: [&str; 3] = [
+    "book_covers_after_delete_summary",
+    "book_assets_after_delete_summary",
+    "books_after_delete",
+];
+
+fn suspend_bulk_removal_triggers(transaction: &Transaction<'_>) -> Result<[String; 3]> {
+    let definitions = BULK_REMOVAL_TRIGGERS
+        .map(|name| {
+            transaction
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+                    [name],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(StorageError::from)
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .try_into()
+        .expect("three trigger definitions produce a three-element array");
+    transaction.execute_batch(
+        "DROP TRIGGER book_covers_after_delete_summary; \
+         DROP TRIGGER book_assets_after_delete_summary; \
+         DROP TRIGGER books_after_delete;",
+    )?;
+    Ok(definitions)
+}
+
+fn restore_bulk_removal_triggers(
+    transaction: &Transaction<'_>,
+    definitions: &[String; 3],
+) -> Result<()> {
+    for definition in definitions {
+        transaction.execute_batch(definition)?;
+    }
+    Ok(())
+}
+
 fn resolve_bulk_tag(
     transaction: &Transaction<'_>,
     reference: &TagReference,
@@ -4400,6 +4511,140 @@ END;
             b"publication"
         );
         assert!(!database.remove_book(id).expect("remove absent book"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn bulk_removal_is_atomic_exact_generation_safe_and_keeps_source_files() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let source = TestAsset::file("bulk-remove-source");
+        let mut target_ids = Vec::new();
+        for index in 0..12 {
+            let title = if index < 10 {
+                format!("Target {index}")
+            } else {
+                format!("Other {index}")
+            };
+            let path = if index == 0 {
+                source.path().to_str().expect("UTF-8 test path").to_owned()
+            } else {
+                format!("/books/bulk-remove-{index}.epub")
+            };
+            let mut imported = record(&path, &title, "Bulk Author");
+            if index == 0 {
+                imported.cover_thumbnail = Some(vec![1, 2, 3]);
+            }
+            let id = database.import_books(&[imported]).expect("seed book")[0];
+            if index < 10 {
+                target_ids.push(id);
+            }
+        }
+        let target_query = LibraryQuery {
+            search: "title:Target".into(),
+            ..LibraryQuery::default()
+        };
+        let snapshot = database
+            .selection_snapshot(&target_query)
+            .expect("selection snapshot");
+        assert_eq!(snapshot.matching_books, 10);
+        let excluded = target_ids[3];
+        let selection =
+            BookSelection::all_matching(target_query.clone(), snapshot.generation, vec![excluded]);
+
+        let result = database
+            .remove_books(&selection)
+            .expect("bulk remove books");
+        assert_eq!(result.books_removed, 9);
+        assert_eq!(database.count().expect("count books"), 3);
+        assert!(
+            database
+                .get_book(excluded)
+                .expect("load exclusion")
+                .is_some()
+        );
+        assert_eq!(
+            database.load_cover(target_ids[0]).expect("load cover"),
+            None
+        );
+        assert_eq!(
+            database
+                .query(&target_query)
+                .expect("search remaining targets")
+                .iter()
+                .map(|book| book.id)
+                .collect::<Vec<_>>(),
+            vec![excluded]
+        );
+        assert_eq!(
+            fs::read(source.path()).expect("read source"),
+            b"publication"
+        );
+
+        let assets: i64 = database
+            .connection
+            .query_row("SELECT count(*) FROM book_assets", [], |row| row.get(0))
+            .expect("count assets");
+        assert_eq!(assets, 3);
+        let removal_triggers: i64 = database
+            .connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema \
+                 WHERE type = 'trigger' AND name IN ( \
+                     'book_covers_after_delete_summary', \
+                     'book_assets_after_delete_summary', \
+                     'books_after_delete' \
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count restored removal triggers");
+        assert_eq!(removal_triggers, 3);
+        database
+            .connection
+            .execute(
+                "INSERT INTO books_fts(books_fts, rank) VALUES ('integrity-check', 1)",
+                [],
+            )
+            .expect("validate FTS after bulk removal");
+
+        let stale_snapshot = database
+            .selection_snapshot(&target_query)
+            .expect("fresh snapshot");
+        let stale =
+            BookSelection::all_matching(target_query, stale_snapshot.generation, Vec::new());
+        database
+            .import_books(&[record(
+                "/books/bulk-remove-generation.epub",
+                "Generation change",
+                "Bulk Author",
+            )])
+            .expect("change generation");
+        assert!(matches!(
+            database.remove_books(&stale),
+            Err(StorageError::StaleSelection)
+        ));
+        assert!(
+            database
+                .get_book(excluded)
+                .expect("load exclusion")
+                .is_some()
+        );
+
+        let explicit = BookSelection::explicit(vec![excluded, excluded, BookId::new(404)]);
+        assert_eq!(
+            database
+                .remove_books(&explicit)
+                .expect("remove explicit selection")
+                .books_removed,
+            1
+        );
+        assert_eq!(
+            database
+                .remove_books(&BookSelection::explicit(Vec::new()))
+                .expect("remove empty selection")
+                .books_removed,
+            0
+        );
     }
 
     #[test]

@@ -525,6 +525,13 @@ pub struct BulkTagResult {
     pub tags_created: u64,
 }
 
+/// Exact outcome of one atomic, committed bulk library removal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BulkRemovalResult {
+    /// Logical books removed from the library.
+    pub books_removed: u64,
+}
+
 /// Observed state of one tag across a target selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectionTagUsage {

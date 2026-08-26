@@ -72,6 +72,15 @@ materializing them, applies and reverses an atomic tag edit, checks exact relati
 results, and retains 40 native compositor samples for both dispatch and completion-to-painted-grid.
 It requires an active X11 or Wayland display; CI runs it under an isolated X11 display.
 
+The bulk-removal gate in
+[`bulk-remove-regression-v1.json`](bulk-remove-regression-v1.json) resolves a compact query-backed
+selection of 10,000 books and removes it in one transaction before refreshing the first bounded
+library page. Independent fixture copies retain 40 raw samples while verifying exact cascades for
+assets, covers, organisation relationships, and FTS; unchanged vocabulary and saved searches;
+rollback and stale-selection safety; bounded memory; and byte-for-byte preservation of a real
+publication source file. Durable removal plus the first refreshed page has a 3.5 second p95 budget,
+and additional process RSS is capped at 32 MiB.
+
 The saved-search gate in
 [`saved-searches-regression-v1.json`](saved-searches-regression-v1.json) uses 250 complete canonical
 projections. It measures a bounded 100-row manager page, application through the first 128 matching
@@ -124,6 +133,8 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-vocabulary-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/bulk-tags-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/bulk-remove-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/saved-searches-regression-v1.json
 python3 benchmarks/performance_regression.py \

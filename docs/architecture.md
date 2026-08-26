@@ -52,8 +52,9 @@ matching count, while later windows skip the repeated count. The desktop retains
 windows and at most one queued query request. A bounded worker pool loads and decodes cover
 thumbnails, a metadata worker serializes edits, and dedicated import and asset-maintenance workers
 perform filesystem and write-heavy work off the UI thread. The metadata worker also serializes
-confirmed single-book removal, which deletes library records and cached data while leaving source
-files untouched. Asset scans check referenced paths with
+confirmed single- and bulk-book removal. Bulk removal resolves a compact selection and uses one
+set-based transaction; both forms delete library records and cached data while leaving source files
+untouched. Asset scans check referenced paths with
 metadata and openability checks, then persist only changed health states in one transaction;
 relinking validates publication structure without regenerating thumbnails. Explicit format
 attachment validates the selected publication before atomically adding a referenced asset, leaving

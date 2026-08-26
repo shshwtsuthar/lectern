@@ -63,6 +63,10 @@
       "budget": "benchmarks/bulk-tags-regression-v1.json"
     },
     {
+      "name": "bulk-remove-v1",
+      "budget": "benchmarks/bulk-remove-regression-v1.json"
+    },
+    {
       "name": "saved-searches-v1",
       "budget": "benchmarks/saved-searches-regression-v1.json"
     },

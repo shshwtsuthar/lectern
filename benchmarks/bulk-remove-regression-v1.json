@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-organisation-regression-budget",
+  "workload": {
+    "query_mode": "bulk-remove",
+    "books": 50000,
+    "seed": 20260825,
+    "cover_every": 3,
+    "contributors": 20000,
+    "series": 2500,
+    "tags": 500,
+    "tags_per_book": 8,
+    "saved_searches": 250,
+    "matching_books": 10000,
+    "page_size": 128,
+    "warmup_iterations": 10,
+    "measured_iterations": 40,
+    "scenarios": [
+      "bulk_remove_and_refresh"
+    ],
+    "correctness": [
+      "exact_removed_and_remaining_counts",
+      "asset_cover_and_organisation_cascades",
+      "fts_and_query_visibility",
+      "vocabulary_and_saved_searches_unchanged",
+      "publication_source_bytes_unchanged",
+      "foreign_keys_and_fts_integrity",
+      "stale_query_selection_rejected",
+      "injected_failure_rolls_back",
+      "selection_does_not_materialize_book_summaries"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 5.0
+  },
+  "budgets": {
+    "bulk_remove_and_refresh": {
+      "max_p95_ms": 3500,
+      "max_peak_rss_delta_bytes": 33554432
+    }
+  }
+}

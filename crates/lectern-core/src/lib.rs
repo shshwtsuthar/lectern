@@ -658,6 +658,12 @@ pub trait LibraryService {
         edit: &organisation::BulkTagEdit,
     ) -> Result<organisation::BulkTagResult, Self::Error>;
 
+    /// Atomically removes a compact selection while leaving publication files untouched.
+    fn remove_books(
+        &mut self,
+        selection: &organisation::BookSelection,
+    ) -> Result<organisation::BulkRemovalResult, Self::Error>;
+
     /// Loads complete metadata and assets for one book.
     fn get_book(&mut self, id: BookId) -> Result<Option<Book>, Self::Error>;
 
