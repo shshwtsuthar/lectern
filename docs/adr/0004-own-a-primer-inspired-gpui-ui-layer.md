@@ -50,10 +50,10 @@ Represent each complete theme as immutable data. Begin with `PrimerTheme::light(
 independent of the selected color mode. The representation must accept additional upstream token
 sets, including high-contrast and color-vision variants, without changing component implementations.
 
-Vendor only the required 16 px and 24 px Octicon SVGs through a separately pinned and checksummed
-source. Generate a closed Rust `Octicon` enum that maps variants to static asset paths. Preserve the
-upstream MIT license and provenance. GitHub logos and marks are excluded unless their use has been
-reviewed against GitHub's trademark and logo rules.
+Vendor only the required Tabler outline SVGs through a separately pinned and checksummed source.
+Generate a closed Rust `TablerIcon` enum that maps variants to static asset paths. Preserve the
+upstream MIT license and provenance. Brand icons are excluded unless their product and trademark use
+has been explicitly reviewed.
 
 Pin `gpui`, `gpui_platform`, and `gpui-base` deliberately. `gpui` and `gpui_platform` must resolve
 from the same source revision, and `gpui-base` must be selected from a revision whose own GPUI

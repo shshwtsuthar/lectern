@@ -50,7 +50,7 @@ The first `lectern-ui` bootstrap must add a checked-in source manifest, expected
 `tools/primer/primer-sources.toml`, containing:
 
 - the exact `@primer/primitives` package version and package integrity;
-- the exact Octicons package version or Git commit and archive integrity;
+- the exact Tabler Icons package version or Git commit and archive integrity;
 - the Primer React version or Git commit used as the component reference;
 - the GPUI Git URL and full commit SHA;
 - the `gpui_platform` Git URL and the same full commit SHA; and
@@ -232,35 +232,33 @@ Prefer fixed typed structs and static slices to string-keyed maps in the render 
 must be bounded and allocation-free. If a component needs derived presentation, calculate it once
 when constructing the theme unless it truly depends on runtime geometry.
 
-## Octicons
+## Tabler Icons
 
-Treat Octicons as an independent upstream source and upgrade. Vendor only icons used by committed
-components and product call sites, including the natural 16 px and 24 px variants where upstream
-provides both.
+Treat Tabler Icons as an independent upstream source and upgrade. Vendor only outline icons used by
+committed components and product call sites. Tabler's SVGs use a 24 px view box; component sizing is
+a rendering concern rather than a reason to vendor duplicated source variants.
 
 Expected layout:
 
 ```text
-crates/lectern-ui/assets/octicons/
-├── search-16.svg
-├── search-24.svg
-├── upload-16.svg
-└── upload-24.svg
-crates/lectern-ui/src/generated/octicons.rs
-third_party/octicons/LICENSE
-third_party/octicons/PROVENANCE.md
+crates/lectern-ui/assets/tabler/
+├── search.svg
+└── upload.svg
+crates/lectern-ui/src/generated/tabler_icons.rs
+third_party/tabler-icons/LICENSE
+third_party/tabler-icons/PROVENANCE.md
 ```
 
 Generate a closed enum and static mapping:
 
 ```rust
-pub enum Octicon {
+pub enum TablerIcon {
     Search,
     Upload,
 }
 
-impl Octicon {
-    pub const fn path(self, size: OcticonSize) -> &'static str {
+impl TablerIcon {
+    pub const fn path(self) -> &'static str {
         // Generated exhaustive mapping.
     }
 }
@@ -270,13 +268,13 @@ The concrete rendering wrapper uses GPUI's SVG asset support. It should avoid al
 formatting paths during render. Icons inherit the component's semantic foreground color unless the
 Primer contract gives the icon its own token.
 
-An Octicon is decorative by default and must not invent an accessible name. The surrounding control
+An icon is decorative by default and must not invent an accessible name. The surrounding control
 owns its label. `IconButton`, for example, requires an explicit accessible label even when a tooltip
 shows the same text.
 
-Octicons are MIT-licensed, with GitHub's separate rules for logos and marks. Preserve the license and
-provenance whenever SVGs are distributed. Exclude GitHub logo/mark assets by default; adding one
-requires an explicit trademark-use review, not merely an enum variant.
+Tabler Icons are MIT-licensed. Preserve the license and provenance whenever SVGs are distributed.
+Exclude brand icons by default; adding one requires an explicit product and trademark-use review,
+not merely an enum variant.
 
 ## Crate shape
 
@@ -285,7 +283,7 @@ The first implementation may adjust module names, but it should preserve these o
 ```text
 crates/lectern-ui/
 ├── Cargo.toml
-├── assets/octicons/
+├── assets/tabler/
 ├── examples/component_gallery.rs
 ├── src/
 │   ├── components/
@@ -331,7 +329,7 @@ Summarize only the relevant Primer contract:
 - controlled and transient states;
 - pointer, keyboard, focus, and dismissal behavior;
 - accessibility role, name, description, values, and actions;
-- required tokens and Octicons; and
+- required tokens and Tabler Icons; and
 - deliberate omissions or native deviations.
 
 Do not mechanically reproduce every React prop. A smaller API is correct when Lectern does not need
@@ -349,7 +347,7 @@ Button::new("import-books")
     .label("Import")
     .variant(ButtonVariant::Primary)
     .size(ButtonSize::Medium)
-    .leading_icon(Octicon::Upload)
+    .leading_icon(TablerIcon::Upload)
     .on_click(|_, window, cx| {
         // Dispatch a Lectern action.
     })
@@ -473,7 +471,7 @@ Tests live beside the component and cover:
 - focus entry, focus-visible appearance, traversal order, trapping, dismissal, and restoration;
 - accessibility role, label, description, value/state, and actions exposed by the pinned stack;
 - both initial themes and any theme switch;
-- generated token and Octicon mapping completeness; and
+- generated token and Tabler Icon mapping completeness; and
 - the component-specific contract and edge cases.
 
 Use GPUI's test support for actions, focus, input, and windows. Keep a manual visual review step until
@@ -593,7 +591,7 @@ A component is complete only when all applicable items are true:
 - native interaction behavior is delegated to the lowest suitable GPUI layer;
 - every presentation value comes from generated Primer or explicitly named Lectern tokens;
 - light and dark work without component theme-name conditionals;
-- required Octicons are pinned, generated, licensed, and mapped statically;
+- required Tabler Icons are pinned, generated, licensed, and mapped statically;
 - keyboard, focus, controlled state, and accessibility behavior are implemented and tested;
 - the gallery covers every supported size, variant, slot, content shape, and state;
 - focused tests, formatting, linting, and `primer-sync --check` pass;
@@ -634,8 +632,7 @@ the implementation inputs.
 - [Primer Spinner](https://primer.style/product/components/spinner/)
 - [Primer Label](https://primer.style/product/components/label/)
 - [Primer search pattern](https://primer.style/product/scenario-patterns/search/)
-- [Primer Octicons repository and license](https://github.com/primer/octicons)
-- [GitHub logo policy](https://docs.github.com/en/site-policy/other-site-policies/github-logo-policy)
+- [Tabler Icons repository and license](https://github.com/tabler/tabler-icons)
 - [GPUI crate documentation](https://docs.rs/gpui/)
 - [GPUI typed global state](https://docs.rs/gpui/latest/gpui/trait.Global.html)
 - [GPUI `RenderOnce`](https://docs.rs/gpui/latest/gpui/trait.RenderOnce.html)
