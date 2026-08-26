@@ -25,10 +25,11 @@ component does not hide application state in an internal loading flag.
 
 ## Presentation and accessibility
 
-All colors, geometry, typography, and focus-visible values come from the generated Primer token
-allowlist. Components select immutable light or dark theme data without branching on a theme name.
-The upload glyph is the pinned Tabler outline SVG and is decorative; the Button label owns the
-accessible name.
+Neutral colors, geometry, typography, and focus-visible values come from the generated Primer token
+allowlist. The Primary variant uses the explicitly named Lectern Mauve state palette defined by the
+[visual foundations](visual-foundations.md), replacing Primer's GitHub-green primary treatment.
+Components select immutable light or dark theme data without branching on a theme name. The upload
+glyph is the pinned Tabler outline SVG and is decorative; the Button label owns the accessible name.
 
 The root exposes the Button role, label, and click action. Disabled controls remove their click
 action. The pinned GPUI stateful-element API does not currently expose AccessKit's disabled flag, so

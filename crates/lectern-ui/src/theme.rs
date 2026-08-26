@@ -2,14 +2,17 @@ use std::sync::{Arc, OnceLock};
 
 use gpui::{App, FontWeight, Global, Hsla, Rems, rems, rgba};
 
-use crate::generated::{dark, light, primitive_metadata as common};
+use crate::{
+    brand::{DARK_PRIMARY_BUTTON, LIGHT_PRIMARY_BUTTON},
+    generated::{dark, light, primitive_metadata as common},
+};
 
-/// A supported immutable Primer color mode.
+/// A supported immutable Lectern color mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColorMode {
-    /// Primer's light theme.
+    /// Lectern's light theme.
     Light,
-    /// Primer's dark theme.
+    /// Lectern's dark theme.
     Dark,
 }
 
@@ -111,7 +114,7 @@ pub struct SpacingTheme {
     pub extra_large: Rems,
 }
 
-/// One complete, immutable generated Primer theme.
+/// One complete, immutable Lectern theme built from Primer-derived and Lectern-owned tokens.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PrimerTheme {
     mode: ColorMode,
@@ -171,6 +174,10 @@ impl PrimerTheme {
         }
         let color = |value| rgba(value).into();
         let default_foreground = color(choose!(BUTTON_DEFAULT_FG_REST));
+        let primary = match mode {
+            ColorMode::Light => LIGHT_PRIMARY_BUTTON,
+            ColorMode::Dark => DARK_PRIMARY_BUTTON,
+        };
         Self {
             mode,
             surface: SurfaceColors {
@@ -195,18 +202,18 @@ impl PrimerTheme {
                     disabled_icon: color(choose!(BUTTON_DEFAULT_FG_DISABLED)),
                 },
                 primary: ButtonColors {
-                    background: color(choose!(BUTTON_PRIMARY_BG_REST)),
-                    hover_background: color(choose!(BUTTON_PRIMARY_BG_HOVER)),
-                    active_background: color(choose!(BUTTON_PRIMARY_BG_ACTIVE)),
-                    disabled_background: color(choose!(BUTTON_PRIMARY_BG_DISABLED)),
-                    border: color(choose!(BUTTON_PRIMARY_BORDER_REST)),
-                    hover_border: color(choose!(BUTTON_PRIMARY_BORDER_HOVER)),
-                    active_border: color(choose!(BUTTON_PRIMARY_BORDER_ACTIVE)),
-                    disabled_border: color(choose!(BUTTON_PRIMARY_BORDER_DISABLED)),
-                    foreground: color(choose!(BUTTON_PRIMARY_FG_REST)),
-                    disabled_foreground: color(choose!(BUTTON_PRIMARY_FG_DISABLED)),
-                    icon: color(choose!(BUTTON_PRIMARY_ICON_REST)),
-                    disabled_icon: color(choose!(BUTTON_PRIMARY_ICON_DISABLED)),
+                    background: color(primary.background),
+                    hover_background: color(primary.hover_background),
+                    active_background: color(primary.active_background),
+                    disabled_background: color(primary.disabled_background),
+                    border: color(primary.border),
+                    hover_border: color(primary.hover_border),
+                    active_border: color(primary.active_border),
+                    disabled_border: color(primary.disabled_border),
+                    foreground: color(primary.foreground),
+                    disabled_foreground: color(primary.disabled_foreground),
+                    icon: color(primary.icon),
+                    disabled_icon: color(primary.disabled_icon),
                 },
                 radius: rems(common::BORDER_RADIUS_MEDIUM),
                 border_width: rems(common::BORDER_WIDTH_THIN),
@@ -255,5 +262,13 @@ mod tests {
         assert_eq!(dark.mode(), ColorMode::Dark);
         assert_ne!(light.surface.background, dark.surface.background);
         assert_eq!(light.button.radius, dark.button.radius);
+        assert_eq!(
+            light.button.primary.background,
+            rgba(LIGHT_PRIMARY_BUTTON.background).into()
+        );
+        assert_eq!(
+            dark.button.primary.background,
+            rgba(DARK_PRIMARY_BUTTON.background).into()
+        );
     }
 }

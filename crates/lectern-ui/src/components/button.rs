@@ -33,7 +33,7 @@ pub enum ButtonSize {
     Large,
 }
 
-/// A typed Primer Button backed by `gpui-base` interaction behavior.
+/// A typed Lectern Button derived from Primer and backed by `gpui-base` interaction behavior.
 #[derive(IntoElement)]
 pub struct Button {
     id: ElementId,

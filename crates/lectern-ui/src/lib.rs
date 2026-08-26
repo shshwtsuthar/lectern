@@ -1,6 +1,7 @@
-//! Primer-inspired native UI components for Lectern.
+//! Primer-derived native UI components with Lectern-owned visual identity.
 
 mod assets;
+mod brand;
 mod components;
 mod generated;
 mod icon;
