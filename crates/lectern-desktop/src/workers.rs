@@ -16,9 +16,9 @@ use lectern_core::{
     AssetHealthReport, AssetId, Book, BookFormat, BookId, BookSummary, ImportProgress,
     ImportSummary, LibraryQuery, LibraryService,
     organisation::{
-        BookEdit, BookSelection, BulkTagEdit, BulkTagResult, ContributorId, ContributorUsage,
-        SavedSearch, SavedSearchId, SelectionSnapshot, SelectionTagUsage, SeriesId, SeriesUsage,
-        TagId, TagUsage, VocabularyMutationResult,
+        BookEdit, BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, ContributorId,
+        ContributorUsage, SavedSearch, SavedSearchId, SelectionSnapshot, SelectionTagUsage,
+        SeriesId, SeriesUsage, TagId, TagUsage, VocabularyMutationResult,
     },
 };
 use lectern_desktop::export::{
@@ -101,6 +101,9 @@ enum MetadataRequest {
         generation: u64,
         selection: BookSelection,
         edit: BulkTagEdit,
+    },
+    RemoveBooks {
+        selection: BookSelection,
     },
     LoadSavedSearches {
         generation: u64,
@@ -375,6 +378,9 @@ pub(crate) enum WorkerEvent {
     BulkTagsApplied {
         generation: u64,
         result: Result<BulkTagResult, String>,
+    },
+    BooksRemoved {
+        result: Result<BulkRemovalResult, String>,
     },
     SavedSearchesLoaded {
         generation: u64,
@@ -766,6 +772,12 @@ impl WorkerSet {
             .is_ok()
     }
 
+    pub(crate) fn remove_books(&self, selection: BookSelection) -> bool {
+        self.metadata_sender
+            .send(MetadataRequest::RemoveBooks { selection })
+            .is_ok()
+    }
+
     pub(crate) fn load_saved_searches(&self, generation: u64) -> bool {
         self.metadata_sender
             .send(MetadataRequest::LoadSavedSearches { generation })
@@ -1090,6 +1102,12 @@ fn metadata_worker(
                     context,
                     WorkerEvent::BulkTagsApplied { generation, result },
                 )
+            }
+            MetadataRequest::RemoveBooks { selection } => {
+                let result = service
+                    .remove_books(&selection)
+                    .map_err(|error| error.to_string());
+                publish(events, context, WorkerEvent::BooksRemoved { result })
             }
             MetadataRequest::LoadSavedSearches { generation } => {
                 let result = service

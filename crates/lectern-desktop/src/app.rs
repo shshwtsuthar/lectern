@@ -12,10 +12,10 @@ use lectern_core::{
     AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookFormat, BookId, BookSummary,
     ImportProgress, ImportSummary, LibraryQuery, SortOrder,
     organisation::{
-        BookEdit, BookSelection, BulkTagEdit, BulkTagResult, ContributorFacet, ContributorId,
-        ContributorRole, ContributorUsage, ExactFacets, LibraryGeneration, NameKind, SavedSearch,
-        SavedSearchId, SearchExpression, SearchParseError, SelectionSnapshot, SelectionTagUsage,
-        SeriesId, SeriesIndex, SeriesUsage, TagId, TagReference, TagUsage,
+        BookEdit, BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, ContributorFacet,
+        ContributorId, ContributorRole, ContributorUsage, ExactFacets, LibraryGeneration, NameKind,
+        SavedSearch, SavedSearchId, SearchExpression, SearchParseError, SelectionSnapshot,
+        SelectionTagUsage, SeriesId, SeriesIndex, SeriesUsage, TagId, TagReference, TagUsage,
         VocabularyMutationResult, identity_key, normalize_name,
     },
 };
@@ -390,6 +390,18 @@ impl BulkTagUi {
     }
 }
 
+#[derive(Clone)]
+struct BulkRemovalConfirmation {
+    selection: BookSelection,
+    selected_books: u64,
+}
+
+#[derive(Default)]
+struct BulkRemovalUi {
+    confirmation: Option<BulkRemovalConfirmation>,
+    removing: bool,
+}
+
 #[derive(Default)]
 struct SavedSearchUi {
     generation: u64,
@@ -747,6 +759,7 @@ pub(crate) struct LecternApp {
     organiser: OrganiserUi,
     saved_searches: SavedSearchUi,
     bulk_tags: BulkTagUi,
+    bulk_removal: BulkRemovalUi,
     query_generation: u64,
     query_pending: bool,
     library_total: Option<usize>,
@@ -804,6 +817,7 @@ impl LecternApp {
             organiser: OrganiserUi::default(),
             saved_searches: SavedSearchUi::default(),
             bulk_tags: BulkTagUi::default(),
+            bulk_removal: BulkRemovalUi::default(),
             query_generation: 0,
             query_pending: false,
             library_total: None,
@@ -1064,6 +1078,7 @@ impl LecternApp {
                 WorkerEvent::BulkTagsApplied { generation, result } => {
                     self.bulk_tags_applied(generation, result);
                 }
+                WorkerEvent::BooksRemoved { result } => self.books_removed(result),
                 WorkerEvent::SavedSearchesLoaded { generation, result } => {
                     self.saved_searches_loaded(generation, result);
                 }
@@ -1409,6 +1424,9 @@ impl LecternApp {
     }
 
     fn selection_shortcuts(&mut self, context: &egui::Context) {
+        if self.bulk_removal.removing {
+            return;
+        }
         if (self.grid_selection.is_active() || self.selection_pending.is_some())
             && context
                 .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
@@ -1448,11 +1466,15 @@ impl LecternApp {
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.selection_pending = None;
         self.grid_selection.clear();
+        self.bulk_removal.confirmation = None;
         self.grid_focus_id = None;
         self.reset_bulk_tags();
     }
 
     fn begin_grid_selection(&mut self) {
+        if self.bulk_removal.removing {
+            return;
+        }
         if self.editor.as_ref().is_some_and(BookEditor::changed) {
             "Save or reset the current Book details before selecting books"
                 .clone_into(&mut self.status);
@@ -1468,6 +1490,9 @@ impl LecternApp {
     }
 
     fn toggle_grid_book(&mut self, id: BookId, index: usize) {
+        if self.bulk_removal.removing {
+            return;
+        }
         self.reset_bulk_tags();
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.selection_pending = None;
@@ -1480,6 +1505,9 @@ impl LecternApp {
     }
 
     fn select_range_to(&mut self, id: BookId, index: usize) {
+        if self.bulk_removal.removing {
+            return;
+        }
         self.reset_bulk_tags();
         let Some(anchor) = self.grid_selection.anchor else {
             self.toggle_grid_book(id, index);
@@ -1508,6 +1536,9 @@ impl LecternApp {
     }
 
     fn select_all_matching(&mut self) {
+        if self.bulk_removal.removing {
+            return;
+        }
         self.reset_bulk_tags();
         if self.library_total == Some(0) || self.selection_pending.is_some() {
             return;
@@ -1673,6 +1704,64 @@ impl LecternApp {
                 }
                 self.bulk_tags.error = Some(error.clone());
                 self.status = format!("Could not apply tag changes: {error}");
+            }
+        }
+    }
+
+    fn request_bulk_removal(&mut self) {
+        if self.grid_selection.selected_count() == 0
+            || self.selection_pending.is_some()
+            || self.bulk_removal.removing
+            || self.importing
+        {
+            return;
+        }
+        let Some(selection) = self.grid_selection.descriptor() else {
+            return;
+        };
+        self.bulk_removal.confirmation = Some(BulkRemovalConfirmation {
+            selection,
+            selected_books: self.grid_selection.selected_count(),
+        });
+    }
+
+    fn start_bulk_removal(&mut self, confirmation: BulkRemovalConfirmation) {
+        self.bulk_removal.confirmation = None;
+        if self.bulk_removal.removing
+            || self.grid_selection.selected_count() != confirmation.selected_books
+            || self.grid_selection.descriptor().as_ref() != Some(&confirmation.selection)
+        {
+            "The selection changed; review it before removing books".clone_into(&mut self.status);
+            return;
+        }
+        if self.workers.remove_books(confirmation.selection) {
+            self.bulk_removal.removing = true;
+            self.status = format!(
+                "Removing {} selected {} from the library…",
+                confirmation.selected_books,
+                pluralize_book(confirmation.selected_books),
+            );
+        } else {
+            "Metadata worker is unavailable".clone_into(&mut self.status);
+        }
+    }
+
+    fn books_removed(&mut self, result: Result<BulkRemovalResult, String>) {
+        self.bulk_removal.removing = false;
+        match result {
+            Ok(result) => {
+                self.status = format!(
+                    "Removed {} {} from the library; book files were kept",
+                    result.books_removed,
+                    pluralize_book(result.books_removed),
+                );
+                self.covers.clear();
+                self.pending_covers.clear();
+                self.missing_covers.clear();
+                self.refresh_library();
+            }
+            Err(error) => {
+                self.status = format!("Could not remove selected books: {error}");
             }
         }
     }
@@ -4576,6 +4665,46 @@ impl LecternApp {
         });
     }
 
+    fn bulk_removal_confirmation_window(&mut self, context: &egui::Context) {
+        let Some(confirmation) = self.bulk_removal.confirmation.clone() else {
+            return;
+        };
+        let response =
+            egui::Modal::new(egui::Id::new("bulk-removal-confirmation")).show(context, |ui| {
+                ui.set_max_width(460.0);
+                ui.heading("Remove selected books from library?");
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "Remove {} selected {} from Lectern?",
+                    confirmation.selected_books,
+                    pluralize_book(confirmation.selected_books),
+                ));
+                ui.label(
+                    RichText::new(
+                        "Their publication files will remain on disk. This only removes Lectern’s metadata, cached covers, and file relationships.",
+                    )
+                    .color(MUTED),
+                );
+                ui.add_space(14.0);
+                let mut confirm = false;
+                let mut cancel = false;
+                ui.horizontal(|ui| {
+                    confirm = ui
+                        .button(RichText::new("Remove from library").color(Color32::LIGHT_RED))
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+                (confirm, cancel)
+            });
+        let should_close = response.should_close();
+        let (confirm, cancel) = response.inner;
+        if confirm {
+            self.start_bulk_removal(confirmation);
+        } else if cancel || should_close {
+            self.bulk_removal.confirmation = None;
+        }
+    }
+
     fn book_removal_confirmation_window(&mut self, context: &egui::Context) {
         let Some(confirmation) = self.book_removal.confirmation.clone() else {
             return;
@@ -5081,28 +5210,14 @@ impl LecternApp {
     fn selection_bar(&mut self, ui: &mut egui::Ui) {
         let active = self.grid_selection.is_active();
         let pending = self.selection_pending.is_some();
+        let removing = self.bulk_removal.removing;
         let selected_books = self.grid_selection.selected_count();
-        let label = if pending {
-            "Resolving selection…".to_owned()
-        } else if self.grid_selection.is_every_matching() {
-            format!(
-                "All {} matching selected",
-                self.grid_selection.selected_count()
-            )
-        } else if let Some(matching) = self.grid_selection.matching_count() {
-            format!(
-                "{} selected from {matching} matching",
-                self.grid_selection.selected_count()
-            )
-        } else if active {
-            format!("{} selected", self.grid_selection.selected_count())
-        } else {
-            "Select books for bulk actions".to_owned()
-        };
+        let label = selection_bar_label(&self.grid_selection, pending, removing);
         let mut select_all = false;
         let mut begin = false;
         let mut clear = false;
         let mut bulk_tags = false;
+        let mut bulk_remove = false;
         egui::Frame::new()
             .fill(PANEL)
             .stroke(Stroke::new(1.0, BORDER))
@@ -5111,19 +5226,38 @@ impl LecternApp {
             .show(ui, |ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        if pending {
+                        if pending || removing {
                             ui.spinner();
                         }
                         ui.label(RichText::new(label).strong());
                         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                             if active || pending {
-                                clear = ui.button("Clear selection").clicked();
+                                clear = ui
+                                    .add_enabled(!removing, egui::Button::new("Clear selection"))
+                                    .clicked();
                             }
                             if active {
                                 bulk_tags = ui
                                     .add_enabled(
-                                        selected_books > 0 && !pending && !self.bulk_tags.is_open(),
+                                        selected_books > 0
+                                            && !pending
+                                            && !removing
+                                            && !self.importing
+                                            && !self.bulk_tags.is_open(),
                                         egui::Button::new("Bulk tags"),
+                                    )
+                                    .clicked();
+                                bulk_remove = ui
+                                    .add_enabled(
+                                        selected_books > 0
+                                            && !pending
+                                            && !removing
+                                            && !self.importing
+                                            && !self.bulk_tags.is_open(),
+                                        egui::Button::new(
+                                            RichText::new("Remove from library")
+                                                .color(Color32::LIGHT_RED),
+                                        ),
                                     )
                                     .clicked();
                             } else {
@@ -5134,7 +5268,10 @@ impl LecternApp {
                             }
                             if !self.grid_selection.is_every_matching() {
                                 select_all = ui
-                                    .add_enabled(!pending, egui::Button::new("Select all matching"))
+                                    .add_enabled(
+                                        !pending && !removing,
+                                        egui::Button::new("Select all matching"),
+                                    )
                                     .clicked();
                             }
                         });
@@ -5156,6 +5293,8 @@ impl LecternApp {
             self.select_all_matching();
         } else if bulk_tags {
             self.request_bulk_tag_panel();
+        } else if bulk_remove {
+            self.request_bulk_removal();
         }
     }
 
@@ -5393,6 +5532,7 @@ impl eframe::App for LecternApp {
         self.asset_detach_confirmation_window(ui.ctx());
         self.asset_replace_confirmation_window(ui.ctx());
         self.export_overwrite_confirmation_window(ui.ctx());
+        self.bulk_removal_confirmation_window(ui.ctx());
         self.book_removal_confirmation_window(ui.ctx());
         self.bulk_tag_discard_confirmation_window(ui.ctx());
         self.organiser_window(ui.ctx());
@@ -6552,6 +6692,27 @@ fn removal_file_message(asset_count: usize) -> String {
     }
 }
 
+fn pluralize_book(count: u64) -> &'static str {
+    if count == 1 { "book" } else { "books" }
+}
+
+fn selection_bar_label(selection: &GridSelection, pending: bool, removing: bool) -> String {
+    let selected = selection.selected_count();
+    if removing {
+        format!("Removing {selected} selected {}…", pluralize_book(selected))
+    } else if pending {
+        "Resolving selection…".to_owned()
+    } else if selection.is_every_matching() {
+        format!("All {selected} matching selected")
+    } else if let Some(matching) = selection.matching_count() {
+        format!("{selected} selected from {matching} matching")
+    } else if selection.is_active() {
+        format!("{selected} selected")
+    } else {
+        "Select books for bulk actions".to_owned()
+    }
+}
+
 fn missing_book_formats(book: &Book) -> Vec<BookFormat> {
     BookFormat::ALL
         .into_iter()
@@ -6608,6 +6769,12 @@ mod tests {
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE - 1), 0);
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE), QUERY_PAGE_SIZE);
         assert_eq!(query_page_offset(QUERY_PAGE_SIZE + 17), QUERY_PAGE_SIZE);
+    }
+
+    #[test]
+    fn bulk_removal_count_uses_the_right_noun() {
+        assert_eq!(super::pluralize_book(1), "book");
+        assert_eq!(super::pluralize_book(10_000), "books");
     }
 
     #[test]

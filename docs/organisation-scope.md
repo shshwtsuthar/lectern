@@ -29,7 +29,7 @@ aggregation.
 | Series | One normalized series per book, optional numeric index, browse/filter, rename, merge, and series sort | One series membership per book |
 | Tags | Flat normalized tags, single-book editing, rename, merge, delete, include/exclude filtering | No hierarchy, colors, or automatic rules |
 | Selection | Toggle, ordered range, clear, and all-current-results selection | No persistent selection across query or library changes |
-| Bulk editing | Add and remove several tags atomically, with an exact affected count | No bulk contributor, series, title, file, or delete operations |
+| Bulk actions | Add and remove several tags atomically; remove books from the library with confirmation and an exact affected count | No bulk contributor, series, title, file-asset, or export operations |
 | Search | Safe fielded prefix/phrase search plus exact facet chips | Conjunctive grammar only; no raw FTS, OR, regex, or parentheses |
 | Saved searches | Create, apply, update, rename, and delete a named query/filter/sort state | No smart collections or scheduled actions |
 | Vocabulary management | Bounded contributor, series, and tag lists with usage counts and explicit merge | No automatic cleanup or duplicate suggestions |
@@ -170,7 +170,7 @@ editor; unsaved book edits must be saved, reset, or explicitly discarded first.
 
 ## Bulk tag workflow
 
-The bulk panel is intentionally restricted to tags. It displays the union of tags on the target
+The bulk-tag panel is intentionally restricted to tags. It displays the union of tags on the target
 books with one of three observed states: **All**, **Some**, or **None**. For each tag the user may
 queue **Add to all**, **Remove from all**, or leave it unchanged. Search can add tags absent from the
 union, and **Create and add** creates a new tag only when the operation commits.
@@ -193,8 +193,25 @@ not be reported as lost data.
 
 Bulk tag work runs on the serialized library-write path. It must use set-based statements or bounded
 batches inside one transaction, must not load each complete book, and must not issue one commit per
-book. There is no bulk book deletion, contributor edit, series edit, asset action, or filesystem
-operation in this tranche.
+book. There is no bulk contributor edit, series edit, asset action, or filesystem operation in this
+tranche.
+
+## Bulk remove workflow
+
+The selection bar exposes **Remove from library** for a non-empty, resolved selection. A destructive
+confirmation names the exact selected count and states that publication files remain on disk. While
+the operation is queued, the selection is locked and the bar presents a busy state.
+
+The metadata worker sends the compact selection descriptor to one immediate transaction. The
+storage boundary rejects stale query-backed selections, removes the selected logical books and
+their database-owned assets, cached covers, organization relationships, and FTS entries with
+set-based statements, and returns the exact removed count. It never opens, modifies, or deletes a
+publication file. Success clears selection, releases cached cover state, refreshes the active
+projection, and announces the exact result. Failure preserves the selection for review or retry.
+
+The deterministic 50,000-book workload removes a 10,000-book query-backed selection. It retains 40
+release-mode samples, verifies every cascade and source-file invariant, and gates durable removal
+plus the first 128-book refresh at 3.5 seconds p95 with at most 32 MiB of additional process RSS.
 
 ## Filtering and structured search
 
@@ -427,7 +444,7 @@ The completed tranche must pass these product-level scenarios in addition to foc
 - Hierarchical, colored, private, automatically assigned, or AI-generated tags.
 - Manual shelves/collections, reading lists, reading status, progress, ratings, reviews, and dates
   other than the existing added/modified metadata.
-- Bulk title, contributor, series, publisher, language, description, cover, asset, export, or delete
+- Bulk title, contributor, series, publisher, language, description, cover, asset, or export
   operations.
 - Multiple series memberships, named series arcs, non-numeric volume labels, or automatic gap
   filling/renumbering.
