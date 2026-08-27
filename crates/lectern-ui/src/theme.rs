@@ -8,8 +8,8 @@ use gpui::{App, FontWeight, Global, Hsla, Rems, rems, rgba};
 use crate::{
     brand::{
         DARK_ACCENT_FOCUS, DARK_ACCENT_PRIMARY, DARK_ACCENT_SELECTION, DARK_TAG_COLORS,
-        DIALOG_BACKDROP, LIGHT_ACCENT_FOCUS, LIGHT_ACCENT_PRIMARY, LIGHT_ACCENT_SELECTION,
-        LIGHT_TAG_COLORS,
+        DIALOG_BACKDROP, DIALOG_BACKGROUND_CONTENT_OPACITY, LIGHT_ACCENT_FOCUS,
+        LIGHT_ACCENT_PRIMARY, LIGHT_ACCENT_SELECTION, LIGHT_TAG_COLORS,
     },
     generated::{dark, light, primitive_metadata as common},
 };
@@ -178,6 +178,8 @@ pub struct SelectionTheme {
 pub struct DialogTheme {
     /// Viewport scrim behind the modal surface.
     pub backdrop: Hsla,
+    /// Reduced contrast for application content beneath the modal.
+    pub background_content_opacity: f32,
     /// Dialog surface corner radius.
     pub radius: Rems,
 }
@@ -498,6 +500,7 @@ impl PrimerTheme {
             },
             dialog: DialogTheme {
                 backdrop: color(DIALOG_BACKDROP),
+                background_content_opacity: DIALOG_BACKGROUND_CONTENT_OPACITY,
                 radius: rems(common::BORDER_RADIUS_LARGE),
             },
             action_menu: ActionMenuTheme {
@@ -636,6 +639,14 @@ mod tests {
         assert_eq!(light.input.height, dark.input.height);
         assert_eq!(light.input.background, rgba(light::CONTROL_BG_REST).into());
         assert_eq!(dark.input.background, rgba(dark::CONTROL_BG_REST).into());
+        assert!(
+            (light.dialog.background_content_opacity - DIALOG_BACKGROUND_CONTENT_OPACITY).abs()
+                < f32::EPSILON
+        );
+        assert!(
+            (dark.dialog.background_content_opacity - DIALOG_BACKGROUND_CONTENT_OPACITY).abs()
+                < f32::EPSILON
+        );
         assert_eq!(light.typography.body_family, "Karla");
         assert_eq!(light.typography.wordmark_family, "Newsreader 14pt");
         assert_eq!(light.typography.wordmark_weight, FontWeight::MEDIUM);

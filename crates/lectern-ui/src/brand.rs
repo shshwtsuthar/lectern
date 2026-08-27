@@ -32,6 +32,9 @@ pub(crate) const DARK_SELECTION: SelectionTokens = SelectionTokens {
 /// Scrim used behind modal Lectern surfaces.
 pub(crate) const DIALOG_BACKDROP: u32 = 0x0000_0066;
 
+/// Retained opacity for application content beneath a modal.
+pub(crate) const DIALOG_BACKGROUND_CONTENT_OPACITY: f32 = 0.82;
+
 /// Lectern-owned focus outlines replace Primer's blue focus accent.
 pub(crate) const LIGHT_FOCUS: u32 = MAUVE;
 pub(crate) const DARK_FOCUS: u32 = LAVENDER;

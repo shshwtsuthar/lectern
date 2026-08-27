@@ -30,6 +30,12 @@ visible color name, explicit accessible name, selected state, and a non-color se
 Every interactive state comes from a named light/dark accent token set rather than component-local
 color arithmetic.
 
+While any modal is open, the application content beneath it uses a restrained soft-focus treatment:
+the shared scrim and a named reduction in background-content contrast soften competing detail while
+the dialog remains fully opaque and sharp. This is Lectern's lightweight GPUI fallback for the
+framework's lack of per-element backdrop filtering; do not increase the effect into a heavy blur or
+apply it to the dialog surface itself.
+
 The application requests server-side window decorations on Linux so GNOME may provide its standard
 title bar and window controls above Lectern's compact application bar. The platform can decline this
 request where server-side decorations are unavailable.

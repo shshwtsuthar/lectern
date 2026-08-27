@@ -2548,6 +2548,7 @@ impl Render for LecternView {
             LibraryState::Ready if self.books.is_empty() => self.empty_library_view(&theme, cx),
             LibraryState::Ready => self.library_view(&theme, cx),
         };
+        let modal_open = self.removal_confirmation.is_some() || self.theme_dialog_open;
 
         div()
             .size_full()
@@ -2563,7 +2564,14 @@ impl Render for LecternView {
             .on_action(cx.listener(|this, _: &ClearBookSelection, _, cx| {
                 this.clear_selection_action(cx);
             }))
-            .child(content)
+            .child(
+                div()
+                    .size_full()
+                    .when(modal_open, |background| {
+                        background.opacity(theme.dialog.background_content_opacity)
+                    })
+                    .child(content),
+            )
             .when(self.removal_confirmation.is_some(), |root| {
                 root.child(self.bulk_removal_dialog(&theme, cx))
             })
