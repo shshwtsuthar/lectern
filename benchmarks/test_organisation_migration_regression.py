@@ -19,7 +19,7 @@ SPEC.loader.exec_module(REGRESSION)
 
 
 def checked_in_budget() -> dict:
-    with (BENCHMARKS / "organisation-migration-regression-v2.json").open(
+    with (BENCHMARKS / "organisation-migration-regression-v3.json").open(
         encoding="utf-8"
     ) as source:
         return json.load(source)
@@ -29,7 +29,7 @@ def valid_result() -> dict:
     return {
         "library_books": 50_000,
         "source_schema_version": 5,
-        "final_schema_version": 8,
+        "final_schema_version": 9,
         "warmup_iterations": 2,
         "measured_iterations": 20,
         "visible_projections_preserved": True,
@@ -37,6 +37,7 @@ def valid_result() -> dict:
         "fts_equivalent": True,
         "initial_tags_and_saved_searches_empty": True,
         "schema_invariants_valid": True,
+        "default_identifier_types_valid": True,
         "duplicate_series_numbers_repaired": True,
         "failed_migration_rolled_back": True,
         "scenarios": [

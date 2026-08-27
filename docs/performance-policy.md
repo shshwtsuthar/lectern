@@ -60,9 +60,9 @@ python3 benchmarks/performance_regression.py \
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/reimport-known-path-regression-v1.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/organisation-migration-regression-v2.json
+  --budget benchmarks/organisation-migration-regression-v3.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/organisation-query-regression-v2.json
+  --budget benchmarks/organisation-query-regression-v3.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-vocabulary-regression-v2.json
 python3 benchmarks/performance_regression.py \
@@ -118,9 +118,12 @@ book-selection-to-painted-sidebar p95, and peak RSS.
 The normalized organisation v2 fixture replaces the historical duplicate series-number
 distribution with deterministic unique exact numbers at the same 50,000-book, 2,500-series scale.
 Its query suite includes the indexed conflict/self-exclusion check used by the Book number input.
-The version-five-to-current migration suite reaches schema version 8 and measures installation of
-the partial unique index; unit migration coverage separately supplies deliberate version-seven
-duplicates and verifies the deterministic repair.
+The query-only v3 fixture additionally assigns three identifiers per book and covers bounded
+identifier-type lookup plus a complete identifier metadata save/reload through production paths.
+The version-five-to-current migration suite reaches schema version 9 and measures installation of
+the partial unique index plus the identifier tables and seeded default types; unit migration
+coverage separately supplies deliberate version-seven duplicates and verifies the deterministic
+repair.
 
 The export suite is also mandatory for changes to copy buffers, publication, overwrite behavior,
 export scheduling, or export progress. Import, startup, scrolling, rendering, or memory changes

@@ -143,9 +143,9 @@ python3 benchmarks/performance_regression.py \
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/reimport-known-path-regression-v1.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/organisation-migration-regression-v2.json
+  --budget benchmarks/organisation-migration-regression-v3.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/organisation-query-regression-v2.json
+  --budget benchmarks/organisation-query-regression-v3.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-vocabulary-regression-v2.json
 python3 benchmarks/performance_regression.py \

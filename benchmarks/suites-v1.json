@@ -48,11 +48,11 @@
     },
     {
       "name": "organisation-migration-v2",
-      "budget": "benchmarks/organisation-migration-regression-v2.json"
+      "budget": "benchmarks/organisation-migration-regression-v3.json"
     },
     {
       "name": "organisation-query-v2",
-      "budget": "benchmarks/organisation-query-regression-v2.json"
+      "budget": "benchmarks/organisation-query-regression-v3.json"
     },
     {
       "name": "organisation-vocabulary-v2",

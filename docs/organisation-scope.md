@@ -374,7 +374,7 @@ later changes also use the repository's paired 10%/material-delta regression rul
 
 ### Normalized query workload
 
-Add `organisation-query-regression-v2.json` over 50,000 books with deterministic distributions of
+Add `organisation-query-regression-v3.json` over 50,000 books with deterministic distributions of
 20,000 contributors, 2,500 series, 500 tags, eight tags per book, one to four contributor credits
 per book, 70% series membership, existing mixed assets/covers, and 250 saved searches. Retain 10
 warmups and 40 measured samples for:
@@ -409,7 +409,7 @@ operation is capped at 32 MiB above the seeded idle phase; the operation must no
 
 ### Migration workload
 
-Use `organisation-migration-regression-v2.json` with independent copies of a version-five
+Use `organisation-migration-regression-v3.json` with independent copies of a version-five
 50,000-book database. It verifies byte-equivalent visible author/series projections, stable book and
 asset identities, FTS equivalence, empty initial tags/searches, and every schema invariant. Retain at
 least 20 optimized samples; migration has a 5 second p95 wall-time budget and a 256 MiB peak-RSS

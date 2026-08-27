@@ -5,9 +5,10 @@ use std::collections::{HashMap, HashSet};
 use lectern_core::{
     Book,
     organisation::{
-        BookEdit, ContributorCreditEdit, ContributorId, ContributorReference, ContributorRole,
-        NameKind, SeriesId, SeriesIndex, SeriesMembershipEdit, SeriesReference, TagColor, TagId,
-        TagReference, identity_key, normalize_name,
+        BookEdit, BookIdentifierEdit, ContributorCreditEdit, ContributorId, ContributorReference,
+        ContributorRole, IdentifierTypeId, IdentifierTypeReference, NameKind, SeriesId,
+        SeriesIndex, SeriesMembershipEdit, SeriesReference, TagColor, TagId, TagReference,
+        identity_key, normalize_identifier_value, normalize_name,
     },
 };
 
@@ -110,11 +111,19 @@ pub(crate) struct TagDraft {
     pub(crate) color: TagColor,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IdentifierDraft {
+    pub(crate) existing_type_id: Option<IdentifierTypeId>,
+    pub(crate) type_name: String,
+    pub(crate) value: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BookCurationDraft {
     pub(crate) contributors: Vec<ContributorDraft>,
     pub(crate) series: SeriesDraft,
     pub(crate) tags: Vec<TagDraft>,
+    pub(crate) identifiers: Vec<IdentifierDraft>,
     next_row_id: u64,
 }
 
@@ -154,11 +163,21 @@ impl BookCurationDraft {
                 color: tag.color,
             })
             .collect();
+        let identifiers = book
+            .identifiers
+            .iter()
+            .map(|identifier| IdentifierDraft {
+                existing_type_id: Some(identifier.identifier_type.id),
+                type_name: identifier.identifier_type.name.clone(),
+                value: identifier.value.clone(),
+            })
+            .collect();
         Self {
             next_row_id: u64::try_from(contributors.len()).expect("credit count fits u64"),
             contributors,
             series,
             tags,
+            identifiers,
         }
     }
 
@@ -209,6 +228,29 @@ impl BookCurationDraft {
             existing_id: None,
             name,
             color,
+        });
+        Ok(true)
+    }
+
+    pub(crate) fn add_identifier(
+        &mut self,
+        existing_type_id: Option<IdentifierTypeId>,
+        type_name: &str,
+        value: &str,
+    ) -> Result<bool, String> {
+        let type_name =
+            normalize_name(NameKind::IdentifierType, type_name).map_err(display_error)?;
+        let value = normalize_identifier_value(value)?;
+        let type_key = identity_key(&type_name);
+        if self.identifiers.iter().any(|identifier| {
+            identity_key(&identifier.type_name) == type_key && identifier.value == value
+        }) {
+            return Ok(false);
+        }
+        self.identifiers.push(IdentifierDraft {
+            existing_type_id,
+            type_name,
+            value,
         });
         Ok(true)
     }
@@ -293,6 +335,26 @@ impl BookCurationDraft {
             ));
         }
 
+        let mut identifier_keys = HashSet::with_capacity(self.identifiers.len());
+        let mut identifiers = Vec::with_capacity(self.identifiers.len());
+        for identifier in &self.identifiers {
+            let type_name = normalize_name(NameKind::IdentifierType, &identifier.type_name)
+                .map_err(display_error)?;
+            let value = normalize_identifier_value(&identifier.value)?;
+            if !identifier_keys.insert((identity_key(&type_name), value.clone())) {
+                return Err(format!(
+                    "{type_name} identifier '{value}' is assigned more than once."
+                ));
+            }
+            identifiers.push(BookIdentifierEdit {
+                identifier_type: identifier.existing_type_id.map_or_else(
+                    || IdentifierTypeReference::New(type_name),
+                    IdentifierTypeReference::Existing,
+                ),
+                value,
+            });
+        }
+
         Ok(BookEdit {
             id: book.id,
             title: title.to_owned(),
@@ -302,6 +364,7 @@ impl BookCurationDraft {
             contributors,
             series,
             tags,
+            identifiers,
         })
     }
 
@@ -353,8 +416,9 @@ mod tests {
     use lectern_core::{
         AssetHealth, AssetId, AssetStorage, BookAsset, BookFormat, BookId,
         organisation::{
-            Contributor, ContributorCredit, ContributorId, ContributorRole, Series, SeriesId,
-            SeriesIndex, SeriesMembership, Tag, TagColor, TagId,
+            BookIdentifier, Contributor, ContributorCredit, ContributorId, ContributorRole,
+            IdentifierType, IdentifierTypeId, Series, SeriesId, SeriesIndex, SeriesMembership, Tag,
+            TagColor, TagId,
         },
     };
 
@@ -387,6 +451,13 @@ mod tests {
                 name: "Fantasy".into(),
                 color: TagColor::Slate,
             }],
+            identifiers: vec![BookIdentifier {
+                identifier_type: IdentifierType {
+                    id: IdentifierTypeId::new(6),
+                    name: "ISBN".into(),
+                },
+                value: "978-0-1234-5678-9".into(),
+            }],
             publisher: Some("Parnassus".into()),
             language: Some("en".into()),
             description: None,
@@ -412,6 +483,7 @@ mod tests {
         assert_eq!(edit.contributors[0].position, 0);
         assert_eq!(edit.series.unwrap().index.unwrap().to_string(), "1.5");
         assert_eq!(edit.tags.len(), 1);
+        assert_eq!(edit.identifiers.len(), 1);
         assert_eq!(edit.description, None);
     }
 
@@ -483,5 +555,25 @@ mod tests {
         );
         assert_eq!(draft.tags[1].name, "Science Fiction");
         assert_eq!(draft.tags[1].color, TagColor::Azure);
+    }
+
+    #[test]
+    fn identifiers_accept_multiple_values_and_deduplicate_exact_assignments() {
+        let mut draft = BookCurationDraft::from_book(&book());
+        assert!(
+            draft
+                .add_identifier(Some(IdentifierTypeId::new(6)), "ISBN", "978-1")
+                .unwrap()
+        );
+        assert!(
+            !draft
+                .add_identifier(Some(IdentifierTypeId::new(6)), " isbn ", "978-1")
+                .unwrap()
+        );
+        assert!(draft.add_identifier(None, "WikiData", " Q42 ").unwrap());
+
+        let edit = draft.to_book_edit(&book(), "Title", "", "", "").unwrap();
+        assert_eq!(edit.identifiers.len(), 3);
+        assert_eq!(edit.identifiers[2].value, "Q42");
     }
 }
