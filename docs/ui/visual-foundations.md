@@ -31,6 +31,31 @@ Brand color does not override semantics or accessibility. Do not use brand color
 communicate status, and verify the contrast of the actual foreground/background pair for its text
 size and interaction state.
 
+## Consistent padding for edge-aligned controls
+
+Controls aligned to an edge or corner of a container must be positioned with deliberate container
+padding, not arbitrary per-edge offsets or control-local margins. For a control placed in a simple
+header, toolbar, panel, or empty-state boundary, use one spacing token for the container's entire
+perimeter:
+
+```text
+paddingTop = paddingRight = paddingBottom = paddingLeft
+```
+
+The control's visual bounds must therefore have the same inset from each adjacent container edge.
+For example, a button aligned to the top-right of a header must not sit nearly flush with the top
+while retaining a larger gap on the right. Its top, right, and bottom insets must come from the same
+container-padding value, with the equivalent padding preserved on the unused left edge.
+
+Apply asymmetric padding only when a documented layout constraint requires it, such as a safe area,
+window control region, or intentionally distinct content hierarchy. In those cases, use named
+layout tokens and make the exception explicit. Do not compensate for an incorrectly sized container
+or control with independent pixel nudges.
+
+When implementing or reviewing edge-aligned controls, inspect the control's visible bounds rather
+than only its layout origin. Borders, shadows, focus rings, and transparent hit-area expansion can
+change the perceived inset and must not make otherwise equal spacing appear uneven.
+
 ## Concentric radii for nested surfaces
 
 When a rounded surface is nested inside another rounded surface with a uniform inset, padding, or
