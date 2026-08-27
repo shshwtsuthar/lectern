@@ -5,6 +5,7 @@
 
 pub(crate) const BG_COLOR_DEFAULT: u32 = 0xffff_ffff;
 pub(crate) const BG_COLOR_MUTED: u32 = 0xf6f8_faff;
+pub(crate) const BORDER_COLOR_MUTED: u32 = 0xd1d9_e0b3;
 pub(crate) const BUTTON_DEFAULT_BG_ACTIVE: u32 = 0xe6ea_efff;
 pub(crate) const BUTTON_DEFAULT_BG_DISABLED: u32 = 0xeff2_f5ff;
 pub(crate) const BUTTON_DEFAULT_BG_HOVER: u32 = 0xeff2_f5ff;

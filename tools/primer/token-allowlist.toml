@@ -29,6 +29,13 @@ kind = "color"
 scope = "theme"
 
 [[tokens]]
+name = "borderColor-muted"
+rust_name = "BORDER_COLOR_MUTED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
 name = "focus-outlineColor"
 rust_name = "FOCUS_OUTLINE_COLOR"
 source = "functional/themes"

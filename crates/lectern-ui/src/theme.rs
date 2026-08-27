@@ -29,6 +29,15 @@ pub struct SurfaceColors {
     pub muted_foreground: Hsla,
 }
 
+/// Borders used to separate adjacent, non-interactive application surfaces.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BorderTheme {
+    /// Low-contrast border for quiet surface boundaries.
+    pub muted: Hsla,
+    /// Standard thin border width.
+    pub thin: Rems,
+}
+
 /// A complete visual state for one Button variant.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ButtonColors {
@@ -120,6 +129,8 @@ pub struct PrimerTheme {
     mode: ColorMode,
     /// Surface and text colors.
     pub surface: SurfaceColors,
+    /// Non-interactive surface borders.
+    pub border: BorderTheme,
     /// Button colors and geometry.
     pub button: ButtonTheme,
     /// Focus-visible ring.
@@ -185,6 +196,10 @@ impl PrimerTheme {
                 muted_background: color(choose!(BG_COLOR_MUTED)),
                 foreground: color(choose!(FG_COLOR_DEFAULT)),
                 muted_foreground: color(choose!(FG_COLOR_MUTED)),
+            },
+            border: BorderTheme {
+                muted: color(choose!(BORDER_COLOR_MUTED)),
+                thin: rems(common::BORDER_WIDTH_THIN),
             },
             button: ButtonTheme {
                 default: ButtonColors {
@@ -261,6 +276,9 @@ mod tests {
         assert_eq!(light.mode(), ColorMode::Light);
         assert_eq!(dark.mode(), ColorMode::Dark);
         assert_ne!(light.surface.background, dark.surface.background);
+        assert_eq!(light.border.muted, rgba(light::BORDER_COLOR_MUTED).into());
+        assert_eq!(dark.border.muted, rgba(dark::BORDER_COLOR_MUTED).into());
+        assert_eq!(light.border.thin, dark.border.thin);
         assert_eq!(light.button.radius, dark.button.radius);
         assert_eq!(
             light.button.primary.background,

@@ -317,6 +317,8 @@ impl LecternView {
                     .items_center()
                     .justify_between()
                     .p(theme.spacing.small)
+                    .border_b(theme.border.thin)
+                    .border_color(theme.border.muted)
                     .child(
                         div()
                             .text_size(theme.typography.title_size)
@@ -372,6 +374,8 @@ impl LecternView {
                     .flex_none()
                     .h(px(BOTTOM_BAR_HEIGHT_PX))
                     .px(theme.spacing.extra_large)
+                    .border_t(theme.border.thin)
+                    .border_color(theme.border.muted)
                     .flex()
                     .items_center()
                     .text_color(theme.surface.muted_foreground)
