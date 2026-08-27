@@ -197,6 +197,13 @@ kind = "dimension"
 scope = "common"
 
 [[tokens]]
+name = "borderRadius-large"
+rust_name = "BORDER_RADIUS_LARGE"
+source = "functional/size/radius.json"
+kind = "dimension"
+scope = "common"
+
+[[tokens]]
 name = "borderWidth-thin"
 rust_name = "BORDER_WIDTH_THIN"
 source = "functional/size/border.json"

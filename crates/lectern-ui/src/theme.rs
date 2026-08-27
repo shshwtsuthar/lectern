@@ -3,7 +3,9 @@ use std::sync::{Arc, OnceLock};
 use gpui::{App, FontWeight, Global, Hsla, Rems, rems, rgba};
 
 use crate::{
-    brand::{DARK_PRIMARY_BUTTON, LIGHT_PRIMARY_BUTTON},
+    brand::{
+        DARK_PRIMARY_BUTTON, DARK_SELECTION, DIALOG_BACKDROP, LIGHT_PRIMARY_BUTTON, LIGHT_SELECTION,
+    },
     generated::{dark, light, primitive_metadata as common},
 };
 
@@ -36,6 +38,28 @@ pub struct BorderTheme {
     pub muted: Hsla,
     /// Standard thin border width.
     pub thin: Rems,
+}
+
+/// Lectern-branded visual state for selected library content.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SelectionTheme {
+    /// Quiet selected-card background.
+    pub background: Hsla,
+    /// Selected-card and checkbox border.
+    pub border: Hsla,
+    /// Checked indicator background.
+    pub check_background: Hsla,
+    /// Checked indicator foreground.
+    pub check_foreground: Hsla,
+}
+
+/// Modal surface presentation shared by product confirmations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DialogTheme {
+    /// Viewport scrim behind the modal surface.
+    pub backdrop: Hsla,
+    /// Dialog surface corner radius.
+    pub radius: Rems,
 }
 
 /// A complete visual state for one Button variant.
@@ -133,6 +157,10 @@ pub struct PrimerTheme {
     pub surface: SurfaceColors,
     /// Non-interactive surface borders.
     pub border: BorderTheme,
+    /// Selected-content presentation.
+    pub selection: SelectionTheme,
+    /// Modal surface presentation.
+    pub dialog: DialogTheme,
     /// Button colors and geometry.
     pub button: ButtonTheme,
     /// Focus-visible ring.
@@ -176,6 +204,10 @@ impl PrimerTheme {
             .map_or_else(Self::light, |theme| Arc::clone(&theme.0))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive constructor makes every immutable theme field visibly complete"
+    )]
     fn from_generated(mode: ColorMode) -> Self {
         macro_rules! choose {
             ($name:ident) => {
@@ -191,6 +223,10 @@ impl PrimerTheme {
             ColorMode::Light => LIGHT_PRIMARY_BUTTON,
             ColorMode::Dark => DARK_PRIMARY_BUTTON,
         };
+        let selection = match mode {
+            ColorMode::Light => LIGHT_SELECTION,
+            ColorMode::Dark => DARK_SELECTION,
+        };
         Self {
             mode,
             surface: SurfaceColors {
@@ -202,6 +238,16 @@ impl PrimerTheme {
             border: BorderTheme {
                 muted: color(choose!(BORDER_COLOR_MUTED)),
                 thin: rems(common::BORDER_WIDTH_THIN),
+            },
+            selection: SelectionTheme {
+                background: color(selection.background),
+                border: color(selection.border),
+                check_background: color(selection.check_background),
+                check_foreground: color(selection.check_foreground),
+            },
+            dialog: DialogTheme {
+                backdrop: color(DIALOG_BACKDROP),
+                radius: rems(common::BORDER_RADIUS_LARGE),
             },
             button: ButtonTheme {
                 default: ButtonColors {

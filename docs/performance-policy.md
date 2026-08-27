@@ -85,6 +85,22 @@ It uses release-mode fresh processes, retains 40 measured samples after 5 warmup
 ready and busy presentation markers, and gates first-frame and click-to-painted-busy-state p95 plus
 peak RSS. It requires an active X11 or Wayland display.
 
+GPUI populated-library selection, selected-card rendering, contextual actions, destructive
+confirmation, and their theme tokens require the native selection suite in addition to the atomic
+bulk-removal storage suite:
+
+```sh
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/ui-selection-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/bulk-remove-regression-v1.json
+```
+
+The selection suite retains 40 measured fresh-process samples after 5 warmups for a 50,000-book
+projection with a bounded 128-card first page. It verifies the compact selection descriptor and
+exact confirmation copy while gating populated first paint, selection-to-painted-context, and
+confirmation-to-painted-modal p95 plus peak RSS.
+
 The export suite is also mandatory for changes to copy buffers, publication, overwrite behavior,
 export scheduling, or export progress. Import, startup, scrolling, rendering, or memory changes
 must also run the applicable workload from

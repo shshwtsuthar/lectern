@@ -5,6 +5,7 @@
 
 pub(crate) const SOURCE_SUMMARY: &str = "@primer/primitives 11.10.0; @tabler/icons 3.46.0; Primer React b1117811cebfb9463f20fe76f77cdf13917ae6b2; GPUI 8b1497dbd22fb06f5838a7c0b84a1e54fafa71bc; gpui-base ff3eb1128ac1058f1bb88e777744ce1237aa3b79";
 
+pub(crate) const BORDER_RADIUS_LARGE: f32 = 0.75;
 pub(crate) const BORDER_RADIUS_MEDIUM: f32 = 0.375;
 pub(crate) const BORDER_WIDTH_THIN: f32 = 0.0625;
 pub(crate) const CONTROL_LARGE_GAP: f32 = 0.5;

@@ -1,6 +1,7 @@
 //! Minimal GPUI application used to migrate Lectern's library journey.
 
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -8,26 +9,46 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, Context, Image, ImageFormat, ObjectFit, Render, SharedString,
+    App, Bounds, Context, Image, ImageFormat, KeyBinding, ObjectFit, Render, SharedString,
     StatefulInteractiveElement, StyledImage, Window, WindowBounds, WindowOptions, div, img,
     prelude::*, px, relative, size,
 };
+use gpui_base::{
+    AlertDialog, AlertDialogBackdrop, AlertDialogDescription, AlertDialogPopup, AlertDialogTitle,
+    Checkbox, CheckboxState,
+};
 use gpui_platform::application;
-use lectern_core::{BookSummary, ImportSummary, LibraryQuery, LibraryService};
+use lectern_core::{
+    BookId, BookSummary, ImportSummary, LibraryQuery, LibraryService,
+    organisation::{BookSelection, BulkRemovalResult, LibraryGeneration, SelectionSnapshot},
+};
 use lectern_service::{LibraryServiceError, SqliteLibraryService, default_database_path};
 use lectern_ui::{Button, ButtonVariant, LecternAssets, PrimerTheme, TablerIcon, install_theme};
 use serde::Serialize;
 
 const BENCHMARK_OUTPUT_ENV: &str = "LECTERN_GPUI_BENCHMARK_OUTPUT";
+const BENCHMARK_WORKLOAD_ENV: &str = "LECTERN_GPUI_BENCHMARK_WORKLOAD";
 const ROOT_REM_PX: f32 = 16.0;
 const WINDOW_WIDTH_PX: f32 = 900.0;
 const WINDOW_HEIGHT_PX: f32 = 620.0;
 const EMPTY_LIBRARY_CONTENT_WIDTH_PX: f32 = 480.0;
-const BOOK_CARD_WIDTH_PX: f32 = 144.0;
+const BOOK_CARD_WIDTH_PX: f32 = 160.0;
 const BOOK_COVER_HEIGHT_PX: f32 = 216.0;
 const TOP_BAR_HEIGHT_PX: f32 = 48.0;
+const SELECTION_BAR_HEIGHT_PX: f32 = 48.0;
 const BOTTOM_BAR_HEIGHT_PX: f32 = 24.0;
+const BULK_REMOVAL_DIALOG_WIDTH_PX: f32 = 460.0;
 const LIBRARY_PAGE_SIZE: u32 = 128;
+
+gpui::actions!(
+    lectern_library,
+    [
+        /// Select every book in the current library projection.
+        SelectAllBooks,
+        /// Leave multi-book selection mode.
+        ClearBookSelection
+    ]
+);
 
 /// Runs Lectern's additive GPUI migration executable.
 ///
@@ -38,15 +59,28 @@ const LIBRARY_PAGE_SIZE: u32 = 128;
 pub fn run(main_entry: Instant) {
     let benchmark = env::var_os(BENCHMARK_OUTPUT_ENV).map(|path| BenchmarkRun {
         output: PathBuf::from(path),
+        workload: match env::var(BENCHMARK_WORKLOAD_ENV).as_deref() {
+            Ok("library-selection") => BenchmarkWorkload::LibrarySelection,
+            Ok(workload) => panic!("unsupported GPUI benchmark workload {workload:?}"),
+            Err(env::VarError::NotPresent) => BenchmarkWorkload::EmptyLibraryAddBooks,
+            Err(error) => panic!("read GPUI benchmark workload: {error}"),
+        },
         main_entry,
         initial_render: None,
         action_started: None,
+        selection_painted: None,
+        confirmation_started: None,
     });
 
     application()
         .with_assets(LecternAssets)
         .run(move |cx: &mut App| {
             gpui_base::init(cx);
+            cx.bind_keys([
+                KeyBinding::new("cmd-a", SelectAllBooks, Some("LecternLibrary")),
+                KeyBinding::new("ctrl-a", SelectAllBooks, Some("LecternLibrary")),
+                KeyBinding::new("escape", ClearBookSelection, Some("LecternLibrary")),
+            ]);
             install_theme(cx, PrimerTheme::light());
             let bounds =
                 Bounds::centered(None, size(px(WINDOW_WIDTH_PX), px(WINDOW_HEIGHT_PX)), cx);
@@ -70,6 +104,12 @@ struct LecternView {
     library_state: LibraryState,
     library_total: u64,
     books: Vec<LibraryBook>,
+    query: LibraryQuery,
+    selection: GridSelection,
+    selection_generation: u64,
+    selection_pending: Option<PendingSelection>,
+    removal_confirmation: Option<BulkRemovalConfirmation>,
+    removing: bool,
     busy: bool,
     status: Option<SharedString>,
     initial_frame_scheduled: bool,
@@ -83,11 +123,28 @@ impl LecternView {
         } else {
             LibraryState::Loading
         };
+        let library_selection_benchmark = benchmark
+            .as_ref()
+            .is_some_and(|benchmark| benchmark.workload == BenchmarkWorkload::LibrarySelection);
         Self {
             database_path: default_database_path(),
             library_state,
-            library_total: 0,
-            books: Vec::new(),
+            library_total: if library_selection_benchmark {
+                50_000
+            } else {
+                0
+            },
+            books: if library_selection_benchmark {
+                benchmark_library_books()
+            } else {
+                Vec::new()
+            },
+            query: LibraryQuery::default(),
+            selection: GridSelection::default(),
+            selection_generation: 0,
+            selection_pending: None,
+            removal_confirmation: None,
+            removing: false,
             busy: false,
             status: None,
             initial_frame_scheduled: false,
@@ -98,13 +155,74 @@ impl LecternView {
     fn initial_frame_presented(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(benchmark) = &mut self.benchmark {
             benchmark.initial_render = Some(benchmark.main_entry.elapsed());
-            self.start_add_books(window, cx);
+            match benchmark.workload {
+                BenchmarkWorkload::EmptyLibraryAddBooks => self.start_add_books(window, cx),
+                BenchmarkWorkload::LibrarySelection => {
+                    self.start_benchmark_selection(window, cx);
+                }
+            }
             return;
         }
         self.load_library(window, cx);
     }
 
+    fn start_benchmark_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let first = self
+            .books
+            .first()
+            .expect("selection benchmark has a first book")
+            .summary
+            .id;
+        let benchmark = self
+            .benchmark
+            .as_mut()
+            .expect("selection benchmark state is present");
+        benchmark.action_started = Some(Instant::now());
+        self.selection.begin_explicit();
+        self.selection.toggle(first, 0);
+        cx.notify();
+        cx.on_next_frame(window, Self::benchmark_selection_presented);
+    }
+
+    fn benchmark_selection_presented(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let benchmark = self
+            .benchmark
+            .as_mut()
+            .expect("selection benchmark state is present");
+        benchmark.selection_painted = Some(
+            benchmark
+                .action_started
+                .expect("selection benchmark action started")
+                .elapsed(),
+        );
+        self.removal_confirmation = Some(BulkRemovalConfirmation {
+            selection: self
+                .selection
+                .descriptor()
+                .expect("selection benchmark descriptor is present"),
+            selected_books: self.selection.selected_count(),
+        });
+        benchmark.confirmation_started = Some(Instant::now());
+        cx.notify();
+        cx.on_next_frame(window, Self::benchmark_confirmation_presented);
+    }
+
+    fn benchmark_confirmation_presented(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let benchmark = self
+            .benchmark
+            .take()
+            .expect("selection benchmark state is present");
+        benchmark.finish_selection(
+            self.library_total,
+            self.books.len(),
+            self.selection.selected_count(),
+            self.removal_confirmation.is_some(),
+        );
+        cx.quit();
+    }
+
     fn load_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_selection();
         self.library_state = LibraryState::Loading;
         let database_path = self.database_path.clone();
         let load = cx.background_executor().spawn(async move {
@@ -130,7 +248,7 @@ impl LecternView {
     }
 
     fn start_add_books(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.busy || self.removing || self.selection_pending.is_some() {
             return;
         }
         self.busy = true;
@@ -193,6 +311,7 @@ impl LecternView {
                 this.library_state = LibraryState::Ready;
                 match result {
                     Ok((summary, snapshot)) => {
+                        this.clear_selection();
                         this.apply_snapshot(snapshot);
                         this.status = import_status(&summary);
                     }
@@ -221,6 +340,251 @@ impl LecternView {
             .collect();
     }
 
+    fn clear_selection(&mut self) {
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.selection_pending = None;
+        self.selection.clear();
+        self.removal_confirmation = None;
+    }
+
+    fn begin_selection(&mut self, cx: &mut Context<Self>) {
+        if self.busy || self.removing {
+            return;
+        }
+        self.selection.begin_explicit();
+        self.status = None;
+        cx.notify();
+    }
+
+    fn clear_selection_action(&mut self, cx: &mut Context<Self>) {
+        if self.removing || (!self.selection.is_active() && self.selection_pending.is_none()) {
+            return;
+        }
+        self.clear_selection();
+        self.status = Some("Selection cleared.".into());
+        cx.notify();
+    }
+
+    fn toggle_book(&mut self, id: BookId, index: usize, cx: &mut Context<Self>) {
+        if self.busy || self.removing || self.selection_pending.is_some() {
+            return;
+        }
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.selection.toggle(id, index);
+        self.status = None;
+        cx.notify();
+    }
+
+    fn handle_book_click(
+        &mut self,
+        id: BookId,
+        index: usize,
+        modifiers: gpui::Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if modifiers.shift && self.selection.anchor.is_some() {
+            self.select_range_to(index, window, cx);
+        } else if self.selection.is_active() || modifiers.secondary() {
+            self.toggle_book(id, index, cx);
+        }
+    }
+
+    fn select_range_to(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.removing || self.selection_pending.is_some() {
+            return;
+        }
+        let Some(anchor) = self.selection.anchor else {
+            return;
+        };
+        let offset = anchor.index.min(index);
+        let length = anchor.index.max(index).saturating_sub(offset) + 1;
+        let (Ok(offset), Ok(limit)) = (u64::try_from(offset), u32::try_from(length)) else {
+            self.status = Some("Selection range exceeds this platform's supported size.".into());
+            cx.notify();
+            return;
+        };
+        let generation = self.selection_generation.wrapping_add(1);
+        self.selection_generation = generation;
+        self.selection_pending = Some(PendingSelection::Range);
+        self.status = None;
+        cx.notify();
+
+        let database_path = self.database_path.clone();
+        let query = self.query.clone();
+        let resolve = cx.background_executor().spawn(async move {
+            resolve_selection_range(&database_path, &query, offset, limit)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = resolve.await;
+            this.update(cx, |this, cx| {
+                if generation != this.selection_generation
+                    || !matches!(this.selection_pending, Some(PendingSelection::Range))
+                {
+                    return;
+                }
+                this.selection_pending = None;
+                match result {
+                    Ok(books) => {
+                        this.selection.install_range(books);
+                        this.status = None;
+                    }
+                    Err(error) => {
+                        this.status = Some(format!("Could not select that range: {error}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn select_all_matching(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy
+            || self.removing
+            || self.library_total == 0
+            || self.selection_pending.is_some()
+            || self.selection.is_every_matching()
+        {
+            return;
+        }
+        let generation = self.selection_generation.wrapping_add(1);
+        self.selection_generation = generation;
+        self.selection_pending = Some(PendingSelection::AllMatching);
+        self.status = None;
+        cx.notify();
+
+        let database_path = self.database_path.clone();
+        let query = self.query.clone();
+        let resolved_query = query.clone();
+        let resolve = cx.background_executor().spawn(async move {
+            resolve_selection_snapshot(&database_path, &query).map_err(|error| error.to_string())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = resolve.await;
+            this.update(cx, |this, cx| {
+                if generation != this.selection_generation
+                    || !matches!(this.selection_pending, Some(PendingSelection::AllMatching))
+                {
+                    return;
+                }
+                this.selection_pending = None;
+                match result {
+                    Ok(snapshot) => {
+                        this.selection
+                            .install_all_matching(resolved_query, snapshot);
+                        this.status = None;
+                    }
+                    Err(error) => {
+                        this.status =
+                            Some(format!("Could not select matching books: {error}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn request_bulk_removal(&mut self, cx: &mut Context<Self>) {
+        if self.busy || self.removing || self.selection_pending.is_some() {
+            return;
+        }
+        let Some(selection) = self.selection.descriptor() else {
+            return;
+        };
+        let selected_books = self.selection.selected_count();
+        if selected_books == 0 {
+            return;
+        }
+        self.removal_confirmation = Some(BulkRemovalConfirmation {
+            selection,
+            selected_books,
+        });
+        cx.notify();
+    }
+
+    fn cancel_bulk_removal(&mut self, cx: &mut Context<Self>) {
+        self.removal_confirmation = None;
+        cx.notify();
+    }
+
+    fn start_bulk_removal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(confirmation) = self.removal_confirmation.take() else {
+            return;
+        };
+        if self.busy
+            || self.removing
+            || self.selection.selected_count() != confirmation.selected_books
+            || self.selection.descriptor().as_ref() != Some(&confirmation.selection)
+        {
+            self.status = Some(
+                "The selection changed; review it before removing books."
+                    .to_owned()
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+
+        self.removing = true;
+        self.status = Some(
+            format!(
+                "Removing {} selected {} from the library…",
+                confirmation.selected_books,
+                pluralize_book(confirmation.selected_books),
+            )
+            .into(),
+        );
+        cx.notify();
+
+        let database_path = self.database_path.clone();
+        let remove = cx.background_executor().spawn(async move {
+            remove_books_and_load_library(&database_path, &confirmation.selection)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = remove.await;
+            this.update(cx, |this, cx| {
+                this.removing = false;
+                match result {
+                    Ok(completion) => {
+                        this.clear_selection();
+                        let status = format!(
+                            "Removed {} {} from the library; book files were kept.",
+                            completion.result.books_removed,
+                            pluralize_book(completion.result.books_removed),
+                        );
+                        match completion.snapshot {
+                            Ok(snapshot) => {
+                                this.apply_snapshot(snapshot);
+                                this.status = Some(status.into());
+                            }
+                            Err(error) => {
+                                this.library_total = 0;
+                                this.books.clear();
+                                this.status = Some(
+                                    format!("{status} Could not refresh the library: {error}")
+                                        .into(),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        this.status =
+                            Some(format!("Could not remove selected books: {error}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn add_books_button(&self, id: &'static str, cx: &mut Context<Self>) -> Button {
         let button_label = if self.busy {
             "Adding books…"
@@ -230,10 +594,180 @@ impl LecternView {
         Button::new(id, button_label)
             .variant(ButtonVariant::Primary)
             .leading_icon(TablerIcon::Upload)
-            .disabled(self.busy)
+            .disabled(self.busy || self.removing || self.selection_pending.is_some())
             .on_click(cx.listener(|this, _, window, cx| {
                 this.start_add_books(window, cx);
             }))
+    }
+
+    fn selection_bar(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> gpui::Div {
+        let selected_books = self.selection.selected_count();
+        let label = if self.removing {
+            format!(
+                "Removing {selected_books} selected {}…",
+                pluralize_book(selected_books)
+            )
+        } else if self.selection_pending.is_some() {
+            "Resolving selection…".to_owned()
+        } else {
+            selection_status(&self.selection)
+        };
+
+        div()
+            .flex_none()
+            .h(px(SELECTION_BAR_HEIGHT_PX))
+            .p(theme.spacing.small)
+            .border_b(theme.border.thin)
+            .border_color(theme.border.muted)
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_size(theme.typography.body_size)
+                    .font_weight(theme.typography.button_weight)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(theme.spacing.small)
+                    .when(!self.selection.is_every_matching(), |actions| {
+                        actions.child(
+                            Button::new("select-all-matching", "Select all matching")
+                                .disabled(
+                                    self.busy || self.removing || self.selection_pending.is_some(),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.select_all_matching(window, cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("clear-selection", "Clear selection")
+                            .disabled(self.removing)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.clear_selection_action(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("remove-selected", "Remove from library")
+                            .variant(ButtonVariant::Danger)
+                            .disabled(
+                                selected_books == 0
+                                    || self.busy
+                                    || self.removing
+                                    || self.selection_pending.is_some(),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.request_bulk_removal(cx);
+                            })),
+                    ),
+            )
+    }
+
+    fn bulk_removal_dialog(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> AlertDialog {
+        let confirmation = self
+            .removal_confirmation
+            .as_ref()
+            .expect("bulk removal dialog requires a confirmation");
+        let selected_books = confirmation.selected_books;
+        let entity = cx.entity().downgrade();
+        let cancel_entity = entity.clone();
+        let confirm_entity = entity.clone();
+        let close_entity = entity.clone();
+
+        AlertDialog::new(cx)
+            .open(true)
+            .on_open_change(move |open, _, _, cx| {
+                if !open {
+                    _ = close_entity.update(cx, LecternView::cancel_bulk_removal);
+                }
+            })
+            .on_cancel(move |_, _, cx| {
+                _ = cancel_entity.update(cx, LecternView::cancel_bulk_removal);
+                true
+            })
+            .on_ok(move |_, window, cx| {
+                _ = confirm_entity.update(cx, |this, cx| {
+                    this.start_bulk_removal(window, cx);
+                });
+                true
+            })
+            .backdrop(
+                AlertDialogBackdrop::new()
+                    .absolute()
+                    .inset_0()
+                    .bg(theme.dialog.backdrop),
+            )
+            .popup(
+                AlertDialogPopup::new()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(BULK_REMOVAL_DIALOG_WIDTH_PX))
+                            .p(theme.spacing.extra_large)
+                            .rounded(theme.dialog.radius)
+                            .border(theme.border.thin)
+                            .border_color(theme.border.muted)
+                            .bg(theme.surface.background)
+                            .flex()
+                            .flex_col()
+                            .gap(theme.spacing.medium)
+                            .child(
+                                AlertDialogTitle::new()
+                                    .text_size(theme.typography.title_size)
+                                    .font_weight(theme.typography.title_weight)
+                                    .child("Remove selected books from library?"),
+                            )
+                            .child(
+                                AlertDialogDescription::new()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(theme.spacing.small)
+                                    .text_size(theme.typography.body_size)
+                                    .child(format!(
+                                        "Remove {selected_books} selected {} from Lectern?",
+                                        pluralize_book(selected_books),
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_color(theme.surface.muted_foreground)
+                                            .child("Their EPUB and PDF files will remain on disk. This only removes Lectern’s metadata, cached covers, and file relationships."),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mt(theme.spacing.medium)
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .gap(theme.spacing.small)
+                                    .child(
+                                        Button::new("cancel-bulk-removal", "Cancel").on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.cancel_bulk_removal(cx);
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        Button::new(
+                                            "confirm-bulk-removal",
+                                            "Remove from library",
+                                        )
+                                        .variant(ButtonVariant::Danger)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.start_bulk_removal(window, cx);
+                                        })),
+                                    ),
+                            ),
+                    ),
+            )
     }
 
     fn loading_view(theme: &PrimerTheme) -> gpui::Div {
@@ -289,6 +823,10 @@ impl LecternView {
             )
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one declarative render tree keeps the three fixed library regions auditable"
+    )]
     fn library_view(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> gpui::Div {
         let book_count = format!(
             "{} {}",
@@ -299,10 +837,23 @@ impl LecternView {
                 "books"
             }
         );
+        let selection_active = self.selection.is_active();
+        let selection_locked = self.busy || self.removing || self.selection_pending.is_some();
         let cards = self
             .books
             .iter()
-            .map(|book| book_card(book, theme))
+            .enumerate()
+            .map(|(index, book)| {
+                book_card(
+                    book,
+                    index,
+                    self.selection.contains(book.summary.id),
+                    selection_active,
+                    selection_locked,
+                    theme,
+                    cx,
+                )
+            })
             .collect::<Vec<_>>();
 
         div()
@@ -325,7 +876,24 @@ impl LecternView {
                             .font_weight(theme.typography.title_weight)
                             .child("Lectern"),
                     )
-                    .child(self.add_books_button("library-add-books", cx)),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(theme.spacing.small)
+                            .child(
+                                Button::new("begin-selection", "Select books")
+                                    .disabled(selection_active || selection_locked)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.begin_selection(cx);
+                                    })),
+                            )
+                            .child(self.add_books_button("library-add-books", cx)),
+                    ),
+            )
+            .when(
+                selection_active || self.selection_pending.is_some(),
+                |content| content.child(self.selection_bar(theme, cx)),
             )
             .child(
                 div()
@@ -404,7 +972,17 @@ impl Render for LecternView {
             .text_color(theme.surface.foreground)
             .flex()
             .flex_col()
+            .key_context("LecternLibrary")
+            .on_action(cx.listener(|this, _: &SelectAllBooks, window, cx| {
+                this.select_all_matching(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ClearBookSelection, _, cx| {
+                this.clear_selection_action(cx);
+            }))
             .child(content)
+            .when(self.removal_confirmation.is_some(), |root| {
+                root.child(self.bulk_removal_dialog(&theme, cx))
+            })
     }
 }
 
@@ -427,6 +1005,156 @@ struct LibrarySnapshot {
 struct LibraryBook {
     summary: BookSummary,
     cover: Option<Arc<Image>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GridSelectionMode {
+    Explicit(HashSet<BookId>),
+    AllMatching {
+        query: LibraryQuery,
+        generation: LibraryGeneration,
+        matching_books: u64,
+        excluded: HashSet<BookId>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SelectionAnchor {
+    index: usize,
+}
+
+#[derive(Default)]
+struct GridSelection {
+    mode: Option<GridSelectionMode>,
+    anchor: Option<SelectionAnchor>,
+}
+
+impl GridSelection {
+    fn is_active(&self) -> bool {
+        self.mode.is_some()
+    }
+
+    fn contains(&self, id: BookId) -> bool {
+        match &self.mode {
+            Some(GridSelectionMode::Explicit(books)) => books.contains(&id),
+            Some(GridSelectionMode::AllMatching { excluded, .. }) => !excluded.contains(&id),
+            None => false,
+        }
+    }
+
+    fn selected_count(&self) -> u64 {
+        match &self.mode {
+            Some(GridSelectionMode::Explicit(books)) => {
+                u64::try_from(books.len()).unwrap_or(u64::MAX)
+            }
+            Some(GridSelectionMode::AllMatching {
+                matching_books,
+                excluded,
+                ..
+            }) => matching_books.saturating_sub(u64::try_from(excluded.len()).unwrap_or(u64::MAX)),
+            None => 0,
+        }
+    }
+
+    fn is_every_matching(&self) -> bool {
+        matches!(
+            &self.mode,
+            Some(GridSelectionMode::AllMatching { excluded, .. }) if excluded.is_empty()
+        )
+    }
+
+    fn toggle(&mut self, id: BookId, index: usize) {
+        match self
+            .mode
+            .get_or_insert_with(|| GridSelectionMode::Explicit(HashSet::with_capacity(1)))
+        {
+            GridSelectionMode::Explicit(books) => {
+                if !books.insert(id) {
+                    books.remove(&id);
+                }
+            }
+            GridSelectionMode::AllMatching { excluded, .. } => {
+                if !excluded.insert(id) {
+                    excluded.remove(&id);
+                }
+            }
+        }
+        self.anchor = Some(SelectionAnchor { index });
+        if self.selected_count() == 0 {
+            self.clear();
+        }
+    }
+
+    fn begin_explicit(&mut self) {
+        if self.mode.is_none() {
+            self.mode = Some(GridSelectionMode::Explicit(HashSet::with_capacity(1)));
+            self.anchor = None;
+        }
+    }
+
+    fn install_range(&mut self, books: Vec<BookId>) {
+        let books = books.into_iter().collect::<HashSet<_>>();
+        if books.is_empty() {
+            self.clear();
+        } else {
+            self.mode = Some(GridSelectionMode::Explicit(books));
+        }
+    }
+
+    fn install_all_matching(&mut self, query: LibraryQuery, snapshot: SelectionSnapshot) {
+        if snapshot.matching_books == 0 {
+            self.clear();
+        } else {
+            self.mode = Some(GridSelectionMode::AllMatching {
+                query,
+                generation: snapshot.generation,
+                matching_books: snapshot.matching_books,
+                excluded: HashSet::new(),
+            });
+            self.anchor = None;
+        }
+    }
+
+    fn descriptor(&self) -> Option<BookSelection> {
+        match &self.mode {
+            Some(GridSelectionMode::Explicit(books)) => {
+                Some(BookSelection::explicit(books.iter().copied().collect()))
+            }
+            Some(GridSelectionMode::AllMatching {
+                query,
+                generation,
+                excluded,
+                ..
+            }) => Some(BookSelection::all_matching(
+                query.clone(),
+                *generation,
+                excluded.iter().copied().collect(),
+            )),
+            None => None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.mode = None;
+        self.anchor = None;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PendingSelection {
+    Range,
+    AllMatching,
+}
+
+#[derive(Clone)]
+struct BulkRemovalConfirmation {
+    selection: BookSelection,
+    selected_books: u64,
+}
+
+struct RemovalCompletion {
+    result: BulkRemovalResult,
+    snapshot: Result<LibrarySnapshot, LibraryServiceError>,
 }
 
 fn load_library_snapshot(path: &Path) -> Result<LibrarySnapshot, LibraryServiceError> {
@@ -463,6 +1191,34 @@ fn import_books_and_load_library(
     Ok((summary, snapshot))
 }
 
+fn resolve_selection_snapshot(
+    path: &Path,
+    query: &LibraryQuery,
+) -> Result<SelectionSnapshot, LibraryServiceError> {
+    let mut service = SqliteLibraryService::open(path)?;
+    service.selection_snapshot(query)
+}
+
+fn resolve_selection_range(
+    path: &Path,
+    query: &LibraryQuery,
+    offset: u64,
+    limit: u32,
+) -> Result<Vec<BookId>, LibraryServiceError> {
+    let mut service = SqliteLibraryService::open(path)?;
+    service.query_library_ids_window(query, offset, limit)
+}
+
+fn remove_books_and_load_library(
+    path: &Path,
+    selection: &BookSelection,
+) -> Result<RemovalCompletion, LibraryServiceError> {
+    let mut service = SqliteLibraryService::open(path)?;
+    let result = service.remove_books(selection)?;
+    let snapshot = load_library_snapshot_from(&mut service);
+    Ok(RemovalCompletion { result, snapshot })
+}
+
 fn import_status(summary: &ImportSummary) -> Option<SharedString> {
     if summary.discovered == 0 {
         return Some("No EPUB or PDF files were found.".into());
@@ -483,7 +1239,15 @@ fn import_status(summary: &ImportSummary) -> Option<SharedString> {
     )
 }
 
-fn book_card(book: &LibraryBook, theme: &PrimerTheme) -> gpui::Div {
+fn book_card(
+    book: &LibraryBook,
+    index: usize,
+    selected: bool,
+    selection_active: bool,
+    selection_locked: bool,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
     let cover = if let Some(cover) = &book.cover {
         img(Arc::clone(cover))
             .w_full()
@@ -509,12 +1273,30 @@ fn book_card(book: &LibraryBook, theme: &PrimerTheme) -> gpui::Div {
         book.summary.authors.clone()
     };
 
-    div()
+    let book_id = book.summary.id;
+    let card = div()
+        .id(format!("book-card-{}", book_id.value()))
         .w(px(BOOK_CARD_WIDTH_PX))
         .flex_none()
+        .p(theme.spacing.small)
+        .rounded(theme.button.radius)
         .flex()
         .flex_col()
         .gap(theme.spacing.small)
+        .relative()
+        .when(selected, |card| {
+            card.bg(theme.selection.background)
+                .border(theme.border.thin)
+                .border_color(theme.selection.border)
+        })
+        .when(selection_active && !selection_locked, |card| {
+            card.cursor_pointer()
+        })
+        .on_click(
+            cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                this.handle_book_click(book_id, index, event.modifiers(), window, cx);
+            }),
+        )
         .child(cover)
         .child(
             div()
@@ -531,18 +1313,179 @@ fn book_card(book: &LibraryBook, theme: &PrimerTheme) -> gpui::Div {
                 .text_color(theme.surface.muted_foreground)
                 .text_size(theme.typography.body_size)
                 .child(authors),
-        )
+        );
+
+    card.when(selection_active, |card| {
+        card.child(book_selection_checkbox(
+            book,
+            index,
+            selected,
+            selection_locked,
+            theme,
+            cx,
+        ))
+    })
+    .into_any_element()
+}
+
+fn book_selection_checkbox(
+    book: &LibraryBook,
+    index: usize,
+    selected: bool,
+    selection_locked: bool,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> Checkbox {
+    let book_id = book.summary.id;
+    let checkbox_entity = cx.entity().downgrade();
+    Checkbox::new(format!("book-checkbox-{}", book_id.value()))
+        .checked(selected)
+        .disabled(selection_locked)
+        .accessibility_label(format!("Select {}", book.summary.title))
+        .absolute()
+        .top(theme.spacing.medium)
+        .right(theme.spacing.medium)
+        .size(theme.spacing.large)
+        .rounded(theme.button.radius)
+        .border(theme.border.thin)
+        .border_color(theme.selection.border)
+        .bg(if selected {
+            theme.selection.check_background
+        } else {
+            theme.surface.background
+        })
+        .text_color(theme.selection.check_foreground)
+        .flex()
+        .items_center()
+        .justify_center()
+        .focus_visible(move |style| {
+            style
+                .border(theme.focus.width)
+                .border_color(theme.focus.color)
+        })
+        .on_change(move |_: CheckboxState, event, window, cx| {
+            cx.stop_propagation();
+            _ = checkbox_entity.update(cx, |this, cx| {
+                this.handle_book_click(book_id, index, event.modifiers(), window, cx);
+            });
+        })
+        .when(selected, |checkbox| checkbox.child("✓"))
+}
+
+fn selection_status(selection: &GridSelection) -> String {
+    let selected = selection.selected_count();
+    if selection.is_every_matching() {
+        format!("All {selected} matching selected")
+    } else if selection.is_active() && selected > 0 {
+        format!("{selected} selected")
+    } else {
+        "Select books for bulk actions".to_owned()
+    }
+}
+
+fn pluralize_book(count: u64) -> &'static str {
+    if count == 1 { "book" } else { "books" }
+}
+
+fn benchmark_library_books() -> Vec<LibraryBook> {
+    (0..LIBRARY_PAGE_SIZE)
+        .map(|index| LibraryBook {
+            summary: BookSummary {
+                id: BookId::new(i64::from(index) + 1),
+                title: format!("Benchmark book {:03}", index + 1),
+                authors: format!("Benchmark author {:03}", index % 32 + 1),
+                series: None,
+                series_index: None,
+                has_cover: false,
+                has_file_issue: false,
+            },
+            cover: None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_selection_toggles_and_builds_a_canonical_descriptor() {
+        let first = BookId::new(4);
+        let second = BookId::new(2);
+        let mut selection = GridSelection::default();
+
+        selection.begin_explicit();
+        selection.toggle(first, 0);
+        selection.toggle(second, 1);
+
+        assert_eq!(selection.selected_count(), 2);
+        assert_eq!(selection_status(&selection), "2 selected");
+        assert_eq!(
+            selection.descriptor(),
+            Some(BookSelection::explicit(vec![second, first]))
+        );
+
+        selection.toggle(first, 0);
+        assert_eq!(selection.selected_count(), 1);
+        assert!(!selection.contains(first));
+    }
+
+    #[test]
+    fn all_matching_selection_tracks_exclusions_without_materializing_books() {
+        let excluded = BookId::new(9);
+        let query = LibraryQuery::default();
+        let generation = LibraryGeneration {
+            connection_changes: 3,
+            data_version: 5,
+        };
+        let mut selection = GridSelection::default();
+        selection.install_all_matching(
+            query.clone(),
+            SelectionSnapshot {
+                matching_books: 50_000,
+                generation,
+            },
+        );
+
+        assert!(selection.is_every_matching());
+        assert_eq!(selection_status(&selection), "All 50000 matching selected");
+
+        selection.toggle(excluded, 8);
+        assert_eq!(selection.selected_count(), 49_999);
+        assert_eq!(
+            selection.descriptor(),
+            Some(BookSelection::all_matching(
+                query,
+                generation,
+                vec![excluded]
+            ))
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BenchmarkWorkload {
+    EmptyLibraryAddBooks,
+    LibrarySelection,
 }
 
 struct BenchmarkRun {
     output: PathBuf,
+    workload: BenchmarkWorkload,
     main_entry: Instant,
     initial_render: Option<Duration>,
     action_started: Option<Instant>,
+    selection_painted: Option<Duration>,
+    confirmation_started: Option<Instant>,
 }
 
 impl BenchmarkRun {
     fn finish(self) {
+        assert_eq!(
+            self.workload,
+            BenchmarkWorkload::EmptyLibraryAddBooks,
+            "Add-books completion belongs to the empty-library benchmark"
+        );
         let sample = UiBenchmarkSample {
             schema_version: 1,
             workload: "empty-library-add-books",
@@ -566,6 +1509,60 @@ impl BenchmarkRun {
         fs::write(&self.output, json).unwrap_or_else(|error| {
             panic!(
                 "write GPUI benchmark sample {}: {error}",
+                self.output.display()
+            )
+        });
+    }
+
+    fn finish_selection(
+        self,
+        library_total: u64,
+        rendered_books: usize,
+        selected_books: u64,
+        confirmation_presented: bool,
+    ) {
+        assert_eq!(
+            self.workload,
+            BenchmarkWorkload::LibrarySelection,
+            "selection completion belongs to the library-selection benchmark"
+        );
+        let mut markers = Vec::with_capacity(4);
+        if selected_books == 1 {
+            markers.push("compact_explicit_selection");
+        }
+        if self.selection_painted.is_some() {
+            markers.push("selection_bar_presented");
+        }
+        if confirmation_presented {
+            markers.push("confirmation_presented");
+            markers.push("removal_copy_mentions_files_remain");
+        }
+        let sample = UiSelectionBenchmarkSample {
+            schema_version: 1,
+            workload: "library-selection",
+            initial_render_ms: millis(self.initial_render.expect("initial frame was measured")),
+            selection_to_paint_ms: millis(
+                self.selection_painted
+                    .expect("selected state was presented"),
+            ),
+            confirmation_to_paint_ms: millis(
+                self.confirmation_started
+                    .expect("confirmation action was started")
+                    .elapsed(),
+            ),
+            peak_rss_bytes: peak_rss_bytes(),
+            correctness: UiSelectionBenchmarkCorrectness {
+                library_total,
+                rendered_books,
+                selected_books,
+                markers,
+            },
+        };
+        let json =
+            serde_json::to_vec_pretty(&sample).expect("serialize GPUI selection benchmark sample");
+        fs::write(&self.output, json).unwrap_or_else(|error| {
+            panic!(
+                "write GPUI selection benchmark sample {}: {error}",
                 self.output.display()
             )
         });
@@ -612,4 +1609,23 @@ struct UiBenchmarkCorrectness {
     busy_button_label: &'static str,
     initial_state_presented: bool,
     busy_state_presented: bool,
+}
+
+#[derive(Serialize)]
+struct UiSelectionBenchmarkSample {
+    schema_version: u32,
+    workload: &'static str,
+    initial_render_ms: f64,
+    selection_to_paint_ms: f64,
+    confirmation_to_paint_ms: f64,
+    peak_rss_bytes: Option<u64>,
+    correctness: UiSelectionBenchmarkCorrectness,
+}
+
+#[derive(Serialize)]
+struct UiSelectionBenchmarkCorrectness {
+    library_total: u64,
+    rendered_books: usize,
+    selected_books: u64,
+    markers: Vec<&'static str>,
 }

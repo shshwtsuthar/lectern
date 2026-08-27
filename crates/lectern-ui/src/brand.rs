@@ -6,6 +6,32 @@ pub(crate) const MAUVE: u32 = 0x9b6a_a6ff;
 /// Lectern's supporting light lavender (`#D8C4E1`).
 pub(crate) const LAVENDER: u32 = 0xd8c4_e1ff;
 
+/// Lectern-owned selected-state colors for one application color mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectionTokens {
+    pub(crate) background: u32,
+    pub(crate) border: u32,
+    pub(crate) check_background: u32,
+    pub(crate) check_foreground: u32,
+}
+
+pub(crate) const LIGHT_SELECTION: SelectionTokens = SelectionTokens {
+    background: 0xf6ef_f8ff,
+    border: 0x9560_9fff,
+    check_background: 0x9560_9fff,
+    check_foreground: 0xffff_ffff,
+};
+
+pub(crate) const DARK_SELECTION: SelectionTokens = SelectionTokens {
+    background: 0x2d22_30ff,
+    border: LAVENDER,
+    check_background: MAUVE,
+    check_foreground: 0x0d11_17ff,
+};
+
+/// Scrim used behind modal Lectern surfaces.
+pub(crate) const DIALOG_BACKDROP: u32 = 0x0000_0066;
+
 /// One complete, theme-specific primary-button color contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PrimaryButtonTokens {
@@ -97,6 +123,17 @@ mod tests {
                     "{name} {state} contrast {ratio:.3} is below {MINIMUM_NORMAL_TEXT_CONTRAST}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn checked_selection_indicators_meet_normal_text_contrast() {
+        for (name, tokens) in [("light", LIGHT_SELECTION), ("dark", DARK_SELECTION)] {
+            let ratio = contrast_ratio(tokens.check_background, tokens.check_foreground);
+            assert!(
+                ratio >= MINIMUM_NORMAL_TEXT_CONTRAST,
+                "{name} checked-indicator contrast {ratio:.3} is below {MINIMUM_NORMAL_TEXT_CONTRAST}"
+            );
         }
     }
 }

@@ -94,6 +94,14 @@ sample, verifies the exact empty-library and busy-state copy, measures main entr
 painted frame and Add-books dispatch to the painted busy state, and gates p95 latency plus peak RSS.
 It requires an active X11 or Wayland display.
 
+The GPUI selection workload in
+[`ui-selection-regression-v1.json`](ui-selection-regression-v1.json) launches the same optimized
+binary with a deterministic 50,000-book projection and a bounded 128-card first page. It retains 40
+measured fresh-process samples after 5 warmups, verifies that selection remains a compact descriptor,
+and measures the initial populated-library paint, selection dispatch through the painted contextual
+bar, and destructive-confirmation dispatch through its painted modal. The exact removal transaction
+and refreshed first page remain covered by `bulk-remove-regression-v1`.
+
 Performance-sensitive pull requests additionally run the base and candidate revisions three times
 each on the same runner. The gate compares the median of their run-level p95 values and fails a
 scenario when it exceeds both the versioned percentage limit and minimum material latency delta.
@@ -139,6 +147,8 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/saved-searches-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/ui-bootstrap-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/ui-selection-regression-v1.json
 ```
 
 Use `--output-dir PATH` to choose a new artifact directory, or `--budget PATH` to evaluate a

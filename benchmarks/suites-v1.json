@@ -73,6 +73,10 @@
     {
       "name": "ui-bootstrap-v1",
       "budget": "benchmarks/ui-bootstrap-regression-v1.json"
+    },
+    {
+      "name": "ui-selection-v1",
+      "budget": "benchmarks/ui-selection-regression-v1.json"
     }
   ]
 }
