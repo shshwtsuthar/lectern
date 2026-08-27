@@ -3,10 +3,10 @@
 ## Journey and workload
 
 The first call site is the right-side book-details editor: changing title, contributor names,
-series book number, publisher, description, and the search queries inside the Series and Tag menus
-for one selected book. Language, Series identity, and contributor roles use the ActionMenu contract
-rather than a free-form metadata field. Its
-representative release workload is `ui-book-detail-regression-v1`, which opens a complete book
+series book number, publisher, publication date, description, and the search queries inside the
+Series and Tag menus for one selected book. Language, Series identity, and contributor roles use the
+ActionMenu contract rather than a free-form metadata field. Its
+representative release workload is `ui-book-detail-regression-v2`, which opens a complete book
 fixture with normalized contributors, series membership, tags, and two assets. It retains raw
 samples and checks open-to-painted-detail p95, first-paint latency, peak RSS, and fixture
 correctness. `ui-bootstrap-regression-v1` also guards the component gallery and shared theme path.

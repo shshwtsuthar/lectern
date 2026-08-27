@@ -128,6 +128,18 @@ light- and dark-mode values as named tag-palette tokens in the Lectern theme. Ex
 to Slate. New tags require an explicit color choice after their normalized name is confirmed. Do
 not introduce arbitrary per-tag color literals in product render code.
 
+## Personal ratings
+
+Personal book ratings use five compact star shapes and accept exact half-star values from zero to
+five. Each half is an independent pointer and keyboard target with an accessible value label. A
+second activation of the current value clears the rating to zero, and a visible **Clear** action is
+shown whenever a rating is present.
+
+Filled stars use the selected Lectern accent through explicitly named rating theme tokens; empty
+and disabled stars use their own theme-resolved values. Do not use tag-palette Amber or a local
+color literal merely because gold stars are conventional. The numeric value remains visible beside
+the stars so rating state never depends on color or fill alone.
+
 ## Subtle surface separators
 
 Use a thin, low-contrast border when adjacent application regions need a persistent boundary but
