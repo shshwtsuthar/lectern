@@ -316,7 +316,7 @@ impl LecternView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .px(theme.spacing.extra_large)
+                    .p(theme.spacing.small)
                     .child(
                         div()
                             .text_size(theme.typography.title_size)
