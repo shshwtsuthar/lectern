@@ -1051,6 +1051,8 @@ mod tests {
                 "40",
                 "--warmup",
                 "10",
+                "--fixture-version",
+                "3",
             ]
             .into_iter()
             .map(std::ffi::OsString::from),
@@ -1058,7 +1060,8 @@ mod tests {
         .unwrap();
         assert_eq!(command, "query");
         assert_eq!(options.iterations, 40);
-        assert_eq!(Scenario::ALL.len(), 8);
+        assert_eq!(options.fixture_version, 3);
+        assert_eq!(Scenario::ALL.len(), 9);
     }
 
     #[test]
