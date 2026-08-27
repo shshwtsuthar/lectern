@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-organisation-regression-budget",
+  "workload": {
+    "query_mode": "organisation-query",
+    "fixture_version": 2,
+    "books": 50000,
+    "seed": 20260825,
+    "cover_every": 3,
+    "page_size": 128,
+    "contributors": 20000,
+    "series": 2500,
+    "tags": 500,
+    "tags_per_book": 8,
+    "contributors_per_book": {
+      "minimum": 1,
+      "maximum": 4
+    },
+    "series_membership_percent": 70,
+    "saved_searches": 250,
+    "autocomplete_limit": 50,
+    "warmup_iterations": 10,
+    "measured_iterations": 40,
+    "scenarios": [
+      "contributor_first_page",
+      "series_first_page_sorted",
+      "two_included_tags_first_page",
+      "included_excluded_tags_first_page",
+      "combined_fielded_projection_first_page",
+      "deep_bounded_page_without_count",
+      "bounded_vocabulary_autocomplete",
+      "series_index_availability"
+    ],
+    "correctness": [
+      "exact_ids",
+      "matching_counts",
+      "stable_order",
+      "unique_book_rows",
+      "covering_query_plans",
+      "bounded_autocomplete",
+      "series_index_availability"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 0.25
+  },
+  "budgets": {
+    "contributor_first_page": {
+      "max_p95_ms": 50
+    },
+    "series_first_page_sorted": {
+      "max_p95_ms": 50
+    },
+    "two_included_tags_first_page": {
+      "max_p95_ms": 50
+    },
+    "included_excluded_tags_first_page": {
+      "max_p95_ms": 50
+    },
+    "combined_fielded_projection_first_page": {
+      "max_p95_ms": 50
+    },
+    "deep_bounded_page_without_count": {
+      "max_p95_ms": 50
+    },
+    "bounded_vocabulary_autocomplete": {
+      "max_p95_ms": 50
+    },
+    "series_index_availability": {
+      "max_p95_ms": 50
+    }
+  }
+}

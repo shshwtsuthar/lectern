@@ -34,14 +34,15 @@ class CiPerformanceTests(unittest.TestCase):
                 "replace-asset-v1",
                 "export-asset-v1",
                 "reimport-known-path-v1",
-                "organisation-migration-v1",
-                "organisation-query-v1",
-                "organisation-vocabulary-v1",
-                "bulk-tags-v1",
-                "bulk-remove-v1",
-                "saved-searches-v1",
+                "organisation-migration-v2",
+                "organisation-query-v2",
+                "organisation-vocabulary-v2",
+                "bulk-tags-v2",
+                "bulk-remove-v2",
+                "saved-searches-v2",
                 "ui-bootstrap-v1",
                 "ui-selection-v1",
+                "ui-book-detail-v1",
             ],
         )
         self.assertIn(
@@ -53,15 +54,15 @@ class CiPerformanceTests(unittest.TestCase):
         )
         self.assertIn(
             {
-                "name": "bulk-tags-v1",
-                "budget": "benchmarks/bulk-tags-regression-v1.json",
+                "name": "bulk-tags-v2",
+                "budget": "benchmarks/bulk-tags-regression-v2.json",
             },
             registry["suites"],
         )
         self.assertIn(
             {
-                "name": "saved-searches-v1",
-                "budget": "benchmarks/saved-searches-regression-v1.json",
+                "name": "saved-searches-v2",
+                "budget": "benchmarks/saved-searches-regression-v2.json",
             },
             registry["suites"],
         )

@@ -15,7 +15,7 @@ SPEC.loader.exec_module(REGRESSION)
 
 
 def checked_in_budget() -> dict:
-    with (BENCHMARKS / "bulk-tags-regression-v1.json").open(encoding="utf-8") as source:
+    with (BENCHMARKS / "bulk-tags-regression-v2.json").open(encoding="utf-8") as source:
         return json.load(source)
 
 

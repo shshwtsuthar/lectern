@@ -32,6 +32,7 @@ class OrganisationPerformanceContractTests(unittest.TestCase):
         )
         self.assertEqual(workload["series_membership_percent"], 70)
         self.assertEqual(workload["saved_searches"], 250)
+        self.assertEqual(workload["fixture_version"], 2)
 
     def assert_scenarios_have_budgets(self, budget: dict[str, Any]) -> None:
         scenarios = budget["workload"]["scenarios"]
@@ -43,7 +44,7 @@ class OrganisationPerformanceContractTests(unittest.TestCase):
         )
 
     def test_query_contract_covers_every_required_projection(self) -> None:
-        budget = load_budget("organisation-query-regression-v1.json")
+        budget = load_budget("organisation-query-regression-v2.json")
         self.assertEqual(budget["kind"], "lectern-organisation-regression-budget")
         workload = budget["workload"]
         self.assert_common_library(workload)
@@ -60,13 +61,14 @@ class OrganisationPerformanceContractTests(unittest.TestCase):
                 "unique_book_rows",
                 "covering_query_plans",
                 "bounded_autocomplete",
+                "series_index_availability",
             }.issubset(workload["correctness"])
         )
         for scenario in workload["scenarios"]:
             self.assertEqual(budget["budgets"][scenario]["max_p95_ms"], 50)
 
     def test_bulk_contract_bounds_transaction_memory_and_paints(self) -> None:
-        budget = load_budget("bulk-tags-regression-v1.json")
+        budget = load_budget("bulk-tags-regression-v2.json")
         workload = budget["workload"]
         self.assert_common_library(workload)
         self.assertEqual(workload["matching_books"], 10_000)
@@ -87,7 +89,7 @@ class OrganisationPerformanceContractTests(unittest.TestCase):
         )
 
     def test_migration_contract_uses_independent_version_five_copies(self) -> None:
-        budget = load_budget("organisation-migration-regression-v1.json")
+        budget = load_budget("organisation-migration-regression-v2.json")
         workload = budget["workload"]
         self.assertEqual(workload["source_schema_version"], 5)
         self.assertEqual(workload["books"], 50_000)
@@ -96,6 +98,13 @@ class OrganisationPerformanceContractTests(unittest.TestCase):
         migration = budget["budgets"]["migrate_version_five_library"]
         self.assertEqual(migration["max_p95_ms"], 5_000)
         self.assertEqual(migration["max_peak_rss_bytes"], 256 * 1024 * 1024)
+        repair = budget["budgets"]["repair_version_seven_series_numbers"]
+        self.assertEqual(repair["max_p95_ms"], 1_000)
+        self.assertEqual(repair["max_peak_rss_bytes"], 256 * 1024 * 1024)
+        self.assertIn(
+            "duplicate_series_numbers_repaired",
+            workload["correctness"],
+        )
         self.assertIn(
             "failed_migration_preserves_version_five_database",
             workload["correctness"],

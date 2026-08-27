@@ -47,28 +47,28 @@
       "budget": "benchmarks/reimport-known-path-regression-v1.json"
     },
     {
-      "name": "organisation-migration-v1",
-      "budget": "benchmarks/organisation-migration-regression-v1.json"
+      "name": "organisation-migration-v2",
+      "budget": "benchmarks/organisation-migration-regression-v2.json"
     },
     {
-      "name": "organisation-query-v1",
-      "budget": "benchmarks/organisation-query-regression-v1.json"
+      "name": "organisation-query-v2",
+      "budget": "benchmarks/organisation-query-regression-v2.json"
     },
     {
-      "name": "organisation-vocabulary-v1",
-      "budget": "benchmarks/organisation-vocabulary-regression-v1.json"
+      "name": "organisation-vocabulary-v2",
+      "budget": "benchmarks/organisation-vocabulary-regression-v2.json"
     },
     {
-      "name": "bulk-tags-v1",
-      "budget": "benchmarks/bulk-tags-regression-v1.json"
+      "name": "bulk-tags-v2",
+      "budget": "benchmarks/bulk-tags-regression-v2.json"
     },
     {
-      "name": "bulk-remove-v1",
-      "budget": "benchmarks/bulk-remove-regression-v1.json"
+      "name": "bulk-remove-v2",
+      "budget": "benchmarks/bulk-remove-regression-v2.json"
     },
     {
-      "name": "saved-searches-v1",
-      "budget": "benchmarks/saved-searches-regression-v1.json"
+      "name": "saved-searches-v2",
+      "budget": "benchmarks/saved-searches-regression-v2.json"
     },
     {
       "name": "ui-bootstrap-v1",

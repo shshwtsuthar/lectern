@@ -389,6 +389,7 @@ struct MigrationResult {
     fts_equivalent: bool,
     initial_tags_and_saved_searches_empty: bool,
     schema_invariants_valid: bool,
+    duplicate_series_numbers_repaired: bool,
     failed_migration_rolled_back: bool,
     scenarios: Vec<MigrationScenario>,
 }
@@ -422,13 +423,15 @@ fn run_migration(options: &Options) -> Result<(), String> {
     create_parent(&options.output)?;
     validate_source_template(&options.database, options.books)?;
     let rollback_valid = validate_failed_migration_rollback(options)?;
+    let version_seven = version_seven_template_path(&options.output);
+    prepare_version_seven_template(&options.database, &version_seven, options)?;
 
     let rounds = options
         .warmup
         .checked_add(options.iterations)
         .ok_or_else(|| "migration iteration count overflowed".to_owned())?;
     let sampler = MemorySampler::start()?;
-    let mut samples_ns = Vec::with_capacity(options.iterations);
+    let mut version_five_samples_ns = Vec::with_capacity(options.iterations);
     for round in 0..rounds {
         let candidate = candidate_path(&options.output, round);
         copy_database(&options.database, &candidate)?;
@@ -439,11 +442,28 @@ fn run_migration(options: &Options) -> Result<(), String> {
         validate_migrated_candidate(&candidate, options)?;
         remove_database_files(&candidate)?;
         if round >= options.warmup {
-            samples_ns.push(duration_ns(elapsed)?);
+            version_five_samples_ns.push(duration_ns(elapsed)?);
+        }
+    }
+    let mut version_seven_samples_ns = Vec::with_capacity(options.iterations);
+    for round in 0..rounds {
+        let candidate = candidate_path(&options.output, round);
+        copy_database(&version_seven, &candidate)?;
+        let started = Instant::now();
+        let database = LibraryDatabase::open(&candidate).map_err(display_error)?;
+        let elapsed = started.elapsed();
+        drop(database);
+        validate_migrated_candidate(&candidate, options)?;
+        validate_repaired_series_numbers(&candidate, options)?;
+        remove_database_files(&candidate)?;
+        if round >= options.warmup {
+            version_seven_samples_ns.push(duration_ns(elapsed)?);
         }
     }
     let peak_rss_bytes = sampler.finish()?;
     validate_source_template(&options.database, options.books)?;
+    validate_version_seven_template(&version_seven, options)?;
+    remove_database_files(&version_seven)?;
 
     let result = MigrationResult {
         schema_version: 1,
@@ -454,7 +474,7 @@ fn run_migration(options: &Options) -> Result<(), String> {
             .as_millis(),
         database_path: options.database.display().to_string(),
         source_schema_version: 5,
-        final_schema_version: 6,
+        final_schema_version: 8,
         library_books: options.books,
         warmup_iterations: options.warmup,
         measured_iterations: options.iterations,
@@ -463,20 +483,136 @@ fn run_migration(options: &Options) -> Result<(), String> {
         fts_equivalent: true,
         initial_tags_and_saved_searches_empty: true,
         schema_invariants_valid: true,
+        duplicate_series_numbers_repaired: true,
         failed_migration_rolled_back: rollback_valid,
-        scenarios: vec![MigrationScenario {
-            name: "migrate_version_five_library",
-            successful_migrations: rounds,
-            latency_ms: summarize_latency(&samples_ns),
-            samples_ns,
-            peak_rss_bytes,
-        }],
+        scenarios: vec![
+            MigrationScenario {
+                name: "migrate_version_five_library",
+                successful_migrations: rounds,
+                latency_ms: summarize_latency(&version_five_samples_ns),
+                samples_ns: version_five_samples_ns,
+                peak_rss_bytes,
+            },
+            MigrationScenario {
+                name: "repair_version_seven_series_numbers",
+                successful_migrations: rounds,
+                latency_ms: summarize_latency(&version_seven_samples_ns),
+                samples_ns: version_seven_samples_ns,
+                peak_rss_bytes,
+            },
+        ],
     };
     write_json(&options.output, &result)?;
     println!(
-        "Measured {} independent version-five migrations over {} books",
+        "Measured {} independent version-five and version-seven migrations over {} books",
         options.iterations, options.books
     );
+    Ok(())
+}
+
+fn prepare_version_seven_template(
+    version_five: &Path,
+    destination: &Path,
+    options: &Options,
+) -> Result<(), String> {
+    copy_database(version_five, destination)?;
+    drop(LibraryDatabase::open(destination).map_err(display_error)?);
+    let connection = Connection::open(destination).map_err(display_error)?;
+    connection
+        .execute_batch(
+            "DROP INDEX series_memberships_series_number_uidx; \
+             UPDATE series_memberships SET series_index = 1000000; \
+             UPDATE books SET series_index = 1000000 WHERE series IS NOT NULL; \
+             PRAGMA user_version = 7;",
+        )
+        .map_err(display_error)?;
+    let journal_mode = connection
+        .query_row("PRAGMA journal_mode = DELETE", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(display_error)?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
+        return Err(format!(
+            "version-seven template could not consolidate its journal: {journal_mode}"
+        ));
+    }
+    drop(connection);
+    validate_version_seven_template(destination, options)
+}
+
+fn validate_version_seven_template(path: &Path, options: &Options) -> Result<(), String> {
+    let connection = Connection::open(path).map_err(display_error)?;
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(display_error)?;
+    if version != 7 {
+        return Err(format!(
+            "series-repair source schema is {version}, expected 7"
+        ));
+    }
+    expect_count(&connection, "books", options.books)?;
+    let duplicates: bool = connection
+        .query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM series_memberships \
+                 GROUP BY series_id, series_index HAVING count(*) > 1 \
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(display_error)?;
+    if !duplicates {
+        return Err("version-seven repair fixture contains no duplicate series numbers".into());
+    }
+    Ok(())
+}
+
+fn validate_repaired_series_numbers(path: &Path, options: &Options) -> Result<(), String> {
+    let connection = Connection::open(path).map_err(display_error)?;
+    let numbered: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM series_memberships WHERE series_index IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(display_error)?;
+    if numbered != i64::try_from(expected_series_count(options.books)).map_err(display_error)? {
+        return Err(format!(
+            "series repair retained {numbered} numbers instead of one per series"
+        ));
+    }
+    let invalid: bool = connection
+        .query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM series_memberships membership \
+                 WHERE membership.series_index IS NOT NULL \
+                   AND (EXISTS( \
+                       SELECT 1 FROM series_memberships earlier \
+                       WHERE earlier.series_id = membership.series_id \
+                         AND earlier.book_id < membership.book_id \
+                   ) OR (SELECT series_index FROM books WHERE id = membership.book_id) \
+                       IS NOT membership.series_index) \
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(display_error)?;
+    let stale_unnumbered_projection: bool = connection
+        .query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM series_memberships membership \
+                 JOIN books book ON book.id = membership.book_id \
+                 WHERE membership.series_index IS NULL AND book.series_index IS NOT NULL \
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(display_error)?;
+    if invalid || stale_unnumbered_projection {
+        return Err(
+            "series repair did not retain the lowest-ID number and exact projections".into(),
+        );
+    }
     Ok(())
 }
 
@@ -501,8 +637,8 @@ fn validate_migrated_candidate(path: &Path, options: &Options) -> Result<(), Str
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(display_error)?;
-    if version != 6 {
-        return Err(format!("candidate schema is {version}, expected 6"));
+    if version != 8 {
+        return Err(format!("candidate schema is {version}, expected 8"));
     }
     expect_count(&connection, "books", options.books)?;
     expect_count(&connection, "book_assets", options.books)?;
@@ -520,6 +656,20 @@ fn validate_migrated_candidate(path: &Path, options: &Options) -> Result<(), Str
         "book_covers",
         expected_cover_count(options.books, options.cover_every),
     )?;
+    let unique_series_numbers: bool = connection
+        .query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM sqlite_schema \
+                 WHERE type = 'index' \
+                   AND name = 'series_memberships_series_number_uidx' \
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(display_error)?;
+    if !unique_series_numbers {
+        return Err("migration did not install the unique series-number index".into());
+    }
 
     let mismatches: i64 = connection
         .query_row(
@@ -636,6 +786,13 @@ fn expected_cover_count(books: u64, cover_every: u64) -> u64 {
 fn candidate_path(output: &Path, round: usize) -> PathBuf {
     output.with_file_name(format!(
         ".lectern-organisation-migration-{}-{round}.sqlite3",
+        std::process::id()
+    ))
+}
+
+fn version_seven_template_path(output: &Path) -> PathBuf {
+    output.with_file_name(format!(
+        ".lectern-organisation-migration-{}-v7.sqlite3",
         std::process::id()
     ))
 }

@@ -19,7 +19,7 @@ SPEC.loader.exec_module(REGRESSION)
 
 
 def checked_in_budget() -> dict:
-    with (BENCHMARKS / "organisation-migration-regression-v1.json").open(
+    with (BENCHMARKS / "organisation-migration-regression-v2.json").open(
         encoding="utf-8"
     ) as source:
         return json.load(source)
@@ -29,7 +29,7 @@ def valid_result() -> dict:
     return {
         "library_books": 50_000,
         "source_schema_version": 5,
-        "final_schema_version": 6,
+        "final_schema_version": 8,
         "warmup_iterations": 2,
         "measured_iterations": 20,
         "visible_projections_preserved": True,
@@ -37,6 +37,7 @@ def valid_result() -> dict:
         "fts_equivalent": True,
         "initial_tags_and_saved_searches_empty": True,
         "schema_invariants_valid": True,
+        "duplicate_series_numbers_repaired": True,
         "failed_migration_rolled_back": True,
         "scenarios": [
             {
@@ -45,7 +46,14 @@ def valid_result() -> dict:
                 "samples_ns": [3_000_000_000] * 20,
                 "latency_ms": {"p95": 3_000.0},
                 "peak_rss_bytes": 64 * 1024 * 1024,
-            }
+            },
+            {
+                "name": "repair_version_seven_series_numbers",
+                "successful_migrations": 22,
+                "samples_ns": [500_000_000] * 20,
+                "latency_ms": {"p95": 500.0},
+                "peak_rss_bytes": 64 * 1024 * 1024,
+            },
         ],
     }
 
@@ -59,8 +67,8 @@ class OrganisationMigrationRegressionTests(unittest.TestCase):
         decisions = REGRESSION.evaluate_migration_result(
             valid_result(), checked_in_budget()
         )
-        self.assertEqual(len(decisions), 1)
-        self.assertTrue(decisions[0]["passed"])
+        self.assertEqual(len(decisions), 2)
+        self.assertTrue(all(decision["passed"] for decision in decisions))
 
     def test_failed_correctness_or_memory_is_rejected(self) -> None:
         result = valid_result()

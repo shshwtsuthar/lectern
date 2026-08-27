@@ -447,6 +447,18 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 raise RegressionError(
                     "organisation migration must use source schema version five"
                 )
+        if query_mode in (
+            "organisation-query",
+            "organisation-vocabulary",
+            "bulk-tags",
+            "bulk-remove",
+            "saved-searches",
+        ) and positive_or_zero_field(
+            workload, "fixture_version", "budget.workload"
+        ) != 2:
+            raise RegressionError(
+                "normalized organisation workload must use fixture version two"
+            )
         if query_mode in ("organisation-query", "organisation-vocabulary"):
             for field in (
                 "page_size",
@@ -1209,8 +1221,8 @@ def evaluate_migration_result(
         raise RegressionError("migration library count does not match the budget")
     if positive_or_zero_field(result, "source_schema_version", context) != 5:
         raise RegressionError("migration source schema version is not five")
-    if positive_or_zero_field(result, "final_schema_version", context) != 6:
-        raise RegressionError("migration did not reach schema version six")
+    if positive_or_zero_field(result, "final_schema_version", context) != 8:
+        raise RegressionError("migration did not reach schema version eight")
     warmup = positive_or_zero_field(result, "warmup_iterations", context)
     measured = positive_or_zero_field(result, "measured_iterations", context)
     if warmup != workload["warmup_iterations"] or measured != workload["measured_iterations"]:
@@ -1221,44 +1233,53 @@ def evaluate_migration_result(
         "fts_equivalent",
         "initial_tags_and_saved_searches_empty",
         "schema_invariants_valid",
+        "duplicate_series_numbers_repaired",
         "failed_migration_rolled_back",
     ):
         if result.get(field) is not True:
             raise RegressionError(f"migration correctness check failed: {field}")
 
     scenarios = result.get("scenarios")
-    if not isinstance(scenarios, list) or len(scenarios) != 1:
-        raise RegressionError("migration result must contain one scenario")
-    scenario = scenarios[0]
-    if not isinstance(scenario, dict):
-        raise RegressionError("migration scenario must be an object")
-    name = scenario.get("name")
-    if name != "migrate_version_five_library":
-        raise RegressionError("migration scenario name does not match the workload")
-    if positive_or_zero_field(scenario, "successful_migrations", "migration scenario") != (
-        warmup + measured
-    ):
-        raise RegressionError("successful migration count does not reconcile")
-    samples = scenario.get("samples_ns")
-    if not isinstance(samples, list) or len(samples) != measured:
-        raise RegressionError("migration sample count does not match the budget")
-    if any(
-        isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
-        for sample in samples
-    ):
-        raise RegressionError("migration samples must contain positive integers")
-    latency = object_field(scenario, "latency_ms", "migration scenario")
-    positive_number_field(latency, "p95", "migration scenario latency")
-    peak_rss = positive_or_zero_field(scenario, "peak_rss_bytes", "migration scenario")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError("migration result must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, scenario in enumerate(scenarios):
+        context = f"migration scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{context}.name must be unique and non-empty")
+        if positive_or_zero_field(scenario, "successful_migrations", context) != (
+            warmup + measured
+        ):
+            raise RegressionError("successful migration count does not reconcile")
+        samples = scenario.get("samples_ns")
+        if not isinstance(samples, list) or len(samples) != measured:
+            raise RegressionError("migration sample count does not match the budget")
+        if any(
+            isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+            for sample in samples
+        ):
+            raise RegressionError("migration samples must contain positive integers")
+        latency = object_field(scenario, "latency_ms", context)
+        positive_number_field(latency, "p95", f"{context} latency")
+        positive_or_zero_field(scenario, "peak_rss_bytes", context)
+        by_name[name] = scenario
 
-    decisions = evaluate_latency_budgets({name: scenario}, budget)
-    decision = decisions[0]
-    maximum_rss = budget["budgets"][name]["max_peak_rss_bytes"]
-    decision |= {
-        "peak_rss_bytes": peak_rss,
-        "max_peak_rss_bytes": maximum_rss,
-    }
-    decision["passed"] = bool(decision["passed"] and peak_rss <= maximum_rss)
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("migration scenarios do not match the versioned workload")
+    decisions = evaluate_latency_budgets(by_name, budget)
+    for decision in decisions:
+        name = decision["name"]
+        peak_rss = positive_or_zero_field(by_name[name], "peak_rss_bytes", name)
+        maximum_rss = budget["budgets"][name]["max_peak_rss_bytes"]
+        decision |= {
+            "peak_rss_bytes": peak_rss,
+            "max_peak_rss_bytes": maximum_rss,
+        }
+        decision["passed"] = bool(decision["passed"] and peak_rss <= maximum_rss)
     return decisions
 
 
@@ -1289,6 +1310,7 @@ def evaluate_organisation_query_result(
     required_indexes = {
         "book_contributors_contributor_role_book_idx",
         "series_memberships_series_index_book_idx",
+        "series_memberships_series_number_uidx",
         "book_tags_tag_book_idx",
     }
     if not isinstance(plans, list) or {
@@ -2535,6 +2557,10 @@ def validate_organisation_query_seed_result(
     context = "organisation query seed"
     if result.get("kind") != "organisation-query-seed":
         raise RegressionError("organisation query seed kind is invalid")
+    if positive_or_zero_field(result, "fixture_version", context) != workload.get(
+        "fixture_version", 1
+    ):
+        raise RegressionError("organisation query seed fixture version is invalid")
     expected = {
         "library_books": workload["books"],
         "contributors": workload["contributors"],

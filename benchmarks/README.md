@@ -65,15 +65,17 @@ The publication-export workload lives in
 samples, gates p05 throughput and peak RSS growth, and verifies exact bytes, collision safety,
 missing-source handling, and temporary-file cleanup.
 
-The normalized organisation workloads cover migration, exact/fielded query planning, and bounded
-vocabulary reads and mutations. The bulk-tag gate in
-[`bulk-tags-regression-v1.json`](bulk-tags-regression-v1.json) selects 10,000 matching books without
+The normalized organisation v2 fixtures cover migration, exact/fielded query planning, bounded
+vocabulary reads and mutations, and unique exact book numbers within each series. The query gate
+includes the indexed conflict/self-exclusion lookup used by the side-panel Book number field. The
+v1 budgets remain checked in as historical pre-uniqueness contracts. The bulk-tag gate in
+[`bulk-tags-regression-v2.json`](bulk-tags-regression-v2.json) selects 10,000 matching books without
 materializing them, applies and reverses an atomic tag edit, checks exact relationship and memory
 results, and retains 40 native compositor samples for both dispatch and completion-to-painted-grid.
 It requires an active X11 or Wayland display; CI runs it under an isolated X11 display.
 
 The bulk-removal gate in
-[`bulk-remove-regression-v1.json`](bulk-remove-regression-v1.json) resolves a compact query-backed
+[`bulk-remove-regression-v2.json`](bulk-remove-regression-v2.json) resolves a compact query-backed
 selection of 10,000 books and removes it in one transaction before refreshing the first bounded
 library page. Independent fixture copies retain 40 raw samples while verifying exact cascades for
 assets, covers, organisation relationships, and FTS; unchanged vocabulary and saved searches;
@@ -82,7 +84,7 @@ publication source file. Durable removal plus the first refreshed page has a 3.5
 and additional process RSS is capped at 32 MiB.
 
 The saved-search gate in
-[`saved-searches-regression-v1.json`](saved-searches-regression-v1.json) uses 250 complete canonical
+[`saved-searches-regression-v2.json`](saved-searches-regression-v2.json) uses 250 complete canonical
 projections. It measures a bounded 100-row manager page, application through the first 128 matching
 book IDs, and create/update/rename/delete lifecycle while proving that book, vocabulary, asset, and
 FTS state remains intact.
@@ -100,7 +102,7 @@ binary with a deterministic 50,000-book projection and a bounded 128-card first 
 measured fresh-process samples after 5 warmups, verifies that selection remains a compact descriptor,
 and measures the initial populated-library paint, selection dispatch through the painted contextual
 bar, and destructive-confirmation dispatch through its painted modal. The exact removal transaction
-and refreshed first page remain covered by `bulk-remove-regression-v1`.
+and refreshed first page remain covered by `bulk-remove-regression-v2`.
 
 The GPUI book-detail workload in
 [`ui-book-detail-regression-v1.json`](ui-book-detail-regression-v1.json) paints the same bounded
@@ -141,17 +143,17 @@ python3 benchmarks/performance_regression.py \
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/reimport-known-path-regression-v1.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/organisation-migration-regression-v1.json
+  --budget benchmarks/organisation-migration-regression-v2.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/organisation-query-regression-v1.json
+  --budget benchmarks/organisation-query-regression-v2.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/organisation-vocabulary-regression-v1.json
+  --budget benchmarks/organisation-vocabulary-regression-v2.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/bulk-tags-regression-v1.json
+  --budget benchmarks/bulk-tags-regression-v2.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/bulk-remove-regression-v1.json
+  --budget benchmarks/bulk-remove-regression-v2.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/saved-searches-regression-v1.json
+  --budget benchmarks/saved-searches-regression-v2.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/ui-bootstrap-regression-v1.json
 python3 benchmarks/performance_regression.py \

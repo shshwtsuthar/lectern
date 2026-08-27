@@ -14,7 +14,7 @@ SPEC.loader.exec_module(REGRESSION)
 
 
 def checked_in_budget() -> dict:
-    with (BENCHMARKS / "organisation-vocabulary-regression-v1.json").open(
+    with (BENCHMARKS / "organisation-vocabulary-regression-v2.json").open(
         encoding="utf-8"
     ) as source:
         return json.load(source)
@@ -57,7 +57,7 @@ def valid_result() -> dict:
 
 class OrganisationVocabularyContractTests(unittest.TestCase):
     def test_checked_in_workload_is_bounded_and_complete(self) -> None:
-        with (BENCHMARKS / "organisation-vocabulary-regression-v1.json").open(
+        with (BENCHMARKS / "organisation-vocabulary-regression-v2.json").open(
             encoding="utf-8"
         ) as source:
             budget = json.load(source)

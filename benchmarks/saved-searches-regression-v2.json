@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-organisation-regression-budget",
+  "workload": {
+    "query_mode": "saved-searches",
+    "fixture_version": 2,
+    "books": 50000,
+    "seed": 20260825,
+    "cover_every": 3,
+    "contributors": 20000,
+    "series": 2500,
+    "tags": 500,
+    "tags_per_book": 8,
+    "saved_searches": 250,
+    "manager_page_size": 100,
+    "query_page_size": 128,
+    "warmup_iterations": 10,
+    "measured_iterations": 40,
+    "scenarios": [
+      "bounded_saved_search_manager_page",
+      "saved_search_apply_first_page",
+      "saved_search_management_cycle"
+    ],
+    "correctness": [
+      "bounded_alphabetical_manager_page",
+      "canonical_full_projection_round_trip",
+      "exact_saved_projection_results",
+      "explicit_update_and_stable_identity",
+      "delete_preserves_books_vocabulary_assets",
+      "fts_integrity"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 0.25
+  },
+  "budgets": {
+    "bounded_saved_search_manager_page": {
+      "max_p95_ms": 50
+    },
+    "saved_search_apply_first_page": {
+      "max_p95_ms": 50
+    },
+    "saved_search_management_cycle": {
+      "max_p95_ms": 100
+    }
+  }
+}

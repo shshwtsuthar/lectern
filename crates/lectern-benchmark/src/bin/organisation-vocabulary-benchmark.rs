@@ -642,7 +642,7 @@ fn setup_series_round(path: &Path, round: usize) -> Result<SeriesFixture, String
         .execute(
             "INSERT INTO series_memberships( \
                  book_id, series_id, series_index, name_projection, key_projection \
-             ) SELECT id, ?1, (id % 100) * 1000000, ?2, ?3 \
+             ) SELECT id, ?1, id * 1000000, ?2, ?3 \
                FROM books WHERE language = 'fr'",
             params![
                 source.value(),

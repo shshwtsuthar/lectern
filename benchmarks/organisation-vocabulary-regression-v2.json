@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-organisation-regression-budget",
+  "workload": {
+    "query_mode": "organisation-vocabulary",
+    "fixture_version": 2,
+    "books": 50000,
+    "seed": 20260825,
+    "cover_every": 3,
+    "page_size": 128,
+    "contributors": 20000,
+    "series": 2500,
+    "tags": 500,
+    "tags_per_book": 8,
+    "saved_searches": 250,
+    "autocomplete_limit": 50,
+    "matching_books": 10000,
+    "warmup_iterations": 10,
+    "measured_iterations": 40,
+    "scenarios": [
+      "manager_search_page",
+      "contributor_merge_and_refresh",
+      "series_merge_and_refresh",
+      "tag_merge_and_refresh"
+    ],
+    "correctness": [
+      "bounded_manager_page",
+      "stable_target_identity",
+      "source_identity_removed",
+      "relationships_deduplicated",
+      "positions_compacted",
+      "saved_facets_rewritten",
+      "projections_and_fts_rebuilt",
+      "metadata_and_assets_unchanged",
+      "rollback_verified"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 0.25
+  },
+  "budgets": {
+    "manager_search_page": {
+      "max_p95_ms": 50,
+      "max_peak_rss_delta_bytes": 33554432
+    },
+    "contributor_merge_and_refresh": {
+      "max_p95_ms": 1000,
+      "max_peak_rss_delta_bytes": 33554432
+    },
+    "series_merge_and_refresh": {
+      "max_p95_ms": 1000,
+      "max_peak_rss_delta_bytes": 33554432
+    },
+    "tag_merge_and_refresh": {
+      "max_p95_ms": 1000,
+      "max_peak_rss_delta_bytes": 33554432
+    }
+  }
+}

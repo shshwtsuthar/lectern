@@ -9,8 +9,8 @@ use std::{
 };
 
 use lectern_core::{
-    BookFormat, LibraryQuery, SortOrder,
-    organisation::{ContributorFacet, ContributorId, ExactFacets, SeriesId, TagId},
+    BookFormat, BookId, LibraryQuery, SortOrder,
+    organisation::{ContributorFacet, ContributorId, ExactFacets, SeriesId, SeriesIndex, TagId},
 };
 use lectern_storage::LibraryDatabase;
 use rusqlite::{Connection, TransactionBehavior, params};
@@ -131,6 +131,7 @@ fn main() {
 #[derive(Serialize)]
 struct SeedResult {
     schema_version: u32,
+    fixture_version: u32,
     kind: &'static str,
     database_path: String,
     library_books: u64,
@@ -280,7 +281,10 @@ fn seed(options: &Options) -> Result<(), String> {
         let (series_name, series_key, series_index) = if let Some(series_id) = membership {
             let name = format!("Series {series_id:04}");
             let key = name.to_ascii_lowercase();
-            let index = i64::try_from((offset % 50 + 1) * 1_000_000).map_err(display_error)?;
+            // Fixture v2 keeps the familiar 1–50 whole-number order and uses millionths as a
+            // deterministic tie-breaker, satisfying series-local number uniqueness.
+            let index = i64::try_from((offset % 50 + 1) * 1_000_000 + (offset / 50))
+                .map_err(display_error)?;
             insert_membership
                 .execute(params![id_i64, to_i64(series_id)?, index, name, key])
                 .map_err(display_error)?;
@@ -375,6 +379,7 @@ fn seed(options: &Options) -> Result<(), String> {
 
     let result = SeedResult {
         schema_version: 1,
+        fixture_version: 2,
         kind: "organisation-query-seed",
         database_path: options.database.display().to_string(),
         library_books: options.books,
@@ -406,10 +411,11 @@ enum Scenario {
     Combined,
     DeepPage,
     Autocomplete,
+    SeriesIndexAvailability,
 }
 
 impl Scenario {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Contributor,
         Self::Series,
         Self::IncludedTags,
@@ -417,6 +423,7 @@ impl Scenario {
         Self::Combined,
         Self::DeepPage,
         Self::Autocomplete,
+        Self::SeriesIndexAvailability,
     ];
 
     const fn name(self) -> &'static str {
@@ -428,6 +435,7 @@ impl Scenario {
             Self::Combined => "combined_fielded_projection_first_page",
             Self::DeepPage => "deep_bounded_page_without_count",
             Self::Autocomplete => "bounded_vocabulary_autocomplete",
+            Self::SeriesIndexAvailability => "series_index_availability",
         }
     }
 }
@@ -541,6 +549,7 @@ fn run_queries(options: &Options) -> Result<(), String> {
             "unique_book_rows",
             "covering_query_plans",
             "bounded_autocomplete",
+            "series_index_availability",
         ],
         query_plans,
         scenarios,
@@ -648,6 +657,7 @@ fn run_scenario(
             })
             .map_err(display_error),
         Scenario::Autocomplete => run_autocomplete(database),
+        Scenario::SeriesIndexAvailability => run_series_index_availability(database, seed, books),
     }
 }
 
@@ -683,6 +693,30 @@ fn run_autocomplete(database: &LibraryDatabase) -> Result<Observation, String> {
     Ok(Observation { ids, total: None })
 }
 
+fn run_series_index_availability(
+    database: &LibraryDatabase,
+    seed: u64,
+    books: u64,
+) -> Result<Observation, String> {
+    let series = SeriesId::new(to_i64(1 + (seed ^ 0x51_7e) % SERIES.min(books))?);
+    let index = SeriesIndex::from_scaled(1_000_000).expect("fixture index is in range");
+    let available_to_other = database
+        .series_index_is_available(series, index, BookId::new(0))
+        .map_err(display_error)?;
+    let available_to_self = database
+        .series_index_is_available(series, index, BookId::new(1))
+        .map_err(display_error)?;
+    if available_to_other || !available_to_self {
+        return Err(
+            "series index check did not distinguish a conflict from the current book".into(),
+        );
+    }
+    Ok(Observation {
+        ids: vec![series.value(), -1],
+        total: None,
+    })
+}
+
 fn validate_observation(
     scenario: Scenario,
     observation: &Observation,
@@ -705,6 +739,11 @@ fn validate_observation(
                 || observation.ids.first() != Some(&1)
             {
                 return Err("autocomplete was unbounded or did not put selection first".into());
+            }
+        }
+        Scenario::SeriesIndexAvailability => {
+            if observation.ids.len() != 2 || observation.total.is_some() {
+                return Err("series index availability did not reconcile".into());
             }
         }
         _ => {
@@ -730,6 +769,12 @@ fn collect_query_plans(connection: &Connection) -> Result<Vec<QueryPlan>, String
             "series_filter",
             "series_memberships_series_index_book_idx",
             "SELECT book_id FROM series_memberships WHERE series_id = 1",
+        ),
+        (
+            "series_index_availability",
+            "series_memberships_series_number_uidx",
+            "SELECT book_id FROM series_memberships \
+             WHERE series_id = 1 AND series_index = 1000000",
         ),
         (
             "tag_filter",
@@ -887,7 +932,7 @@ mod tests {
         .unwrap();
         assert_eq!(command, "query");
         assert_eq!(options.iterations, 40);
-        assert_eq!(Scenario::ALL.len(), 7);
+        assert_eq!(Scenario::ALL.len(), 8);
     }
 
     #[test]

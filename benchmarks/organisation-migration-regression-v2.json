@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-organisation-regression-budget",
+  "workload": {
+    "query_mode": "organisation-migration",
+    "source_schema_version": 5,
+    "books": 50000,
+    "seed": 20260825,
+    "cover_every": 3,
+    "warmup_iterations": 2,
+    "measured_iterations": 20,
+    "scenarios": [
+      "migrate_version_five_library",
+      "repair_version_seven_series_numbers"
+    ],
+    "correctness": [
+      "visible_author_series_projection_equivalence",
+      "stable_book_asset_and_cover_identity",
+      "fts_equivalence",
+      "empty_initial_tags_and_saved_searches",
+      "schema_invariants",
+      "duplicate_series_numbers_repaired",
+      "failed_migration_preserves_version_five_database"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 25.0
+  },
+  "budgets": {
+    "migrate_version_five_library": {
+      "max_p95_ms": 5000,
+      "max_peak_rss_bytes": 268435456
+    },
+    "repair_version_seven_series_numbers": {
+      "max_p95_ms": 1000,
+      "max_peak_rss_bytes": 268435456
+    }
+  }
+}
