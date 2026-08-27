@@ -128,6 +128,17 @@ light- and dark-mode values as named tag-palette tokens in the Lectern theme. Ex
 to Slate. New tags require an explicit color choice after their normalized name is confirmed. Do
 not introduce arbitrary per-tag color literals in product render code.
 
+## Book identifiers
+
+Book identifiers form their own flush side-panel section. Show every assigned type and value as a
+compact text row with a nearby Remove action; identifiers are metadata, not colored tags or rounded
+pills. Repeated values of the same type remain separate rows.
+
+Adding an identifier uses progressive disclosure in one anchored menu: first choose a stored type
+or create a normalized custom type, then assign its value. Keep the type vocabulary bounded and
+searchable, preserve the exact value apart from surrounding whitespace, and never make users choose
+from format-specific book columns.
+
 ## Subtle surface separators
 
 Use a thin, low-contrast border when adjacent application regions need a persistent boundary but

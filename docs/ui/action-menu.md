@@ -3,8 +3,8 @@
 ## Journey and workload
 
 The first call sites are the book-detail language selector, contributor-role selector, Series
-picker, and tag picker. The representative release workload is `ui-book-detail-regression-v1`;
-series and tag suggestion queries also use the bounded organisation autocomplete path. Persistent
+picker, tag picker, and identifier-type picker. The representative release workload is
+`ui-book-detail-regression-v2`; series, tag, and identifier-type suggestion queries also use the bounded organisation autocomplete path. Persistent
 tag-color and series-number changes are covered by the organisation migration workload before
 commit.
 

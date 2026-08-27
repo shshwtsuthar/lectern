@@ -544,6 +544,10 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 raise RegressionError(
                     "populated UI workload page_size must be greater than zero"
                 )
+        if query_mode == "ui-book-detail" and positive_or_zero_field(
+            workload, "fixture_version", "budget.workload"
+        ) != 2:
+            raise RegressionError("book-detail UI workload must use fixture version two")
         if query_mode == "saved-searches":
             for field in (
                 "contributors",
@@ -2036,11 +2040,13 @@ def expected_ui_book_detail_correctness(workload: dict[str, Any]) -> dict[str, A
         "title": "Benchmark book 001",
         "contributor_count": 3,
         "tag_count": 2,
+        "identifier_count": 3,
         "asset_count": 2,
         "markers": [
             "bounded_first_page",
             "book_detail_panel_presented",
             "complete_metadata_fixture",
+            "identifiers_presented",
             "multiple_assets_presented",
         ],
     }

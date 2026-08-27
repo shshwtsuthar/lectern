@@ -106,13 +106,13 @@ require the native book-detail suite:
 
 ```sh
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/ui-book-detail-regression-v1.json
+  --budget benchmarks/ui-book-detail-regression-v2.json
 ```
 
 It retains 40 measured fresh-process samples after 5 warmups for the same 50,000-book projection
 and bounded 128-card first page. The representative detail fixture includes ordered contributor
-roles, a series index, multiple tags, ordinary publication metadata, and both EPUB and PDF assets.
-It verifies the complete panel markers while gating populated first paint,
+roles, a series index, multiple tags, three identifiers (including two ISBNs), ordinary publication
+metadata, and both EPUB and PDF assets. It verifies the complete panel markers while gating populated first paint,
 book-selection-to-painted-sidebar p95, and peak RSS.
 
 The normalized organisation v2 fixture replaces the historical duplicate series-number

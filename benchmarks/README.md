@@ -105,9 +105,9 @@ bar, and destructive-confirmation dispatch through its painted modal. The exact 
 and refreshed first page remain covered by `bulk-remove-regression-v2`.
 
 The GPUI book-detail workload in
-[`ui-book-detail-regression-v1.json`](ui-book-detail-regression-v1.json) paints the same bounded
+[`ui-book-detail-regression-v2.json`](ui-book-detail-regression-v2.json) paints the same bounded
 50,000-book projection, opens a representative single-book details panel, and verifies complete
-contributor, series, tag, publication, description, and multi-asset presentation markers. It gates
+contributor, series, tag, identifier, publication, description, and multi-asset presentation markers. It gates
 the populated first paint and book-selection-to-painted-sidebar p95 plus peak RSS while retaining
 every fresh-process sample.
 
@@ -159,7 +159,7 @@ python3 benchmarks/performance_regression.py \
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/ui-selection-regression-v1.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/ui-book-detail-regression-v1.json
+  --budget benchmarks/ui-book-detail-regression-v2.json
 ```
 
 Use `--output-dir PATH` to choose a new artifact directory, or `--budget PATH` to evaluate a

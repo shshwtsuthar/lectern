@@ -47,11 +47,11 @@
       "budget": "benchmarks/reimport-known-path-regression-v1.json"
     },
     {
-      "name": "organisation-migration-v2",
+      "name": "organisation-migration-v3",
       "budget": "benchmarks/organisation-migration-regression-v3.json"
     },
     {
-      "name": "organisation-query-v2",
+      "name": "organisation-query-v3",
       "budget": "benchmarks/organisation-query-regression-v3.json"
     },
     {
@@ -79,8 +79,8 @@
       "budget": "benchmarks/ui-selection-regression-v1.json"
     },
     {
-      "name": "ui-book-detail-v1",
-      "budget": "benchmarks/ui-book-detail-regression-v1.json"
+      "name": "ui-book-detail-v2",
+      "budget": "benchmarks/ui-book-detail-regression-v2.json"
     }
   ]
 }

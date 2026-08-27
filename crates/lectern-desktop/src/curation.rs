@@ -232,6 +232,7 @@ impl BookCurationDraft {
         Ok(true)
     }
 
+    #[allow(dead_code, reason = "used by the GPUI frontend")]
     pub(crate) fn add_identifier(
         &mut self,
         existing_type_id: Option<IdentifierTypeId>,
