@@ -482,85 +482,94 @@ pub(crate) fn execute_plan(
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES].into_boxed_slice();
     let mut history_changed = false;
 
-    for (item_index, item) in plan.items.iter().enumerate() {
-        validate_connected_root(&device.mount_path)?;
-        let disposition = match item.action {
-            PlannedTransferAction::AlreadyPresent => {
-                if item.history_owned {
-                    let hash = hash_file(&device.mount_path.join(&item.relative_path))?;
+    let execution = (|| -> Result<(), DeviceError> {
+        for (item_index, item) in plan.items.iter().enumerate() {
+            validate_connected_root(&device.mount_path)?;
+            let disposition = match item.action {
+                PlannedTransferAction::AlreadyPresent => {
+                    if item.history_owned {
+                        let hash = hash_file(&device.mount_path.join(&item.relative_path))?;
+                        history.upsert(history_record(device, item, hash));
+                        history_changed = true;
+                    }
+                    outcome.items.push(TransferItemOutcome {
+                        book_id: item.book_id,
+                        relative_path: item.relative_path.clone(),
+                        disposition: TransferItemDisposition::AlreadyPresent,
+                        copied_bytes: 0,
+                    });
+                    continue;
+                }
+                PlannedTransferAction::Collision => {
+                    outcome.items.push(TransferItemOutcome {
+                        book_id: item.book_id,
+                        relative_path: item.relative_path.clone(),
+                        disposition: TransferItemDisposition::Skipped,
+                        copied_bytes: 0,
+                    });
+                    continue;
+                }
+                PlannedTransferAction::Replace if duplicate_policy == DuplicatePolicy::Skip => {
+                    outcome.items.push(TransferItemOutcome {
+                        book_id: item.book_id,
+                        relative_path: item.relative_path.clone(),
+                        disposition: TransferItemDisposition::Skipped,
+                        copied_bytes: 0,
+                    });
+                    continue;
+                }
+                PlannedTransferAction::Copy => TransferItemDisposition::Transferred,
+                PlannedTransferAction::Replace => TransferItemDisposition::Replaced,
+            };
+            let copied_before = outcome.copied_bytes;
+            match copy_item(
+                device,
+                item,
+                disposition == TransferItemDisposition::Replaced,
+                &mut buffer,
+                |item_copied_bytes| {
+                    progress(TransferProgress {
+                        item_index,
+                        total_items: plan.items.len(),
+                        current_title: item.title.clone(),
+                        item_copied_bytes,
+                        item_total_bytes: item.source_bytes,
+                        batch_copied_bytes: copied_before.saturating_add(item_copied_bytes),
+                        batch_total_bytes: plan.required_bytes,
+                    })
+                },
+            ) {
+                Ok(hash) => {
+                    outcome.copied_bytes = outcome.copied_bytes.saturating_add(item.source_bytes);
                     history.upsert(history_record(device, item, hash));
                     history_changed = true;
+                    outcome.items.push(TransferItemOutcome {
+                        book_id: item.book_id,
+                        relative_path: item.relative_path.clone(),
+                        disposition,
+                        copied_bytes: item.source_bytes,
+                    });
                 }
-                outcome.items.push(TransferItemOutcome {
+                Err(error @ (DeviceError::Cancelled | DeviceError::Disconnected)) => {
+                    return Err(error);
+                }
+                Err(error) => outcome.failures.push(TransferFailure {
                     book_id: item.book_id,
-                    relative_path: item.relative_path.clone(),
-                    disposition: TransferItemDisposition::AlreadyPresent,
-                    copied_bytes: 0,
-                });
-                continue;
+                    title: item.title.clone(),
+                    message: error.to_string(),
+                }),
             }
-            PlannedTransferAction::Collision => {
-                outcome.items.push(TransferItemOutcome {
-                    book_id: item.book_id,
-                    relative_path: item.relative_path.clone(),
-                    disposition: TransferItemDisposition::Skipped,
-                    copied_bytes: 0,
-                });
-                continue;
-            }
-            PlannedTransferAction::Replace if duplicate_policy == DuplicatePolicy::Skip => {
-                outcome.items.push(TransferItemOutcome {
-                    book_id: item.book_id,
-                    relative_path: item.relative_path.clone(),
-                    disposition: TransferItemDisposition::Skipped,
-                    copied_bytes: 0,
-                });
-                continue;
-            }
-            PlannedTransferAction::Copy => TransferItemDisposition::Transferred,
-            PlannedTransferAction::Replace => TransferItemDisposition::Replaced,
-        };
-        let copied_before = outcome.copied_bytes;
-        match copy_item(
-            device,
-            item,
-            disposition == TransferItemDisposition::Replaced,
-            &mut buffer,
-            |item_copied_bytes| {
-                progress(TransferProgress {
-                    item_index,
-                    total_items: plan.items.len(),
-                    current_title: item.title.clone(),
-                    item_copied_bytes,
-                    item_total_bytes: item.source_bytes,
-                    batch_copied_bytes: copied_before.saturating_add(item_copied_bytes),
-                    batch_total_bytes: plan.required_bytes,
-                })
-            },
-        ) {
-            Ok(hash) => {
-                outcome.copied_bytes = outcome.copied_bytes.saturating_add(item.source_bytes);
-                history.upsert(history_record(device, item, hash));
-                history_changed = true;
-                outcome.items.push(TransferItemOutcome {
-                    book_id: item.book_id,
-                    relative_path: item.relative_path.clone(),
-                    disposition,
-                    copied_bytes: item.source_bytes,
-                });
-            }
-            Err(DeviceError::Cancelled) => return Err(DeviceError::Cancelled),
-            Err(error @ DeviceError::Disconnected) => return Err(error),
-            Err(error) => outcome.failures.push(TransferFailure {
-                book_id: item.book_id,
-                title: item.title.clone(),
-                message: error.to_string(),
-            }),
+        }
+        Ok(())
+    })();
+    if history_changed && let Err(error) = history.save() {
+        if execution.is_ok() {
+            outcome.history_error = Some(error.to_string());
+        } else {
+            tracing::warn!(error = %error, "could not persist completed device transfers after interruption");
         }
     }
-    if history_changed && let Err(error) = history.save() {
-        outcome.history_error = Some(error.to_string());
-    }
+    execution?;
     Ok(outcome)
 }
 
@@ -633,7 +642,6 @@ fn copy_item(
         device_id = %device.id,
         book_id = item.book_id.value(),
         bytes = copied,
-        relative_path = %item.relative_path.display(),
         "completed device transfer"
     );
     Ok(hash)
@@ -835,8 +843,13 @@ fn replace_transfer(temporary: &Path, destination: &Path) -> Result<(), DeviceEr
             error,
         ));
     }
-    fs::remove_file(&backup)
-        .map_err(|error| DeviceError::io("remove replaced device-file backup", backup, error))
+    if let Err(error) = fs::remove_file(&backup) {
+        tracing::warn!(
+            error = %error,
+            "could not remove replaced device-file backup"
+        );
+    }
+    Ok(())
 }
 
 struct TemporaryTransfer {
@@ -977,7 +990,13 @@ pub(crate) fn remove_device_book(
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             history.remove_path(&device.id, relative_path);
-            history.save()?;
+            if let Err(error) = history.save() {
+                tracing::warn!(
+                    device_id = %device.id,
+                    error = %error,
+                    "could not persist missing device-book reconciliation"
+                );
+            }
             return Ok(RemovalOutcome::AlreadyMissing);
         }
         Err(error) => {
@@ -997,10 +1016,16 @@ pub(crate) fn remove_device_book(
     fs::remove_file(&target)
         .map_err(|error| DeviceError::io("remove device book", &target, error))?;
     history.remove_path(&device.id, relative_path);
-    history.save()?;
+    if let Err(error) = history.save() {
+        tracing::warn!(
+            device_id = %device.id,
+            error = %error,
+            "could not persist removed device-book reconciliation"
+        );
+    }
     tracing::info!(
         device_id = %device.id,
-        relative_path = %relative_path.display(),
+        book_id = record.book_id,
         "removed device book"
     );
     Ok(RemovalOutcome::Removed)
@@ -1034,8 +1059,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DuplicatePolicy, FormatPriority, PlannedTransferAction, TransferControl, build_plan,
-        copy_stream, execute_plan, list_device_books, remove_device_book,
+        DuplicatePolicy, FormatPriority, PlannedTransferAction, TransferControl,
+        TransferItemDisposition, build_plan, copy_stream, execute_plan, list_device_books,
+        remove_device_book,
     };
     use crate::{
         DeviceConnectionState, DeviceFormat, DeviceId, DeviceInfo, DeviceKind, DeviceTransferBook,
@@ -1168,6 +1194,73 @@ mod tests {
         });
         let plan = build_plan(&device, &history, &[candidate], &FormatPriority::default()).unwrap();
         assert_eq!(plan.items[0].format, DeviceFormat::Epub);
+
+        let pdf_only = book(&pdf, BookFormat::Pdf);
+        let pdf_plan =
+            build_plan(&device, &history, &[pdf_only], &FormatPriority::default()).unwrap();
+        assert_eq!(pdf_plan.items[0].format, DeviceFormat::Pdf);
+        let mut history = history;
+        let outcome = execute_plan(
+            &device,
+            &mut history,
+            &pdf_plan,
+            DuplicatePolicy::Skip,
+            |_| TransferControl::Continue,
+        )
+        .unwrap();
+        assert_eq!(outcome.transferred_count(), 1);
+        assert!(
+            device
+                .mount_path
+                .join(&pdf_plan.items[0].relative_path)
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn duplicate_metadata_gets_unique_paths_and_untracked_collision_is_skipped() {
+        let fixture = tempdir().unwrap();
+        let first_source = fixture.path().join("first.epub");
+        let second_source = fixture.path().join("second.epub");
+        fs::write(&first_source, b"first").unwrap();
+        fs::write(&second_source, b"other").unwrap();
+        let mount = tempdir().unwrap();
+        let device = device(mount.path());
+        let history_path = fixture.path().join("history.json");
+        let history = TransferHistoryStore::load(history_path).unwrap();
+        let first = book(&first_source, BookFormat::Epub);
+        let mut second = book(&second_source, BookFormat::Epub);
+        second.book_id = BookId::new(3);
+        second.sources[0].asset_id = AssetId::new(4);
+        let plan = build_plan(
+            &device,
+            &history,
+            &[first.clone(), second],
+            &FormatPriority::default(),
+        )
+        .unwrap();
+        assert_ne!(plan.items[0].relative_path, plan.items[1].relative_path);
+
+        let destination = device.mount_path.join(&plan.items[0].relative_path);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"wrong").unwrap();
+        let collision =
+            build_plan(&device, &history, &[first], &FormatPriority::default()).unwrap();
+        assert_eq!(collision.items[0].action, PlannedTransferAction::Collision);
+        let mut history = history;
+        let outcome = execute_plan(
+            &device,
+            &mut history,
+            &collision,
+            DuplicatePolicy::Skip,
+            |_| TransferControl::Continue,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.items[0].disposition,
+            TransferItemDisposition::Skipped
+        );
+        assert_eq!(fs::read(destination).unwrap(), b"wrong");
     }
 
     #[test]
@@ -1251,6 +1344,79 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_preserves_history_for_completed_batch_items() {
+        let fixture = tempdir().unwrap();
+        let first_source = fixture.path().join("first.epub");
+        let second_source = fixture.path().join("second.epub");
+        fs::write(&first_source, vec![1_u8; 32]).unwrap();
+        fs::write(&second_source, vec![2_u8; 600_000]).unwrap();
+        let mount = tempdir().unwrap();
+        let device = device(mount.path());
+        let history_path = fixture.path().join("history.json");
+        let mut history = TransferHistoryStore::load(history_path.clone()).unwrap();
+        let first = DeviceTransferBook {
+            book_id: BookId::new(10),
+            title: "First".to_owned(),
+            authors: "Author".to_owned(),
+            sources: vec![DeviceTransferSource {
+                asset_id: AssetId::new(20),
+                format: BookFormat::Epub,
+                path: first_source,
+            }],
+        };
+        let second = DeviceTransferBook {
+            book_id: BookId::new(11),
+            title: "Second".to_owned(),
+            authors: "Author".to_owned(),
+            sources: vec![DeviceTransferSource {
+                asset_id: AssetId::new(21),
+                format: BookFormat::Epub,
+                path: second_source,
+            }],
+        };
+        let plan = build_plan(
+            &device,
+            &history,
+            &[first, second],
+            &FormatPriority::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            execute_plan(
+                &device,
+                &mut history,
+                &plan,
+                DuplicatePolicy::Skip,
+                |progress| if progress.item_index == 1 {
+                    TransferControl::Cancel
+                } else {
+                    TransferControl::Continue
+                }
+            ),
+            Err(crate::DeviceError::Cancelled)
+        ));
+
+        let history = TransferHistoryStore::load(history_path).unwrap();
+        assert!(
+            history
+                .find_path(&device.id, &plan.items[0].relative_path)
+                .is_some()
+        );
+        assert!(
+            device
+                .mount_path
+                .join(&plan.items[0].relative_path)
+                .is_file()
+        );
+        assert!(
+            !device
+                .mount_path
+                .join(&plan.items[1].relative_path)
+                .exists()
+        );
+    }
+
+    #[test]
     fn disconnect_during_transfer_cleans_partial_file() {
         let fixture = tempdir().unwrap();
         let source = fixture.path().join("source.epub");
@@ -1279,6 +1445,74 @@ mod tests {
                 .mount_path
                 .join(&plan.items[0].relative_path)
                 .exists()
+        );
+    }
+
+    #[test]
+    fn removal_reconciles_missing_files_and_rejects_internal_or_outside_paths() {
+        let fixture = tempdir().unwrap();
+        let source = fixture.path().join("source.epub");
+        fs::write(&source, b"epub").unwrap();
+        let mount = tempdir().unwrap();
+        let device = device(mount.path());
+        let history_path = fixture.path().join("history.json");
+        let mut history = TransferHistoryStore::load(history_path).unwrap();
+        let plan = build_plan(
+            &device,
+            &history,
+            &[book(&source, BookFormat::Epub)],
+            &FormatPriority::default(),
+        )
+        .unwrap();
+        execute_plan(&device, &mut history, &plan, DuplicatePolicy::Skip, |_| {
+            TransferControl::Continue
+        })
+        .unwrap();
+        let relative = &plan.items[0].relative_path;
+        fs::remove_file(device.mount_path.join(relative)).unwrap();
+        assert_eq!(
+            remove_device_book(&device, &mut history, relative).unwrap(),
+            RemovalOutcome::AlreadyMissing
+        );
+        assert!(
+            remove_device_book(&device, &mut history, Path::new("Books/../outside.epub")).is_err()
+        );
+        assert!(
+            remove_device_book(&device, &mut history, Path::new(".kobo/KoboReader.sqlite"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unavailable_local_history_does_not_block_transfer_or_removal() {
+        let fixture = tempdir().unwrap();
+        let source = fixture.path().join("source.epub");
+        fs::write(&source, b"epub").unwrap();
+        let history_path = fixture.path().join("history.json");
+        fs::write(&history_path, b"future or corrupt history").unwrap();
+        let mut history = TransferHistoryStore::load_best_effort(history_path.clone());
+        let mount = tempdir().unwrap();
+        let device = device(mount.path());
+        let plan = build_plan(
+            &device,
+            &history,
+            &[book(&source, BookFormat::Epub)],
+            &FormatPriority::default(),
+        )
+        .unwrap();
+        let outcome = execute_plan(&device, &mut history, &plan, DuplicatePolicy::Skip, |_| {
+            TransferControl::Continue
+        })
+        .unwrap();
+        assert_eq!(outcome.transferred_count(), 1);
+        assert!(outcome.history_error.is_some());
+        assert_eq!(
+            remove_device_book(&device, &mut history, &plan.items[0].relative_path).unwrap(),
+            RemovalOutcome::Removed
+        );
+        assert_eq!(
+            fs::read(history_path).unwrap(),
+            b"future or corrupt history"
         );
     }
 

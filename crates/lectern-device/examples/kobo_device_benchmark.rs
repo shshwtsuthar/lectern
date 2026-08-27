@@ -14,7 +14,8 @@ use std::{
 use lectern_core::{AssetId, BookFormat, BookId};
 use lectern_device::{
     DeviceError, DeviceManager, DeviceTransferBook, DeviceTransferSource, DuplicatePolicy,
-    FormatPriority, MountedVolume, RemovableStorageProvider, TransferControl,
+    FormatPriority, MountedVolume, RemovableStorageProvider, SystemRemovableStorageProvider,
+    TransferControl,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -52,8 +53,18 @@ struct BenchmarkResult {
     source_bytes_per_book: usize,
     warmup_iterations: usize,
     measured_iterations: usize,
+    system_enumeration: SystemEnumerationResult,
     reconciliation: ReconciliationResult,
     transfer: TransferResult,
+}
+
+#[derive(Serialize)]
+struct SystemEnumerationResult {
+    minimum_mounted_volumes: usize,
+    maximum_mounted_volumes: usize,
+    p95_ms: f64,
+    samples_ns: Vec<u64>,
+    correctness: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -106,6 +117,21 @@ fn run(options: &Options) -> Result<(), String> {
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(output_parent).map_err(|error| error.to_string())?;
+    let system_provider = SystemRemovableStorageProvider;
+    let mut system_samples = Vec::with_capacity(100);
+    let mut system_volume_counts = Vec::with_capacity(110);
+    for iteration in 0..110 {
+        let started = Instant::now();
+        let volumes = system_provider
+            .list_mounted_volumes()
+            .map_err(|error| error.to_string())?;
+        let elapsed = u64::try_from(started.elapsed().as_nanos())
+            .map_err(|error| format!("system enumeration duration overflowed: {error}"))?;
+        system_volume_counts.push(volumes.len());
+        if iteration >= 10 {
+            system_samples.push(elapsed);
+        }
+    }
     let fixture = tempdir_in(output_parent).map_err(|error| error.to_string())?;
     let sources_root = fixture.path().join("sources");
     fs::create_dir(&sources_root).map_err(|error| error.to_string())?;
@@ -141,8 +167,7 @@ fn run(options: &Options) -> Result<(), String> {
     let provider = FixtureProvider {
         volumes: Arc::new(Mutex::new(volumes)),
     };
-    let manager = DeviceManager::new(provider.clone(), fixture.path().join("history.json"))
-        .map_err(|error| error.to_string())?;
+    let manager = DeviceManager::new(provider.clone(), fixture.path().join("history.json"));
 
     let mut reconciliation_samples = Vec::with_capacity(100);
     for iteration in 0..110 {
@@ -192,6 +217,16 @@ fn run(options: &Options) -> Result<(), String> {
         source_bytes_per_book: SOURCE_BYTES,
         warmup_iterations: options.warmup,
         measured_iterations: options.iterations,
+        system_enumeration: SystemEnumerationResult {
+            minimum_mounted_volumes: system_volume_counts.iter().copied().min().unwrap_or(0),
+            maximum_mounted_volumes: system_volume_counts.iter().copied().max().unwrap_or(0),
+            p95_ms: Duration::from_nanos(percentile_ns(&system_samples, 95)).as_secs_f64() * 1000.0,
+            samples_ns: system_samples,
+            correctness: vec![
+                "production_volume_provider_exercised",
+                "stable_system_sample_count",
+            ],
+        },
         reconciliation: ReconciliationResult {
             candidate_volumes: RECONCILIATION_VOLUMES,
             detected_devices: 1,

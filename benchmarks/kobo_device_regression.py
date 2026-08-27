@@ -130,10 +130,19 @@ def evaluate(result: dict[str, Any], budget: dict[str, Any]) -> list[dict[str, A
     for field in ("books", "source_bytes_per_book", "warmup_iterations", "measured_iterations"):
         if result.get(field) != workload[field]:
             raise RegressionError(f"result.{field} does not match the budget")
+    system_enumeration = result.get("system_enumeration")
     reconciliation = result.get("reconciliation")
     transfer = result.get("transfer")
-    if not isinstance(reconciliation, dict) or not isinstance(transfer, dict):
+    if (
+        not isinstance(system_enumeration, dict)
+        or not isinstance(reconciliation, dict)
+        or not isinstance(transfer, dict)
+    ):
         raise RegressionError("benchmark result sections are missing")
+    expected_system = {
+        "production_volume_provider_exercised",
+        "stable_system_sample_count",
+    }
     expected_reconciliation = {
         "ordinary_volumes_rejected",
         "single_marker_volume_detected",
@@ -145,6 +154,8 @@ def evaluate(result: dict[str, Any], budget: dict[str, Any]) -> list[dict[str, A
         "no_partial_files_retained",
         "history_reconciled",
     }
+    if set(system_enumeration.get("correctness", [])) != expected_system:
+        raise RegressionError("system-enumeration correctness markers are incomplete")
     if set(reconciliation.get("correctness", [])) != expected_reconciliation:
         raise RegressionError("reconciliation correctness markers are incomplete")
     if set(transfer.get("correctness", [])) != expected_transfer:
@@ -160,11 +171,19 @@ def evaluate(result: dict[str, Any], budget: dict[str, Any]) -> list[dict[str, A
         raise RegressionError("transferred byte count does not match the workload")
     if len(transfer.get("samples_ns", [])) != workload["measured_iterations"]:
         raise RegressionError("transfer raw sample count does not match the workload")
+    if len(system_enumeration.get("samples_ns", [])) < 40:
+        raise RegressionError("system enumeration must retain at least 40 raw samples")
     if len(reconciliation.get("samples_ns", [])) < 40:
         raise RegressionError("reconciliation must retain at least 40 raw samples")
     limits = budget["budgets"]
     rss = transfer.get("peak_rss_delta_bytes")
     return [
+        decision(
+            "system_enumeration_p95_ms",
+            float(system_enumeration["p95_ms"]),
+            float(limits["system_enumeration"]["max_p95_ms"]),
+            "maximum",
+        ),
         decision(
             "reconciliation_p95_ms",
             float(reconciliation["p95_ms"]),

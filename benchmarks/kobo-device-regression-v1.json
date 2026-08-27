@@ -14,6 +14,9 @@
     "minimum_p95_delta_ms": 5.0
   },
   "budgets": {
+    "system_enumeration": {
+      "max_p95_ms": 25
+    },
     "reconciliation": {
       "max_p95_ms": 15
     },

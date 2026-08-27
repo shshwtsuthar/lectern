@@ -56,29 +56,23 @@ impl<P> Clone for DeviceManager<P> {
 
 impl DeviceManager<SystemRemovableStorageProvider> {
     /// Creates a manager backed by the current operating system.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when local transfer history cannot be loaded safely.
-    pub fn system(history_path: PathBuf) -> Result<Self, DeviceError> {
+    #[must_use]
+    pub fn system(history_path: PathBuf) -> Self {
         Self::new(SystemRemovableStorageProvider, history_path)
     }
 }
 
 impl<P: RemovableStorageProvider> DeviceManager<P> {
     /// Creates a manager with an injectable mounted-storage boundary.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when local transfer history cannot be loaded safely.
-    pub fn new(provider: P, history_path: PathBuf) -> Result<Self, DeviceError> {
-        Ok(Self {
+    #[must_use]
+    pub fn new(provider: P, history_path: PathBuf) -> Self {
+        Self {
             inner: Arc::new(ManagerInner {
                 provider,
                 sessions: Mutex::new(HashMap::new()),
-                history: Mutex::new(TransferHistoryStore::load(history_path)?),
+                history: Mutex::new(TransferHistoryStore::load_best_effort(history_path)),
             }),
-        })
+        }
     }
 
     /// Reconciles mounted volumes with the connected-device registry.
@@ -268,10 +262,15 @@ impl<P: RemovableStorageProvider> DeviceManager<P> {
         }
 
         for _ in 0..EJECT_CONFIRMATION_ATTEMPTS {
-            let still_mounted = self
-                .inner
-                .provider
-                .list_mounted_volumes()?
+            let volumes = match self.inner.provider.list_mounted_volumes() {
+                Ok(volumes) => volumes,
+                Err(error) => {
+                    lock(&session.info)?.state = DeviceConnectionState::Connected;
+                    tracing::warn!(device_id = %device.id, error = %error, "device eject confirmation failed");
+                    return Err(error);
+                }
+            };
+            let still_mounted = volumes
                 .iter()
                 .any(|volume| same_marked_mount(volume, &device.mount_path));
             if !still_mounted {
@@ -362,6 +361,7 @@ mod tests {
     struct MockProvider {
         volumes: Arc<Mutex<Vec<MountedVolume>>>,
         eject_error: Arc<Mutex<Option<String>>>,
+        list_error: Arc<Mutex<Option<String>>>,
     }
 
     impl MockProvider {
@@ -369,12 +369,16 @@ mod tests {
             Self {
                 volumes: Arc::new(Mutex::new(volumes)),
                 eject_error: Arc::new(Mutex::new(None)),
+                list_error: Arc::new(Mutex::new(None)),
             }
         }
     }
 
     impl RemovableStorageProvider for MockProvider {
         fn list_mounted_volumes(&self) -> Result<Vec<MountedVolume>, DeviceError> {
+            if let Some(error) = self.list_error.lock().unwrap().clone() {
+                return Err(DeviceError::Platform(error));
+            }
             Ok(self.volumes.lock().unwrap().clone())
         }
 
@@ -418,8 +422,9 @@ mod tests {
             volume(second.path(), "Reader", 30),
         ]);
         let history = tempdir().unwrap();
-        let manager =
-            DeviceManager::new(provider.clone(), history.path().join("history.json")).unwrap();
+        let history_path = history.path().join("history.json");
+        fs::write(&history_path, b"not valid JSON").unwrap();
+        let manager = DeviceManager::new(provider.clone(), history_path);
         let first_result = manager.reconcile().unwrap();
         assert_eq!(first_result.connected.len(), 2);
         assert_eq!(first_result.devices.len(), 2);
@@ -440,12 +445,18 @@ mod tests {
         fs::create_dir(mount.path().join(".kobo")).unwrap();
         let provider = MockProvider::new(vec![volume(mount.path(), "KOBOeReader", 20)]);
         let history = tempdir().unwrap();
-        let manager =
-            DeviceManager::new(provider.clone(), history.path().join("history.json")).unwrap();
+        let manager = DeviceManager::new(provider.clone(), history.path().join("history.json"));
         let id = manager.reconcile().unwrap().devices[0].id.clone();
         *provider.eject_error.lock().unwrap() = Some("mock failure".to_owned());
         assert!(manager.eject(&id).is_err());
         *provider.eject_error.lock().unwrap() = None;
+        *provider.list_error.lock().unwrap() = Some("mock listing failure".to_owned());
+        assert!(manager.eject(&id).is_err());
+        assert_eq!(
+            manager.connected_devices().unwrap()[0].state,
+            crate::DeviceConnectionState::Connected
+        );
+        *provider.list_error.lock().unwrap() = None;
         assert!(manager.eject(&id).is_ok());
         assert!(manager.connected_devices().unwrap().is_empty());
         assert!(matches!(manager.eject(&id), Err(DeviceError::Disconnected)));
@@ -459,7 +470,7 @@ mod tests {
         let mount = tempdir().unwrap();
         fs::create_dir(mount.path().join(".kobo")).unwrap();
         let provider = MockProvider::new(vec![volume(mount.path(), "KOBOeReader", 2_000_000)]);
-        let manager = DeviceManager::new(provider, fixture.path().join("history.json")).unwrap();
+        let manager = DeviceManager::new(provider, fixture.path().join("history.json"));
         let id = manager.reconcile().unwrap().devices[0].id.clone();
         let plan = manager
             .plan_transfer(

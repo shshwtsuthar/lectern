@@ -42,6 +42,7 @@ struct HistoryFile {
 pub(crate) struct TransferHistoryStore {
     path: PathBuf,
     records: Vec<TransferHistoryRecord>,
+    load_error: Option<String>,
 }
 
 impl TransferHistoryStore {
@@ -52,6 +53,7 @@ impl TransferHistoryStore {
                 return Ok(Self {
                     path,
                     records: Vec::new(),
+                    load_error: None,
                 });
             }
             Err(error) => return Err(DeviceError::io("read transfer history", &path, error)),
@@ -76,7 +78,26 @@ impl TransferHistoryStore {
         Ok(Self {
             path,
             records: file.records,
+            load_error: None,
         })
+    }
+
+    pub(crate) fn load_best_effort(path: PathBuf) -> Self {
+        match Self::load(path.clone()) {
+            Ok(history) => history,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "ignoring unavailable device-transfer history"
+                );
+                Self {
+                    path,
+                    records: Vec::new(),
+                    load_error: Some(error.to_string()),
+                }
+            }
+        }
     }
 
     pub(crate) fn records_for(
@@ -116,6 +137,11 @@ impl TransferHistoryStore {
     }
 
     pub(crate) fn save(&self) -> Result<(), DeviceError> {
+        if let Some(error) = &self.load_error {
+            return Err(DeviceError::History(format!(
+                "the existing history was preserved after it could not be loaded: {error}"
+            )));
+        }
         if let Some(parent) = self
             .path
             .parent()
@@ -222,8 +248,14 @@ fn replace_history(temporary: &Path, destination: &Path) -> Result<(), DeviceErr
             error,
         ));
     }
-    fs::remove_file(&backup)
-        .map_err(|error| DeviceError::io("remove previous transfer history", backup, error))
+    if let Err(error) = fs::remove_file(&backup) {
+        tracing::warn!(
+            path = %backup.display(),
+            error = %error,
+            "could not remove previous transfer-history backup"
+        );
+    }
+    Ok(())
 }
 
 struct TemporaryHistory {
@@ -277,8 +309,11 @@ mod tests {
         let text = String::from_utf8(bytes)
             .unwrap()
             .replace("Books/Author/Title.epub", "../outside.epub");
-        fs::write(&path, text).unwrap();
-        assert!(TransferHistoryStore::load(path).is_err());
+        fs::write(&path, &text).unwrap();
+        assert!(TransferHistoryStore::load(path.clone()).is_err());
+        let best_effort = TransferHistoryStore::load_best_effort(path.clone());
+        assert!(best_effort.save().is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), text);
     }
 
     use std::fs;
