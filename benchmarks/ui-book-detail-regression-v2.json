@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-ui-regression-budget",
+  "workload": {
+    "query_mode": "ui-book-detail",
+    "fixture_version": 2,
+    "books": 50000,
+    "seed": 20260827,
+    "cover_every": 0,
+    "page_size": 128,
+    "warmup_iterations": 5,
+    "measured_iterations": 40,
+    "scenarios": [
+      "initial_library_render",
+      "book_detail_to_painted_state"
+    ],
+    "correctness": [
+      "bounded_first_page",
+      "book_detail_panel_presented",
+      "complete_metadata_fixture",
+      "publication_metadata_presented",
+      "half_star_rating_presented",
+      "multiple_assets_presented"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 1.0
+  },
+  "budgets": {
+    "initial_library_render": {
+      "max_p95_ms": 500,
+      "max_peak_rss_bytes": 536870912
+    },
+    "book_detail_to_painted_state": {
+      "max_p95_ms": 50,
+      "max_peak_rss_bytes": 536870912
+    }
+  }
+}

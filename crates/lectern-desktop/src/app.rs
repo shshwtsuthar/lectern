@@ -682,13 +682,19 @@ struct BookRemovalUi {
 impl BookEditor {
     fn new(book: Book) -> Self {
         let curation = BookCurationDraft::from_book(&book);
+        let publication_date = book
+            .publication_date
+            .map(|date| date.to_string())
+            .unwrap_or_default();
         let original_edit = curation
             .to_book_edit(
                 &book,
                 &book.title,
                 book.publisher.as_deref().unwrap_or_default(),
+                &publication_date,
                 book.language.as_deref().unwrap_or_default(),
                 book.description.as_deref().unwrap_or_default(),
+                book.rating,
             )
             .expect("stored normalized book metadata is editable");
         Self {
@@ -711,12 +717,19 @@ impl BookEditor {
     }
 
     fn edit(&self) -> Result<BookEdit, String> {
+        let publication_date = self
+            .original
+            .publication_date
+            .map(|date| date.to_string())
+            .unwrap_or_default();
         self.curation.to_book_edit(
             &self.original,
             &self.title,
             &self.publisher,
+            &publication_date,
             &self.language,
             &self.description,
+            self.original.rating,
         )
     }
 
@@ -6742,7 +6755,7 @@ mod tests {
     };
     use lectern_core::{
         AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId,
-        LibraryQuery,
+        BookRating, LibraryQuery,
     };
     use lectern_desktop::export::ExportProgress;
 
@@ -6987,8 +7000,10 @@ mod tests {
             series_membership: None,
             tags: Vec::new(),
             publisher: None,
+            publication_date: None,
             language: None,
             description: None,
+            rating: BookRating::default(),
             assets: vec![BookAsset {
                 id: AssetId::new(11),
                 format: BookFormat::Epub,
@@ -7021,8 +7036,10 @@ mod tests {
             series_membership: None,
             tags: Vec::new(),
             publisher: None,
+            publication_date: None,
             language: Some("en".into()),
             description: None,
+            rating: BookRating::default(),
             assets: vec![BookAsset {
                 id: AssetId::new(11),
                 format: BookFormat::Epub,

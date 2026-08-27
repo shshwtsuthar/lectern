@@ -218,6 +218,17 @@ pub struct TagPaletteTheme {
     pub lilac: Hsla,
 }
 
+/// Lectern-owned colors for the interactive personal book rating.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RatingTheme {
+    /// Filled star foreground using the selected Lectern accent.
+    pub filled: Hsla,
+    /// Empty star outline.
+    pub empty: Hsla,
+    /// Star foreground while editing is unavailable.
+    pub disabled: Hsla,
+}
+
 /// A complete visual state for one Button variant.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ButtonColors {
@@ -361,6 +372,8 @@ pub struct PrimerTheme {
     pub action_menu: ActionMenuTheme,
     /// Named tag-dot palette.
     pub tag_palette: TagPaletteTheme,
+    /// Interactive personal-rating presentation.
+    pub rating: RatingTheme,
     /// Button colors and geometry.
     pub button: ButtonTheme,
     /// Text-entry colors and geometry.
@@ -519,6 +532,11 @@ impl PrimerTheme {
                 azure: color(tag_colors.azure),
                 lilac: color(tag_colors.lilac),
             },
+            rating: RatingTheme {
+                filled: color(primary.background),
+                empty: color(choose!(CONTROL_BORDER_REST)),
+                disabled: color(choose!(CONTROL_FG_DISABLED)),
+            },
             button: ButtonTheme {
                 default: ButtonColors {
                     background: color(choose!(BUTTON_DEFAULT_BG_REST)),
@@ -675,6 +693,9 @@ mod tests {
             dark.button.primary.disabled_icon,
             rgba(DARK_ACCENT_PRIMARY[AccentColor::Mauve.index()].disabled_icon).into()
         );
+        assert_eq!(light.rating.filled, light.button.primary.background);
+        assert_eq!(dark.rating.filled, dark.button.primary.background);
+        assert_eq!(light.rating.empty, rgba(light::CONTROL_BORDER_REST).into());
 
         for accent in AccentColor::ALL {
             let themed = PrimerTheme::with_accent(ColorMode::Dark, accent);
@@ -683,6 +704,7 @@ mod tests {
                 themed.button.primary.background,
                 rgba(DARK_ACCENT_PRIMARY[accent.index()].background).into()
             );
+            assert_eq!(themed.rating.filled, themed.button.primary.background);
         }
     }
 }

@@ -34,7 +34,7 @@ class CiPerformanceTests(unittest.TestCase):
                 "replace-asset-v1",
                 "export-asset-v1",
                 "reimport-known-path-v1",
-                "organisation-migration-v2",
+                "organisation-migration-v3",
                 "organisation-query-v2",
                 "organisation-vocabulary-v2",
                 "bulk-tags-v2",
@@ -42,7 +42,7 @@ class CiPerformanceTests(unittest.TestCase):
                 "saved-searches-v2",
                 "ui-bootstrap-v1",
                 "ui-selection-v1",
-                "ui-book-detail-v1",
+                "ui-book-detail-v2",
             ],
         )
         self.assertIn(

@@ -25,9 +25,9 @@ use lectern_core::organisation::{
 };
 use lectern_core::{
     AssetHealth, AssetHealthReport, AssetId, AssetStorage, BackupReport, Book, BookAsset,
-    BookAssetDraft, BookDraft, BookFormat, BookId, BookImport, BookMetadataDraft, BookSummary,
-    ImportRecord, LibraryDiagnostics, LibraryPage, LibraryQuery, LibraryStats,
-    ReferencedFileDiagnostics, ReimportMetadataPolicy, SortOrder,
+    BookAssetDraft, BookDraft, BookFormat, BookId, BookImport, BookMetadataDraft, BookRating,
+    BookSummary, ImportRecord, LibraryDiagnostics, LibraryPage, LibraryQuery, LibraryStats,
+    PublicationDate, ReferencedFileDiagnostics, ReimportMetadataPolicy, SortOrder,
 };
 use rayon::prelude::*;
 use rusqlite::{
@@ -38,7 +38,7 @@ use thiserror::Error;
 #[cfg(not(any(unix, windows)))]
 compile_error!("Lectern's lossless path codec currently supports Unix and Windows targets");
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const BACKUP_PAGES_PER_STEP: i32 = 2_048;
 static NEXT_BACKUP_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -338,6 +338,14 @@ BEGIN
     )
     WHERE id = old.book_id;
 END;
+";
+
+const MIGRATE_8_TO_9: &str = r"
+CREATE TABLE book_metadata (
+    book_id          INTEGER PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
+    publication_date TEXT,
+    rating           INTEGER NOT NULL DEFAULT 0 CHECK (rating BETWEEN 0 AND 10)
+) STRICT;
 ";
 
 /// Failure returned by the persistence adapter.
@@ -1034,9 +1042,12 @@ impl LibraryDatabase {
     /// stored book violates the one-or-more-assets invariant.
     pub fn get_book(&self, id: BookId) -> Result<Option<Book>> {
         let mut statement = self.connection.prepare_cached(
-            "SELECT b.id, b.title, b.authors, b.series, b.publisher, b.language, b.description, \
+            "SELECT b.id, b.title, b.authors, b.series, b.publisher, m.publication_date, \
+                    b.language, b.description, coalesce(m.rating, 0), \
                     a.id, a.format, a.storage_mode, a.health, a.path_encoding, a.path \
-             FROM books b LEFT JOIN book_assets a ON a.book_id = b.id \
+             FROM books b \
+             LEFT JOIN book_metadata m ON m.book_id = b.id \
+             LEFT JOIN book_assets a ON a.book_id = b.id \
              WHERE b.id = ?1 ORDER BY a.format, a.id",
         )?;
         let mut rows = statement.query([id.value()])?;
@@ -1044,6 +1055,17 @@ impl LibraryDatabase {
 
         while let Some(row) = rows.next()? {
             if book.is_none() {
+                let publication_date = row
+                    .get::<_, Option<String>>(5)?
+                    .map(|value| {
+                        value.parse::<PublicationDate>().map_err(|_| {
+                            StorageError::Integrity(format!(
+                                "book {id} has invalid publication date {value:?}"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                let rating = decode_rating(row.get(8)?, id)?;
                 book = Some(Book {
                     id: BookId::new(row.get(0)?),
                     title: row.get(1)?,
@@ -1053,20 +1075,22 @@ impl LibraryDatabase {
                     series_membership: None,
                     tags: Vec::new(),
                     publisher: row.get(4)?,
-                    language: row.get(5)?,
-                    description: row.get(6)?,
+                    publication_date,
+                    language: row.get(6)?,
+                    description: row.get(7)?,
+                    rating,
                     assets: Vec::new(),
                 });
             }
 
-            let asset_id = row.get::<_, Option<i64>>(7)?.ok_or_else(|| {
+            let asset_id = row.get::<_, Option<i64>>(9)?.ok_or_else(|| {
                 StorageError::Integrity(format!("book {id} does not contain an asset"))
             })?;
-            let format_value = row.get::<_, String>(8)?;
-            let storage_value = row.get::<_, String>(9)?;
-            let health_value = row.get::<_, String>(10)?;
-            let path_encoding = row.get::<_, String>(11)?;
-            let path_bytes = row.get::<_, Vec<u8>>(12)?;
+            let format_value = row.get::<_, String>(10)?;
+            let storage_value = row.get::<_, String>(11)?;
+            let health_value = row.get::<_, String>(12)?;
+            let path_encoding = row.get::<_, String>(13)?;
+            let path_bytes = row.get::<_, Vec<u8>>(14)?;
             let asset = BookAsset {
                 id: AssetId::new(asset_id),
                 format: decode_format(&format_value)?,
@@ -1118,6 +1142,7 @@ impl LibraryDatabase {
         if changed == 0 {
             return Err(StorageError::BookNotFound(book.id));
         }
+        upsert_book_metadata(&transaction, book.id, book.publication_date, book.rating)?;
         organisation::replace_flattened_organisation(
             &transaction,
             book.id.value(),
@@ -2254,7 +2279,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
     let observed = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match observed {
         SCHEMA_VERSION => return Ok(()),
-        0..=7 => {}
+        0..=8 => {}
         unsupported => return Err(StorageError::UnsupportedSchema(unsupported)),
     }
 
@@ -2282,6 +2307,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v5_to_v6(&transaction)?;
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
+            transaction.execute_batch(MIGRATE_8_TO_9)?;
             true
         }
         1 | 2 => {
@@ -2291,6 +2317,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v5_to_v6(&transaction)?;
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
+            transaction.execute_batch(MIGRATE_8_TO_9)?;
             true
         }
         3 => {
@@ -2299,6 +2326,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v5_to_v6(&transaction)?;
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
+            transaction.execute_batch(MIGRATE_8_TO_9)?;
             true
         }
         4 => {
@@ -2306,21 +2334,29 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v5_to_v6(&transaction)?;
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
+            transaction.execute_batch(MIGRATE_8_TO_9)?;
             true
         }
         5 => {
             organisation::migrate_v5_to_v6(&transaction)?;
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
+            transaction.execute_batch(MIGRATE_8_TO_9)?;
             true
         }
         6 => {
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
+            transaction.execute_batch(MIGRATE_8_TO_9)?;
             true
         }
         7 => {
             organisation::migrate_v7_to_v8(&transaction)?;
+            transaction.execute_batch(MIGRATE_8_TO_9)?;
+            true
+        }
+        8 => {
+            transaction.execute_batch(MIGRATE_8_TO_9)?;
             true
         }
         SCHEMA_VERSION => false,
@@ -2394,6 +2430,7 @@ struct MetadataInput<'a> {
     authors: &'a str,
     series: Option<&'a str>,
     publisher: Option<&'a str>,
+    publication_date: Option<PublicationDate>,
     language: Option<&'a str>,
     description: Option<&'a str>,
     imported_organisation: Option<&'a lectern_core::organisation::ImportedOrganisation>,
@@ -2406,6 +2443,7 @@ impl<'a> From<&'a BookMetadataDraft> for MetadataInput<'a> {
             authors: &book.authors,
             series: book.series.as_deref(),
             publisher: book.publisher.as_deref(),
+            publication_date: book.publication_date,
             language: book.language.as_deref(),
             description: book.description.as_deref(),
             imported_organisation: book.imported_organisation.as_ref(),
@@ -2420,6 +2458,7 @@ impl<'a> From<&'a BookDraft> for MetadataInput<'a> {
             authors: &book.authors,
             series: book.series.as_deref(),
             publisher: book.publisher.as_deref(),
+            publication_date: book.publication_date,
             language: book.language.as_deref(),
             description: book.description.as_deref(),
             imported_organisation: None,
@@ -2461,6 +2500,7 @@ struct ImportStatements<'connection> {
     find_reference_owner: Statement<'connection>,
     insert_book: Statement<'connection>,
     replace_metadata: Statement<'connection>,
+    upsert_metadata: Statement<'connection>,
     upsert_asset: Statement<'connection>,
     upsert_cover: Statement<'connection>,
 }
@@ -2483,6 +2523,11 @@ impl<'connection> ImportStatements<'connection> {
                      title = ?1, sort_title = ?2, authors = ?3, sort_authors = ?4, \
                      series = ?5, publisher = ?6, language = ?7, description = ?8, \
                      modified_at = unixepoch() WHERE id = ?9",
+            )?,
+            upsert_metadata: transaction.prepare(
+                "INSERT INTO book_metadata (book_id, publication_date) VALUES (?1, ?2) \
+                 ON CONFLICT(book_id) DO UPDATE SET \
+                     publication_date = excluded.publication_date",
             )?,
             upsert_asset: transaction.prepare(
                 "INSERT INTO book_assets ( \
@@ -2565,6 +2610,13 @@ fn upsert_book<'a>(
         ])?;
         transaction.last_insert_rowid()
     };
+
+    if owner.is_none() || metadata_policy == ReimportMetadataPolicy::ReplaceExisting {
+        statements.upsert_metadata.execute(params![
+            id,
+            metadata.publication_date.map(|date| date.to_string()),
+        ])?;
+    }
 
     if owner.is_none() {
         organisation::replace_imported_organisation(
@@ -2733,6 +2785,34 @@ fn decode_storage(value: &str) -> Result<AssetStorage> {
 
 fn decode_health(value: &str) -> Result<AssetHealth> {
     AssetHealth::parse(value).ok_or_else(|| StorageError::InvalidAssetHealth(value.into()))
+}
+
+fn decode_rating(value: i64, book: BookId) -> Result<BookRating> {
+    u8::try_from(value)
+        .ok()
+        .and_then(BookRating::from_half_stars)
+        .ok_or_else(|| {
+            StorageError::Integrity(format!("book {book} has invalid half-star rating {value}"))
+        })
+}
+
+fn upsert_book_metadata(
+    transaction: &Transaction<'_>,
+    book: BookId,
+    publication_date: Option<PublicationDate>,
+    rating: BookRating,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO book_metadata (book_id, publication_date, rating) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(book_id) DO UPDATE SET \
+             publication_date = excluded.publication_date, rating = excluded.rating",
+        params![
+            book.value(),
+            publication_date.map(|date| date.to_string()),
+            rating.half_stars(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn inspect_reference_asset(path: &Path) -> AssetHealth {
@@ -3209,7 +3289,7 @@ mod tests {
 
     use lectern_core::{
         AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAssetDraft, BookFormat,
-        BookId, BookMetadataDraft, LibraryQuery, ReimportMetadataPolicy, SortOrder,
+        BookId, BookMetadataDraft, BookRating, LibraryQuery, ReimportMetadataPolicy, SortOrder,
         organisation::{
             BookEdit, BookSelection, BulkTagEdit, ContributorCreditEdit, ContributorFacet,
             ContributorReference, ContributorRole, ExactFacets, ImportedContributorCredit,
@@ -3297,6 +3377,7 @@ mod tests {
             authors: authors.into(),
             series: None,
             publisher: None,
+            publication_date: None,
             language: Some("en".into()),
             description: None,
             imported_organisation: None,
@@ -4080,6 +4161,7 @@ END;
             authors: "Embedded File Author".into(),
             series: Some("Embedded Series".into()),
             publisher: Some("Embedded Publisher".into()),
+            publication_date: Some("1965-08".parse().unwrap()),
             language: Some("fr".into()),
             description: Some("Embedded file description.".into()),
             imported_organisation: None,
@@ -4240,6 +4322,7 @@ END;
                 authors: "Frank Herbert".into(),
                 series: None,
                 publisher: None,
+                publication_date: None,
                 language: None,
                 description: None,
                 format: BookFormat::Epub,
@@ -4846,7 +4929,7 @@ END;
     }
 
     #[test]
-    fn book_summary_projection_does_not_probe_asset_tables() {
+    fn book_summary_projection_does_not_probe_detail_tables() {
         let database = LibraryDatabase::open_in_memory().expect("open library");
         let mut statement = database
             .connection
@@ -4867,6 +4950,7 @@ END;
             details.iter().all(|detail| {
                 !detail.contains("book_covers")
                     && !detail.contains("book_assets")
+                    && !detail.contains("book_metadata")
                     && !detail.contains("CORRELATED")
             }),
             "unexpected query plan: {details:?}"
@@ -4959,8 +5043,10 @@ END;
             id,
             title: "A Wizard of Earthsea".into(),
             publisher: Some("Parnassus".into()),
+            publication_date: Some("1968-09".parse().unwrap()),
             language: Some("EN".into()),
             description: Some("An archipelago tale".into()),
+            rating: BookRating::from_half_stars(9).unwrap(),
             contributors: vec![
                 ContributorCreditEdit {
                     contributor: ContributorReference::New {
@@ -5018,6 +5104,15 @@ END;
         assert_eq!(stored.authors, "Ursula K. Le Guin");
         assert_eq!(stored.contributors.len(), 2);
         assert_eq!(stored.contributors[1].role, ContributorRole::Illustrator);
+        assert_eq!(stored.publisher.as_deref(), Some("Parnassus"));
+        assert_eq!(
+            stored
+                .publication_date
+                .map(|date| date.to_string())
+                .as_deref(),
+            Some("1968-09")
+        );
+        assert_eq!(stored.rating.half_stars(), 9);
         assert_eq!(
             stored
                 .series_membership
@@ -5145,8 +5240,10 @@ END;
             id,
             title: "Must roll back".into(),
             publisher: None,
+            publication_date: None,
             language: None,
             description: None,
+            rating: BookRating::default(),
             contributors: vec![
                 ContributorCreditEdit {
                     contributor: ContributorReference::New {
@@ -5208,8 +5305,10 @@ END;
                 id,
                 title: "Book".into(),
                 publisher: None,
+                publication_date: None,
                 language: None,
                 description: None,
+                rating: BookRating::default(),
                 contributors: vec![ContributorCreditEdit {
                     contributor: ContributorReference::New {
                         display_name: "Alpha Writer".into(),
@@ -5670,8 +5769,10 @@ END;
                 id: first,
                 title: "First".into(),
                 publisher: Some("Publisher".into()),
+                publication_date: None,
                 language: Some("en".into()),
                 description: None,
+                rating: BookRating::default(),
                 contributors: vec![
                     ContributorCreditEdit {
                         contributor: ContributorReference::New {
@@ -5749,8 +5850,10 @@ END;
                 id: second,
                 title: "Second".into(),
                 publisher: None,
+                publication_date: None,
                 language: Some("en".into()),
                 description: None,
+                rating: BookRating::default(),
                 contributors: vec![
                     ContributorCreditEdit {
                         contributor: ContributorReference::Existing(target_contributor),
@@ -6256,8 +6359,10 @@ END;
             series_membership: None,
             tags: Vec::new(),
             publisher: None,
+            publication_date: None,
             language: None,
             description: None,
+            rating: BookRating::default(),
             assets: Vec::new(),
         };
 

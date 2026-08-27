@@ -447,6 +447,12 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 raise RegressionError(
                     "organisation migration must use source schema version five"
                 )
+            if positive_or_zero_field(
+                workload, "fixture_version", "budget.workload"
+            ) != 3:
+                raise RegressionError(
+                    "organisation migration must use fixture version three"
+                )
         if query_mode in (
             "organisation-query",
             "organisation-vocabulary",
@@ -518,6 +524,10 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 raise RegressionError(
                     "populated UI workload page_size must be greater than zero"
                 )
+        if query_mode == "ui-book-detail" and positive_or_zero_field(
+            workload, "fixture_version", "budget.workload"
+        ) != 2:
+            raise RegressionError("book-detail UI workload must use fixture version two")
         if query_mode == "saved-searches":
             for field in (
                 "contributors",
@@ -1221,8 +1231,8 @@ def evaluate_migration_result(
         raise RegressionError("migration library count does not match the budget")
     if positive_or_zero_field(result, "source_schema_version", context) != 5:
         raise RegressionError("migration source schema version is not five")
-    if positive_or_zero_field(result, "final_schema_version", context) != 8:
-        raise RegressionError("migration did not reach schema version eight")
+    if positive_or_zero_field(result, "final_schema_version", context) != 9:
+        raise RegressionError("migration did not reach schema version nine")
     warmup = positive_or_zero_field(result, "warmup_iterations", context)
     measured = positive_or_zero_field(result, "measured_iterations", context)
     if warmup != workload["warmup_iterations"] or measured != workload["measured_iterations"]:
@@ -1233,6 +1243,7 @@ def evaluate_migration_result(
         "fts_equivalent",
         "initial_tags_and_saved_searches_empty",
         "schema_invariants_valid",
+        "canonical_metadata_defaults_valid",
         "duplicate_series_numbers_repaired",
         "failed_migration_rolled_back",
     ):
@@ -2006,6 +2017,8 @@ def expected_ui_book_detail_correctness(workload: dict[str, Any]) -> dict[str, A
         "library_total": workload["books"],
         "rendered_books": workload["page_size"],
         "title": "Benchmark book 001",
+        "publication_date": "2026-08-27",
+        "rating_half_stars": 7,
         "contributor_count": 3,
         "tag_count": 2,
         "asset_count": 2,
@@ -2013,6 +2026,8 @@ def expected_ui_book_detail_correctness(workload: dict[str, Any]) -> dict[str, A
             "bounded_first_page",
             "book_detail_panel_presented",
             "complete_metadata_fixture",
+            "publication_metadata_presented",
+            "half_star_rating_presented",
             "multiple_assets_presented",
         ],
     }

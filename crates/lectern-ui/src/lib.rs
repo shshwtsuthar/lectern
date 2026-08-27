@@ -10,7 +10,7 @@ mod theme;
 pub use assets::{LecternAssets, install_fonts};
 pub use components::{
     ActionListItem, ActionMenu, Button, ButtonSize, ButtonVariant, ColorSwatch, EntityChip,
-    IconButton, TagChip, TextArea, TextInput,
+    IconButton, StarRating, TagChip, TextArea, TextInput,
 };
 pub use icon::TablerIcon;
 pub use theme::{AccentColor, ColorMode, PrimerTheme, install_theme};

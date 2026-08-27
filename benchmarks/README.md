@@ -105,11 +105,11 @@ bar, and destructive-confirmation dispatch through its painted modal. The exact 
 and refreshed first page remain covered by `bulk-remove-regression-v2`.
 
 The GPUI book-detail workload in
-[`ui-book-detail-regression-v1.json`](ui-book-detail-regression-v1.json) paints the same bounded
+[`ui-book-detail-regression-v2.json`](ui-book-detail-regression-v2.json) paints the same bounded
 50,000-book projection, opens a representative single-book details panel, and verifies complete
-contributor, series, tag, publication, description, and multi-asset presentation markers. It gates
-the populated first paint and book-selection-to-painted-sidebar p95 plus peak RSS while retaining
-every fresh-process sample.
+contributor, series, tag, publication-date, half-star-rating, description, and multi-asset
+presentation markers. It gates the populated first paint and book-selection-to-painted-sidebar p95
+plus peak RSS while retaining every fresh-process sample.
 
 Performance-sensitive pull requests additionally run the base and candidate revisions three times
 each on the same runner. The gate compares the median of their run-level p95 values and fails a
@@ -143,7 +143,7 @@ python3 benchmarks/performance_regression.py \
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/reimport-known-path-regression-v1.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/organisation-migration-regression-v2.json
+  --budget benchmarks/organisation-migration-regression-v3.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-query-regression-v2.json
 python3 benchmarks/performance_regression.py \
@@ -159,7 +159,7 @@ python3 benchmarks/performance_regression.py \
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/ui-selection-regression-v1.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/ui-book-detail-regression-v1.json
+  --budget benchmarks/ui-book-detail-regression-v2.json
 ```
 
 Use `--output-dir PATH` to choose a new artifact directory, or `--budget PATH` to evaluate a

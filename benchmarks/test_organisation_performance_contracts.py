@@ -89,7 +89,7 @@ class OrganisationPerformanceContractTests(unittest.TestCase):
         )
 
     def test_migration_contract_uses_independent_version_five_copies(self) -> None:
-        budget = load_budget("organisation-migration-regression-v2.json")
+        budget = load_budget("organisation-migration-regression-v3.json")
         workload = budget["workload"]
         self.assertEqual(workload["source_schema_version"], 5)
         self.assertEqual(workload["books"], 50_000)

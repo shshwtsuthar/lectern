@@ -60,7 +60,7 @@ python3 benchmarks/performance_regression.py \
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/reimport-known-path-regression-v1.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/organisation-migration-regression-v2.json
+  --budget benchmarks/organisation-migration-regression-v3.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-query-regression-v2.json
 python3 benchmarks/performance_regression.py \
@@ -106,21 +106,23 @@ require the native book-detail suite:
 
 ```sh
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/ui-book-detail-regression-v1.json
+  --budget benchmarks/ui-book-detail-regression-v2.json
 ```
 
 It retains 40 measured fresh-process samples after 5 warmups for the same 50,000-book projection
 and bounded 128-card first page. The representative detail fixture includes ordered contributor
-roles, a series index, multiple tags, ordinary publication metadata, and both EPUB and PDF assets.
-It verifies the complete panel markers while gating populated first paint,
-book-selection-to-painted-sidebar p95, and peak RSS.
+roles, a series index, multiple tags, publication date, a 3.5-star rating, ordinary publication
+metadata, and both EPUB and PDF assets. It verifies the complete panel markers while gating
+populated first paint, book-selection-to-painted-sidebar p95, and peak RSS.
 
 The normalized organisation v2 fixture replaces the historical duplicate series-number
 distribution with deterministic unique exact numbers at the same 50,000-book, 2,500-series scale.
 Its query suite includes the indexed conflict/self-exclusion check used by the Book number input.
-The version-five-to-current migration suite reaches schema version 8 and measures installation of
-the partial unique index; unit migration coverage separately supplies deliberate version-seven
-duplicates and verifies the deterministic repair.
+The version-five-to-current migration suite reaches schema version 9 and measures installation of
+the partial unique index plus the canonical publication-date and half-star-rating detail table;
+unit migration coverage separately supplies deliberate version-seven duplicates, verifies the
+deterministic repair, and covers version-eight metadata defaults. Keeping these detail-only values
+outside the hot `books` rows preserves the compact indexed projection used by grid and search scans.
 
 The export suite is also mandatory for changes to copy buffers, publication, overwrite behavior,
 export scheduling, or export progress. Import, startup, scrolling, rendering, or memory changes

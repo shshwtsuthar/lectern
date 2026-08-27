@@ -389,6 +389,7 @@ struct MigrationResult {
     fts_equivalent: bool,
     initial_tags_and_saved_searches_empty: bool,
     schema_invariants_valid: bool,
+    canonical_metadata_defaults_valid: bool,
     duplicate_series_numbers_repaired: bool,
     failed_migration_rolled_back: bool,
     scenarios: Vec<MigrationScenario>,
@@ -474,7 +475,7 @@ fn run_migration(options: &Options) -> Result<(), String> {
             .as_millis(),
         database_path: options.database.display().to_string(),
         source_schema_version: 5,
-        final_schema_version: 8,
+        final_schema_version: 9,
         library_books: options.books,
         warmup_iterations: options.warmup,
         measured_iterations: options.iterations,
@@ -483,6 +484,7 @@ fn run_migration(options: &Options) -> Result<(), String> {
         fts_equivalent: true,
         initial_tags_and_saved_searches_empty: true,
         schema_invariants_valid: true,
+        canonical_metadata_defaults_valid: true,
         duplicate_series_numbers_repaired: true,
         failed_migration_rolled_back: rollback_valid,
         scenarios: vec![
@@ -523,6 +525,7 @@ fn prepare_version_seven_template(
             "DROP INDEX series_memberships_series_number_uidx; \
              UPDATE series_memberships SET series_index = 1000000; \
              UPDATE books SET series_index = 1000000 WHERE series IS NOT NULL; \
+             DROP TABLE book_metadata; \
              PRAGMA user_version = 7;",
         )
         .map_err(display_error)?;
@@ -549,6 +552,20 @@ fn validate_version_seven_template(path: &Path, options: &Options) -> Result<(),
         return Err(format!(
             "series-repair source schema is {version}, expected 7"
         ));
+    }
+    let future_metadata_tables: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema \
+             WHERE type = 'table' AND name = 'book_metadata'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(display_error)?;
+    if future_metadata_tables != 0 {
+        return Err(
+            "version-seven repair fixture contains publication metadata from schema version nine"
+                .into(),
+        );
     }
     expect_count(&connection, "books", options.books)?;
     let duplicates: bool = connection
@@ -637,8 +654,8 @@ fn validate_migrated_candidate(path: &Path, options: &Options) -> Result<(), Str
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(display_error)?;
-    if version != 8 {
-        return Err(format!("candidate schema is {version}, expected 8"));
+    if version != 9 {
+        return Err(format!("candidate schema is {version}, expected 9"));
     }
     expect_count(&connection, "books", options.books)?;
     expect_count(&connection, "book_assets", options.books)?;
@@ -651,6 +668,19 @@ fn validate_migrated_candidate(path: &Path, options: &Options) -> Result<(), Str
     )?;
     expect_count(&connection, "tags", 0)?;
     expect_count(&connection, "saved_searches", 0)?;
+    let invalid_metadata_defaults: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM books b LEFT JOIN book_metadata m ON m.book_id = b.id \
+             WHERE m.publication_date IS NOT NULL OR coalesce(m.rating, 0) != 0",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(display_error)?;
+    if invalid_metadata_defaults != 0 {
+        return Err(format!(
+            "migration left {invalid_metadata_defaults} books with non-default canonical metadata"
+        ));
+    }
     expect_count(
         &connection,
         "book_covers",

@@ -5,7 +5,7 @@ use std::{fmt, ops::Range, str::FromStr};
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::BookId;
+use crate::{BookId, BookRating, PublicationDate};
 
 macro_rules! stable_id {
     ($name:ident, $description:literal) => {
@@ -478,10 +478,14 @@ pub struct BookEdit {
     pub title: String,
     /// Optional publisher.
     pub publisher: Option<String>,
+    /// Optional calendar publication date.
+    pub publication_date: Option<PublicationDate>,
     /// Optional publication language.
     pub language: Option<String>,
     /// Optional description or synopsis.
     pub description: Option<String>,
+    /// Personal zero-to-five-star rating in exact half-star steps.
+    pub rating: BookRating,
     /// Ordered contributor credits.
     pub contributors: Vec<ContributorCreditEdit>,
     /// Optional series relation and index.

@@ -409,10 +409,11 @@ operation is capped at 32 MiB above the seeded idle phase; the operation must no
 
 ### Migration workload
 
-Use `organisation-migration-regression-v2.json` with independent copies of a version-five
+Use `organisation-migration-regression-v3.json` with independent copies of a version-five
 50,000-book database. It verifies byte-equivalent visible author/series projections, stable book and
-asset identities, FTS equivalence, empty initial tags/searches, and every schema invariant. Retain at
-least 20 optimized samples; migration has a 5 second p95 wall-time budget and a 256 MiB peak-RSS
+asset identities, FTS equivalence, empty initial tags/searches, canonical publication metadata
+defaults, and every schema invariant. Retain at least 20 optimized samples; migration has a 5 second
+p95 wall-time budget and a 256 MiB peak-RSS
 budget on the pinned runner. A migration error must leave the original database readable at its old
 schema version.
 

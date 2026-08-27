@@ -20,8 +20,8 @@ use gpui_base::{
 };
 use gpui_platform::application;
 use lectern_core::{
-    AssetHealth, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId, BookSummary,
-    ImportSummary, LibraryQuery, LibraryService,
+    AssetHealth, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId, BookRating,
+    BookSummary, ImportSummary, LibraryQuery, LibraryService,
     organisation::{
         BookSelection, BulkRemovalResult, Contributor, ContributorCredit, ContributorId,
         ContributorRole, LibraryGeneration, NameKind, SelectionSnapshot, Series, SeriesId,
@@ -32,8 +32,8 @@ use lectern_core::{
 use lectern_service::{LibraryServiceError, SqliteLibraryService, default_database_path};
 use lectern_ui::{
     AccentColor, ActionListItem, ActionMenu, Button, ButtonSize, ButtonVariant, ColorMode,
-    ColorSwatch, EntityChip, IconButton, LecternAssets, PrimerTheme, TablerIcon, TagChip, TextArea,
-    TextInput, install_fonts, install_theme,
+    ColorSwatch, EntityChip, IconButton, LecternAssets, PrimerTheme, StarRating, TablerIcon,
+    TagChip, TextArea, TextInput, install_fonts, install_theme,
 };
 use serde::{Deserialize, Serialize};
 
@@ -193,6 +193,8 @@ struct BookDetailEditor {
     series_index_generation: u64,
     series_index_availability: SeriesIndexAvailability,
     publisher: Option<Entity<InputState>>,
+    publication_date: Option<Entity<InputState>>,
+    rating: BookRating,
     language: String,
     language_menu_open: bool,
     description: Option<Entity<TextareaState>>,
@@ -222,6 +224,7 @@ enum DetailOperation {
 enum DetailErrorSection {
     #[default]
     Information,
+    Publication,
     Files,
     Series,
     Contributors,
@@ -275,6 +278,8 @@ impl BookDetailEditor {
             series_index_generation: 0,
             series_index_availability: SeriesIndexAvailability::Idle,
             publisher: None,
+            publication_date: None,
+            rating: book.rating,
             language: book.language.clone().unwrap_or_default(),
             language_menu_open: false,
             description: None,
@@ -331,6 +336,15 @@ impl BookDetailEditor {
             |state| state.read(cx).value().to_string(),
         );
         let language = self.language.clone();
+        let publication_date = self.publication_date.as_ref().map_or_else(
+            || {
+                self.original
+                    .publication_date
+                    .map(|date| date.to_string())
+                    .unwrap_or_default()
+            },
+            |state| state.read(cx).value().to_string(),
+        );
         let description = self.description.as_ref().map_or_else(
             || self.original.description.clone().unwrap_or_default(),
             |state| state.read(cx).value().to_string(),
@@ -339,8 +353,10 @@ impl BookDetailEditor {
             &self.original,
             self.title.read(cx).value().as_str(),
             &publisher,
+            &publication_date,
             &language,
             &description,
+            self.rating,
         )
     }
 
@@ -356,6 +372,7 @@ impl BookDetailEditor {
             self.series_input.as_ref(),
             self.series_index.as_ref(),
             self.publisher.as_ref(),
+            self.publication_date.as_ref(),
             self.tag_input.as_ref(),
         ]
         .into_iter()
@@ -627,6 +644,11 @@ impl LecternView {
             .original
             .clone();
         let title = book.title.clone();
+        let publication_date = book
+            .publication_date
+            .map(|date| date.to_string())
+            .unwrap_or_default();
+        let rating_half_stars = book.rating.half_stars();
         let contributor_count = book.contributors.len();
         let tag_count = book.tags.len();
         let asset_count = book.assets.len();
@@ -644,6 +666,8 @@ impl LecternView {
             self.library_total,
             self.books.len(),
             title,
+            publication_date,
+            rating_half_stars,
             contributor_count,
             tag_count,
             asset_count,
@@ -1056,6 +1080,30 @@ impl LecternView {
             editor.language_menu_open = open;
             cx.notify();
         }
+    }
+
+    fn set_detail_rating(&mut self, half_stars: u8, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        if editor.operation != DetailOperation::Idle {
+            return;
+        }
+        let half_stars = if half_stars > 0 && editor.rating.half_stars() == half_stars {
+            0
+        } else {
+            half_stars
+        };
+        let Some(rating) = BookRating::from_half_stars(half_stars) else {
+            return;
+        };
+        if rating == editor.rating {
+            return;
+        }
+        editor.rating = rating;
+        editor.dirty = true;
+        editor.error = None;
+        cx.notify();
     }
 
     fn move_detail_contributor(&mut self, row_id: u64, offset: isize, cx: &mut Context<Self>) {
@@ -1493,6 +1541,7 @@ impl LecternView {
                 editor.error_section = error_section;
                 let item = match error_section {
                     DetailErrorSection::Information => DETAIL_INFORMATION_ITEM,
+                    DetailErrorSection::Publication => DETAIL_PUBLICATION_ITEM,
                     DetailErrorSection::Files => DETAIL_FILES_ITEM,
                     DetailErrorSection::Series => DETAIL_SERIES_ITEM,
                     DetailErrorSection::Contributors => DETAIL_CONTRIBUTOR_START_ITEM,
@@ -2949,9 +2998,10 @@ fn import_status(summary: &ImportSummary) -> Option<SharedString> {
 }
 
 const DETAIL_INFORMATION_ITEM: usize = 0;
-const DETAIL_FILES_ITEM: usize = 1;
-const DETAIL_SERIES_ITEM: usize = 2;
-const DETAIL_CONTRIBUTOR_START_ITEM: usize = 3;
+const DETAIL_PUBLICATION_ITEM: usize = 1;
+const DETAIL_FILES_ITEM: usize = 2;
+const DETAIL_SERIES_ITEM: usize = 3;
+const DETAIL_CONTRIBUTOR_START_ITEM: usize = 4;
 
 const fn detail_contributor_footer_item(contributor_count: usize) -> usize {
     DETAIL_CONTRIBUTOR_START_ITEM + contributor_count
@@ -3035,20 +3085,34 @@ impl LecternView {
         let contributor_count = editor.contributors.len();
         let disabled = editor.operation != DetailOperation::Idle;
 
-        if item == DETAIL_INFORMATION_ITEM
-            && (editor.publisher.is_none() || editor.description.is_none())
-        {
-            let publisher = editor.original.publisher.clone().unwrap_or_default();
+        if item == DETAIL_INFORMATION_ITEM && editor.description.is_none() {
             let description = editor.original.description.clone().unwrap_or_default();
-            let publisher = metadata_input(window, cx, "Publisher", publisher);
             let description = metadata_textarea(window, cx, "Add a description", description);
             if disabled {
-                publisher.update(cx, |state, cx| state.set_disabled(true, cx));
                 description.update(cx, |state, cx| state.set_disabled(true, cx));
             }
             if let Some(editor) = &mut self.detail_editor {
-                editor.publisher = Some(publisher);
                 editor.description = Some(description);
+            }
+        } else if item == DETAIL_PUBLICATION_ITEM
+            && (editor.publisher.is_none() || editor.publication_date.is_none())
+        {
+            let publisher = editor.original.publisher.clone().unwrap_or_default();
+            let publication_date = editor
+                .original
+                .publication_date
+                .map(|date| date.to_string())
+                .unwrap_or_default();
+            let publisher = metadata_input(window, cx, "Publisher", publisher);
+            let publication_date =
+                metadata_input(window, cx, "YYYY, YYYY-MM, or YYYY-MM-DD", publication_date);
+            if disabled {
+                publisher.update(cx, |state, cx| state.set_disabled(true, cx));
+                publication_date.update(cx, |state, cx| state.set_disabled(true, cx));
+            }
+            if let Some(editor) = &mut self.detail_editor {
+                editor.publisher = Some(publisher);
+                editor.publication_date = Some(publication_date);
             }
         } else if item == DETAIL_SERIES_ITEM && editor.series_input.is_none() {
             let index = editor.curation.series.index.clone();
@@ -3093,6 +3157,8 @@ impl LecternView {
 
         let content = if item == DETAIL_INFORMATION_ITEM {
             detail_information_item(editor, &theme, cx)
+        } else if item == DETAIL_PUBLICATION_ITEM {
+            detail_publication_item(editor, &theme, cx)
         } else if item == DETAIL_FILES_ITEM {
             detail_files_item(editor, &theme, cx)
         } else if item == DETAIL_SERIES_ITEM {
@@ -3128,13 +3194,19 @@ impl LecternView {
 
         let starts_section = matches!(
             item,
-            DETAIL_INFORMATION_ITEM | DETAIL_FILES_ITEM | DETAIL_SERIES_ITEM
+            DETAIL_INFORMATION_ITEM
+                | DETAIL_PUBLICATION_ITEM
+                | DETAIL_FILES_ITEM
+                | DETAIL_SERIES_ITEM
         ) || item == DETAIL_CONTRIBUTOR_START_ITEM
             || item == tags
             || item == library;
         let ends_section = matches!(
             item,
-            DETAIL_INFORMATION_ITEM | DETAIL_FILES_ITEM | DETAIL_SERIES_ITEM
+            DETAIL_INFORMATION_ITEM
+                | DETAIL_PUBLICATION_ITEM
+                | DETAIL_FILES_ITEM
+                | DETAIL_SERIES_ITEM
         ) || item == contributor_footer
             || item == tags;
 
@@ -3250,6 +3322,8 @@ fn metadata_error_section(error: &str) -> DetailErrorSection {
         DetailErrorSection::Series
     } else if error.contains("tag") {
         DetailErrorSection::Tags
+    } else if error.contains("publication date") || error.contains("rating") {
+        DetailErrorSection::Publication
     } else {
         DetailErrorSection::Information
     }
@@ -3342,6 +3416,45 @@ fn detail_information_item(
             &editor.title,
         )))
         .child(
+            detail_field_container("Language", theme)
+                .child(detail_language_menu(editor, theme, cx)),
+        )
+        .child(
+            detail_field_container("Description", theme).child(
+                TextArea::new(
+                    "detail-description",
+                    "Book description",
+                    editor
+                        .description
+                        .as_ref()
+                        .expect("rendered description is initialized"),
+                )
+                .height(rems(6.)),
+            ),
+        )
+        .when_some(
+            detail_error(editor, DetailErrorSection::Information),
+            |content, error| content.child(detail_error_text(error, theme)),
+        )
+        .into_any_element()
+}
+
+fn detail_publication_item(
+    editor: &BookDetailEditor,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let rating_label = if editor.rating == BookRating::default() {
+        "Unrated".to_owned()
+    } else {
+        format!("{} of 5", editor.rating)
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(theme.spacing.large)
+        .child(detail_section_heading("Publication", theme))
+        .child(
             div()
                 .flex()
                 .gap(theme.spacing.medium)
@@ -3359,27 +3472,51 @@ fn detail_information_item(
                         )),
                 )
                 .child(
-                    detail_field_container("Language", theme)
+                    detail_field_container("Publication date", theme)
                         .flex_1()
                         .min_w_0()
-                        .child(detail_language_menu(editor, theme, cx)),
+                        .child(TextInput::new(
+                            "detail-publication-date",
+                            "YYYY, YYYY-MM, or YYYY-MM-DD",
+                            editor
+                                .publication_date
+                                .as_ref()
+                                .expect("rendered publication date is initialized"),
+                        )),
                 ),
         )
         .child(
-            detail_field_container("Description", theme).child(
-                TextArea::new(
-                    "detail-description",
-                    "Book description",
-                    editor
-                        .description
-                        .as_ref()
-                        .expect("rendered description is initialized"),
-                )
-                .height(rems(6.)),
+            detail_field_container("Rating", theme).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(theme.spacing.medium)
+                    .child(
+                        StarRating::new("detail-rating", editor.rating.half_stars())
+                            .disabled(editor.operation != DetailOperation::Idle)
+                            .on_change(cx.listener(|this, half_stars, _, cx| {
+                                this.set_detail_rating(*half_stars, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.surface.muted_foreground)
+                            .child(rating_label),
+                    )
+                    .when(editor.rating != BookRating::default(), |row| {
+                        row.child(
+                            Button::new("clear-detail-rating", "Clear")
+                                .size(ButtonSize::Small)
+                                .disabled(editor.operation != DetailOperation::Idle)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_detail_rating(0, cx);
+                                })),
+                        )
+                    }),
             ),
         )
         .when_some(
-            detail_error(editor, DetailErrorSection::Information),
+            detail_error(editor, DetailErrorSection::Publication),
             |content, error| content.child(detail_error_text(error, theme)),
         )
         .into_any_element()
@@ -4349,10 +4486,12 @@ fn benchmark_book_detail() -> Book {
             },
         ],
         publisher: Some("Lectern Press".to_owned()),
+        publication_date: Some("2026-08-27".parse().expect("valid benchmark date")),
         language: Some("en".to_owned()),
         description: Some(
             "A deterministic book used to verify complete detail-panel presentation.".to_owned(),
         ),
+        rating: BookRating::from_half_stars(7).expect("valid benchmark rating"),
         assets: vec![
             BookAsset {
                 id: AssetId::new(1),
@@ -4552,11 +4691,17 @@ impl BenchmarkRun {
         });
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the benchmark correctness artifact keeps every observed field explicit"
+    )]
     fn finish_book_detail(
         self,
         library_total: u64,
         rendered_books: usize,
         title: String,
+        publication_date: String,
+        rating_half_stars: u8,
         contributor_count: usize,
         tag_count: usize,
         asset_count: usize,
@@ -4579,6 +4724,8 @@ impl BenchmarkRun {
                 library_total,
                 rendered_books,
                 title,
+                publication_date,
+                rating_half_stars,
                 contributor_count,
                 tag_count,
                 asset_count,
@@ -4586,6 +4733,8 @@ impl BenchmarkRun {
                     "bounded_first_page",
                     "book_detail_panel_presented",
                     "complete_metadata_fixture",
+                    "publication_metadata_presented",
+                    "half_star_rating_presented",
                     "multiple_assets_presented",
                 ],
             },
@@ -4677,6 +4826,8 @@ struct UiBookDetailBenchmarkCorrectness {
     library_total: u64,
     rendered_books: usize,
     title: String,
+    publication_date: String,
+    rating_half_stars: u8,
     contributor_count: usize,
     tag_count: usize,
     asset_count: usize,

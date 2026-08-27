@@ -19,7 +19,8 @@ use image::{Rgb, RgbImage, codecs::jpeg::JpegEncoder};
 use lectern_core::organisation::ExactFacets;
 use lectern_core::{
     AssetHealth, AssetId, AssetStorage, Book, BookAssetDraft, BookDraft, BookFormat, BookImport,
-    BookMetadataDraft, BookSummary, ImportRecord, LibraryQuery, LibraryService, SortOrder,
+    BookMetadataDraft, BookSummary, ImportRecord, LibraryQuery, LibraryService, PublicationDate,
+    SortOrder,
 };
 use lectern_desktop::export::{
     EXPORT_BUFFER_BYTES, ExportControl, ExportError, OverwritePolicy, export_file,
@@ -545,6 +546,11 @@ fn benchmark_record(index: usize, seed: u64, cover_thumbnail: Option<Vec<u8>>) -
                 .is_multiple_of(4)
                 .then(|| format!("Series {:03}", (mixed >> 28) % 250)),
             publisher: Some(PUBLISHERS[bounded_index(mixed >> 36, PUBLISHERS.len())].into()),
+            publication_date: Some(
+                format!("{}-{:02}", 1980 + index % 45, index % 12 + 1)
+                    .parse::<PublicationDate>()
+                    .expect("benchmark publication date is valid"),
+            ),
             language: Some(LANGUAGES[bounded_index(mixed >> 44, LANGUAGES.len())].into()),
             description: Some(format!(
                 "Deterministic benchmark publication {index} generated from seed {seed}."
@@ -1078,6 +1084,7 @@ fn removal_candidate(
             authors: "Benchmark Author".into(),
             series: Some("Removal Regression".into()),
             publisher: Some("Lectern Benchmark".into()),
+            publication_date: Some("2026-08-27".parse().expect("valid benchmark date")),
             language: Some("en".into()),
             description: Some("Deterministic aggregate removed after every measurement.".into()),
             imported_organisation: None,
@@ -1972,6 +1979,7 @@ fn replacement_candidate(round: usize, source: &Path, cover_thumbnail: Vec<u8>) 
             authors: "Benchmark Author".into(),
             series: Some("Replacement Regression".into()),
             publisher: Some("Lectern Benchmark".into()),
+            publication_date: Some("2026-08-27".parse().expect("valid benchmark date")),
             language: Some("en".into()),
             description: Some("Deterministic asset replaced after validation.".into()),
             imported_organisation: None,
@@ -2393,6 +2401,7 @@ fn prepare_reimport_candidates(
                     authors: original.authors.clone(),
                     series: original.series.clone(),
                     publisher: original.publisher.clone(),
+                    publication_date: original.publication_date,
                     language: original.language.clone(),
                     description: original.description.clone(),
                     imported_organisation: None,

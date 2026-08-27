@@ -640,6 +640,7 @@ pub(super) fn save_book_edit(transaction: &Transaction<'_>, edit: &BookEdit) -> 
     if changed == 0 {
         return Err(StorageError::BookNotFound(edit.id));
     }
+    super::upsert_book_metadata(transaction, edit.id, edit.publication_date, edit.rating)?;
 
     let resolved_credits = edit
         .contributors
@@ -2796,7 +2797,7 @@ mod tests {
     use rusqlite::Connection;
 
     use super::super::{SCHEMA, SCHEMA_VERSION, initialize_schema_transaction};
-    use super::{migrate_v5_to_v6, migrate_v6_to_v7};
+    use super::{migrate_v5_to_v6, migrate_v6_to_v7, migrate_v7_to_v8};
 
     fn version_five_library() -> Connection {
         let connection = Connection::open_in_memory().expect("open version-five fixture");
@@ -2832,6 +2833,39 @@ mod tests {
             .pragma_update(None, "user_version", 5)
             .expect("mark v5 schema");
         connection
+    }
+
+    #[test]
+    fn version_nine_migration_adds_unrated_publication_metadata_defaults() {
+        let mut connection = version_five_library();
+        {
+            let transaction = connection.transaction().expect("begin migration fixture");
+            migrate_v5_to_v6(&transaction).expect("migrate organisation schema");
+            migrate_v6_to_v7(&transaction).expect("add tag colors");
+            migrate_v7_to_v8(&transaction).expect("add unique series numbers");
+            transaction
+                .pragma_update(None, "user_version", 8)
+                .expect("mark version eight");
+            transaction.commit().expect("commit version-eight fixture");
+        }
+
+        initialize_schema_transaction(&mut connection).expect("migrate version-eight library");
+
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("read schema version"),
+            SCHEMA_VERSION
+        );
+        let metadata = connection
+            .query_row(
+                "SELECT m.publication_date, coalesce(m.rating, 0) \
+                 FROM books b LEFT JOIN book_metadata m ON m.book_id = b.id WHERE b.id = 7",
+                [],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("read migrated metadata");
+        assert_eq!(metadata, (None, 0));
     }
 
     #[test]

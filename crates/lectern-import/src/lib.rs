@@ -12,7 +12,7 @@ use hayro::{
 };
 use image::{ImageReader, Limits, codecs::jpeg::JpegEncoder};
 use lectern_core::{
-    AssetStorage, BookAssetDraft, BookFormat, BookImport, BookMetadataDraft,
+    AssetStorage, BookAssetDraft, BookFormat, BookImport, BookMetadataDraft, PublicationDate,
     ReimportMetadataPolicy,
     organisation::{
         ContributorRole, ImportedContributorCredit, ImportedOrganisation, SeriesIndex, identity_key,
@@ -304,6 +304,7 @@ pub fn parse_epub(path: impl AsRef<Path>) -> Result<BookImport> {
             authors: metadata.creators.join(", "),
             series: metadata.series,
             publisher: metadata.publisher,
+            publication_date: metadata.publication_date,
             language: metadata.language,
             description: metadata.description,
             imported_organisation: Some(ImportedOrganisation {
@@ -376,6 +377,7 @@ pub fn parse_pdf(path: impl AsRef<Path>) -> Result<BookImport> {
             authors,
             series: None,
             publisher: None,
+            publication_date: None,
             language: None,
             description,
             imported_organisation: Some(ImportedOrganisation {
@@ -412,6 +414,7 @@ enum TextField {
     Creator,
     Language,
     Publisher,
+    PublicationDate,
     Description,
     Series,
     SeriesIndex,
@@ -424,6 +427,7 @@ impl TextField {
             Self::Creator => b"creator",
             Self::Language => b"language",
             Self::Publisher => b"publisher",
+            Self::PublicationDate => b"date",
             Self::Description => b"description",
             Self::Series | Self::SeriesIndex => b"meta",
         }
@@ -446,6 +450,7 @@ struct PackageMetadata {
     legacy_series_index: Option<String>,
     group_positions: Vec<(String, String)>,
     publisher: Option<String>,
+    publication_date: Option<PublicationDate>,
     language: Option<String>,
     description: Option<String>,
     legacy_cover_id: Option<String>,
@@ -481,6 +486,11 @@ impl PackageMetadata {
             }
             TextField::Publisher => {
                 self.publisher.get_or_insert(value);
+            }
+            TextField::PublicationDate => {
+                if self.publication_date.is_none() {
+                    self.publication_date = source_publication_date(&value);
+                }
             }
             TextField::Description => {
                 self.description.get_or_insert(value);
@@ -647,6 +657,7 @@ fn inspect_element(
         b"creator" => Some(TextField::Creator),
         b"language" => Some(TextField::Language),
         b"publisher" => Some(TextField::Publisher),
+        b"date" => Some(TextField::PublicationDate),
         b"description" => Some(TextField::Description),
         b"meta" => return inspect_meta(element, metadata),
         b"item" => {
@@ -867,6 +878,17 @@ fn clean_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn source_publication_date(value: &str) -> Option<PublicationDate> {
+    value.parse().ok().or_else(|| {
+        value
+            .as_bytes()
+            .get(10)
+            .filter(|separator| matches!(separator, b'T' | b' '))
+            .and_then(|_| value.get(..10))
+            .and_then(|date| date.parse().ok())
+    })
+}
+
 fn clean_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -974,6 +996,7 @@ mod tests {
                 <dc:creator>Charles Vess</dc:creator>
                 <dc:language>en</dc:language>
                 <dc:publisher>Earthsea Press</dc:publisher>
+                <dc:date>2018-10-25</dc:date>
                 <dc:description>&lt;p&gt;A wizard's journey.&lt;/p&gt;</dc:description>
                 <meta id="earthsea" property="belongs-to-collection">Earthsea</meta>
                 <meta refines="#earthsea" property="group-position">1.25</meta>
@@ -1058,6 +1081,10 @@ mod tests {
         assert_eq!(record.book.authors, "Ursula K. Le Guin, Charles Vess");
         assert_eq!(record.book.series.as_deref(), Some("Earthsea"));
         assert_eq!(record.book.publisher.as_deref(), Some("Earthsea Press"));
+        assert_eq!(
+            record.book.publication_date.map(|date| date.to_string()),
+            Some("2018-10-25".into())
+        );
         assert_eq!(record.book.language.as_deref(), Some("en"));
         assert_eq!(
             record.book.description.as_deref(),

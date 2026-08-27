@@ -10,6 +10,7 @@ use std::{
     error::Error,
     fmt,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 /// Compile-time information about the running Lectern build.
@@ -53,6 +54,167 @@ impl BookId {
 impl fmt::Display for BookId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+/// Calendar date associated with a canonical book's publication.
+///
+/// Year-only and year-month values are supported because publication metadata is frequently less
+/// precise than a complete calendar date. The durable representation is ISO 8601 `YYYY`,
+/// `YYYY-MM`, or `YYYY-MM-DD`.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PublicationDate {
+    year: u16,
+    month: Option<u8>,
+    day: Option<u8>,
+}
+
+impl PublicationDate {
+    /// Returns the publication year.
+    #[must_use]
+    pub const fn year(self) -> u16 {
+        self.year
+    }
+
+    /// Returns the publication month when recorded.
+    #[must_use]
+    pub const fn month(self) -> Option<u8> {
+        self.month
+    }
+
+    /// Returns the publication day when recorded.
+    #[must_use]
+    pub const fn day(self) -> Option<u8> {
+        self.day
+    }
+}
+
+impl FromStr for PublicationDate {
+    type Err = PublicationDateError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let bytes = value.as_bytes();
+        if !matches!(bytes.len(), 4 | 7 | 10)
+            || bytes.get(4).is_some_and(|separator| *separator != b'-')
+            || bytes.get(7).is_some_and(|separator| *separator != b'-')
+        {
+            return Err(PublicationDateError);
+        }
+
+        let year = parse_date_digits(&bytes[..4]).ok_or(PublicationDateError)?;
+        if year == 0 {
+            return Err(PublicationDateError);
+        }
+        if bytes.len() == 4 {
+            return Ok(Self {
+                year,
+                month: None,
+                day: None,
+            });
+        }
+
+        let month = u8::try_from(parse_date_digits(&bytes[5..7]).ok_or(PublicationDateError)?)
+            .map_err(|_| PublicationDateError)?;
+        if !(1..=12).contains(&month) {
+            return Err(PublicationDateError);
+        }
+        if bytes.len() == 7 {
+            return Ok(Self {
+                year,
+                month: Some(month),
+                day: None,
+            });
+        }
+
+        let day = u8::try_from(parse_date_digits(&bytes[8..10]).ok_or(PublicationDateError)?)
+            .map_err(|_| PublicationDateError)?;
+        let maximum_day = days_in_month(year, month);
+        if !(1..=maximum_day).contains(&day) {
+            return Err(PublicationDateError);
+        }
+        Ok(Self {
+            year,
+            month: Some(month),
+            day: Some(day),
+        })
+    }
+}
+
+impl fmt::Display for PublicationDate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:04}", self.year)?;
+        if let Some(month) = self.month {
+            write!(formatter, "-{month:02}")?;
+        }
+        if let Some(day) = self.day {
+            write!(formatter, "-{day:02}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Error returned when publication date text is not a real ISO calendar date.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublicationDateError;
+
+impl fmt::Display for PublicationDateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("publication date must be YYYY, YYYY-MM, or YYYY-MM-DD")
+    }
+}
+
+impl Error for PublicationDateError {}
+
+fn parse_date_digits(bytes: &[u8]) -> Option<u16> {
+    bytes.iter().try_fold(0_u16, |value, byte| {
+        byte.is_ascii_digit()
+            .then(|| value * 10 + u16::from(*byte - b'0'))
+    })
+}
+
+const fn days_in_month(year: u16, month: u8) -> u8 {
+    match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100)) => {
+            29
+        }
+        2 => 28,
+        _ => 31,
+    }
+}
+
+/// A canonical zero-to-five-star book rating stored in exact half-star steps.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BookRating(u8);
+
+impl BookRating {
+    /// Maximum durable rating in half-star units.
+    pub const MAX_HALF_STARS: u8 = 10;
+
+    /// Builds a rating from exact half-star units (`0..=10`).
+    #[must_use]
+    pub const fn from_half_stars(half_stars: u8) -> Option<Self> {
+        if half_stars <= Self::MAX_HALF_STARS {
+            Some(Self(half_stars))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the exact durable half-star count.
+    #[must_use]
+    pub const fn half_stars(self) -> u8 {
+        self.0
+    }
+}
+
+impl fmt::Display for BookRating {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_multiple_of(2) {
+            write!(formatter, "{}", self.0 / 2)
+        } else {
+            write!(formatter, "{}.5", self.0 / 2)
+        }
     }
 }
 
@@ -516,10 +678,14 @@ pub struct Book {
     pub tags: Vec<organisation::Tag>,
     /// Optional publisher.
     pub publisher: Option<String>,
+    /// Optional calendar publication date.
+    pub publication_date: Option<PublicationDate>,
     /// Optional publication language.
     pub language: Option<String>,
     /// Optional description or synopsis.
     pub description: Option<String>,
+    /// Personal zero-to-five-star rating in exact half-star steps.
+    pub rating: BookRating,
     /// File representations attached to this logical book.
     pub assets: Vec<BookAsset>,
 }
@@ -535,6 +701,8 @@ pub struct BookMetadataDraft {
     pub series: Option<String>,
     /// Optional publisher.
     pub publisher: Option<String>,
+    /// Optional calendar publication date supplied by the source publication.
+    pub publication_date: Option<PublicationDate>,
     /// Optional publication language.
     pub language: Option<String>,
     /// Optional description or synopsis.
@@ -558,6 +726,8 @@ pub struct BookDraft {
     pub series: Option<String>,
     /// Optional publisher.
     pub publisher: Option<String>,
+    /// Optional calendar publication date supplied by the source publication.
+    pub publication_date: Option<PublicationDate>,
     /// Optional publication language.
     pub language: Option<String>,
     /// Optional description or synopsis.
@@ -891,7 +1061,10 @@ pub trait LibraryService {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssetHealth, AssetId, AssetStorage, BookFormat, BookId, BuildInfo};
+    use super::{
+        AssetHealth, AssetId, AssetStorage, BookFormat, BookId, BookRating, BuildInfo,
+        PublicationDate,
+    };
 
     #[test]
     fn current_build_info_is_populated() {
@@ -945,5 +1118,49 @@ mod tests {
         assert!(!AssetHealth::Available.has_issue());
         assert!(AssetHealth::Missing.has_issue());
         assert!(AssetHealth::Unreadable.has_issue());
+    }
+
+    #[test]
+    fn publication_dates_are_exact_partial_or_complete_calendar_dates() {
+        for (input, year, month, day) in [
+            ("1969", 1969, None, None),
+            ("2000-02", 2000, Some(2), None),
+            ("2024-02-29", 2024, Some(2), Some(29)),
+        ] {
+            let date = input.parse::<PublicationDate>().expect("valid date");
+            assert_eq!(date.year(), year);
+            assert_eq!(date.month(), month);
+            assert_eq!(date.day(), day);
+            assert_eq!(date.to_string(), input);
+        }
+
+        for invalid in [
+            "",
+            "0000",
+            "24",
+            "2024-00",
+            "2024-13",
+            "2023-02-29",
+            "2024-04-31",
+            "2024-1-01",
+            "2024/01/01",
+            "2024-01-01T00:00:00Z",
+        ] {
+            assert!(
+                invalid.parse::<PublicationDate>().is_err(),
+                "{invalid:?} should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn ratings_are_exact_and_bounded_to_half_stars() {
+        for (half_stars, display) in [(0, "0"), (1, "0.5"), (7, "3.5"), (10, "5")] {
+            let rating = BookRating::from_half_stars(half_stars).expect("valid rating");
+            assert_eq!(rating.half_stars(), half_stars);
+            assert_eq!(rating.to_string(), display);
+        }
+        assert_eq!(BookRating::default().half_stars(), 0);
+        assert_eq!(BookRating::from_half_stars(11), None);
     }
 }

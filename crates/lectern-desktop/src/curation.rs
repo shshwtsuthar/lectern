@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use lectern_core::{
-    Book,
+    Book, BookRating, PublicationDate,
     organisation::{
         BookEdit, ContributorCreditEdit, ContributorId, ContributorReference, ContributorRole,
         NameKind, SeriesId, SeriesIndex, SeriesMembershipEdit, SeriesReference, TagColor, TagId,
@@ -220,13 +220,19 @@ impl BookCurationDraft {
         self.tags.len() != previous
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "canonical metadata validation keeps every edited scalar explicit"
+    )]
     pub(crate) fn to_book_edit(
         &self,
         book: &Book,
         title: &str,
         publisher: &str,
+        publication_date: &str,
         language: &str,
         description: &str,
+        rating: BookRating,
     ) -> Result<BookEdit, String> {
         let title = title.trim();
         if title.is_empty() {
@@ -277,6 +283,10 @@ impl BookCurationDraft {
         }
 
         let series = self.series_edit()?;
+        let publication_date = (!publication_date.trim().is_empty())
+            .then(|| publication_date.trim().parse::<PublicationDate>())
+            .transpose()
+            .map_err(|error| format!("Invalid publication date: {error}."))?;
         let mut tag_keys = HashSet::with_capacity(self.tags.len());
         let mut tags = Vec::with_capacity(self.tags.len());
         for tag in &self.tags {
@@ -297,8 +307,10 @@ impl BookCurationDraft {
             id: book.id,
             title: title.to_owned(),
             publisher: optional_text(publisher),
+            publication_date,
             language: optional_text(language),
             description: optional_text(description),
+            rating,
             contributors,
             series,
             tags,
@@ -351,7 +363,7 @@ fn display_error(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use lectern_core::{
-        AssetHealth, AssetId, AssetStorage, BookAsset, BookFormat, BookId,
+        AssetHealth, AssetId, AssetStorage, BookAsset, BookFormat, BookId, BookRating,
         organisation::{
             Contributor, ContributorCredit, ContributorId, ContributorRole, Series, SeriesId,
             SeriesIndex, SeriesMembership, Tag, TagColor, TagId,
@@ -388,8 +400,10 @@ mod tests {
                 color: TagColor::Slate,
             }],
             publisher: Some("Parnassus".into()),
+            publication_date: Some("1968-09".parse().unwrap()),
             language: Some("en".into()),
             description: None,
+            rating: BookRating::from_half_stars(9).unwrap(),
             assets: vec![BookAsset {
                 id: AssetId::new(5),
                 format: BookFormat::Epub,
@@ -406,13 +420,23 @@ mod tests {
         let draft = BookCurationDraft::from_book(&book);
 
         let edit = draft
-            .to_book_edit(&book, &book.title, " Parnassus ", "en", "")
+            .to_book_edit(
+                &book,
+                &book.title,
+                " Parnassus ",
+                "1968-09",
+                "en",
+                "",
+                book.rating,
+            )
             .unwrap();
 
         assert_eq!(edit.contributors[0].position, 0);
         assert_eq!(edit.series.unwrap().index.unwrap().to_string(), "1.5");
         assert_eq!(edit.tags.len(), 1);
         assert_eq!(edit.description, None);
+        assert_eq!(edit.publication_date.unwrap().to_string(), "1968-09");
+        assert_eq!(edit.rating.half_stars(), 9);
     }
 
     #[test]
@@ -437,7 +461,9 @@ mod tests {
         row.name = "Second Author".into();
         row.confirm_new().unwrap();
 
-        let edit = draft.to_book_edit(&book, &book.title, "", "", "").unwrap();
+        let edit = draft
+            .to_book_edit(&book, &book.title, "", "", "", "", BookRating::default())
+            .unwrap();
 
         assert_eq!(edit.contributors[0].position, 0);
         assert_eq!(edit.contributors[1].position, 0);
@@ -457,7 +483,7 @@ mod tests {
             .name = "Octavia Butler".into();
         assert!(
             draft
-                .to_book_edit(&book, &book.title, "", "", "")
+                .to_book_edit(&book, &book.title, "", "", "", "", BookRating::default(),)
                 .unwrap_err()
                 .contains("Select an existing contributor")
         );
@@ -466,7 +492,7 @@ mod tests {
         draft.series.index = "1.2.3".into();
         assert!(
             draft
-                .to_book_edit(&book, &book.title, "", "", "")
+                .to_book_edit(&book, &book.title, "", "", "", "", BookRating::default(),)
                 .unwrap_err()
                 .contains("unsigned decimal")
         );
