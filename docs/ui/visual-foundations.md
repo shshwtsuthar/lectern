@@ -31,6 +31,20 @@ Brand color does not override semantics or accessibility. Do not use brand color
 communicate status, and verify the contrast of the actual foreground/background pair for its text
 size and interaction state.
 
+## Subtle surface separators
+
+Use a thin, low-contrast border when adjacent application regions need a persistent boundary but
+do not need the visual weight of a new surface. Typical uses include the boundary between a header
+or toolbar and scrolling content, the top edge of a status bar, and divisions between flush panels.
+
+These boundaries must use the shared `border.thin` width and `border.muted` color from the Lectern
+theme. Define both values for every color mode in the theme layer; do not use component-local pixel
+widths, color literals, shadows, or interactive-control borders as substitutes.
+
+Keep separators restrained. Spacing and surface color should establish hierarchy first, so do not
+outline every container or card by default. Add a separator where a boundary would otherwise
+disappear, and assign the line to only one of the adjacent regions to avoid doubled borders.
+
 ## Consistent padding for edge-aligned controls
 
 Controls aligned to an edge or corner of a container must be positioned with deliberate container
