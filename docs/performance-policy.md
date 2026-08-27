@@ -101,6 +101,20 @@ projection with a bounded 128-card first page. It verifies the compact selection
 exact confirmation copy while gating populated first paint, selection-to-painted-context, and
 confirmation-to-painted-modal p95 plus peak RSS.
 
+GPUI single-book selection, detail loading, metadata-editor layout, and book-asset presentation
+require the native book-detail suite:
+
+```sh
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/ui-book-detail-regression-v1.json
+```
+
+It retains 40 measured fresh-process samples after 5 warmups for the same 50,000-book projection
+and bounded 128-card first page. The representative detail fixture includes ordered contributor
+roles, a series index, multiple tags, ordinary publication metadata, and both EPUB and PDF assets.
+It verifies the complete panel markers while gating populated first paint,
+book-selection-to-painted-sidebar p95, and peak RSS.
+
 The export suite is also mandatory for changes to copy buffers, publication, overwrite behavior,
 export scheduling, or export progress. Import, startup, scrolling, rendering, or memory changes
 must also run the applicable workload from

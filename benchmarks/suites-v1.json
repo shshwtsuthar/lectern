@@ -77,6 +77,10 @@
     {
       "name": "ui-selection-v1",
       "budget": "benchmarks/ui-selection-regression-v1.json"
+    },
+    {
+      "name": "ui-book-detail-v1",
+      "budget": "benchmarks/ui-book-detail-regression-v1.json"
     }
   ]
 }

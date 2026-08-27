@@ -19,8 +19,13 @@ use gpui_base::{
 };
 use gpui_platform::application;
 use lectern_core::{
-    BookId, BookSummary, ImportSummary, LibraryQuery, LibraryService,
-    organisation::{BookSelection, BulkRemovalResult, LibraryGeneration, SelectionSnapshot},
+    AssetHealth, AssetStorage, Book, BookAsset, BookFormat, BookId, BookSummary, ImportSummary,
+    LibraryQuery, LibraryService,
+    organisation::{
+        BookSelection, BulkRemovalResult, Contributor, ContributorCredit, ContributorId,
+        ContributorRole, LibraryGeneration, SelectionSnapshot, Series, SeriesId, SeriesIndex,
+        SeriesMembership, Tag, TagId,
+    },
 };
 use lectern_service::{LibraryServiceError, SqliteLibraryService, default_database_path};
 use lectern_ui::{Button, ButtonVariant, LecternAssets, PrimerTheme, TablerIcon, install_theme};
@@ -38,6 +43,7 @@ const TOP_BAR_HEIGHT_PX: f32 = 48.0;
 const SELECTION_BAR_HEIGHT_PX: f32 = 48.0;
 const BOTTOM_BAR_HEIGHT_PX: f32 = 24.0;
 const BULK_REMOVAL_DIALOG_WIDTH_PX: f32 = 460.0;
+const BOOK_DETAIL_PANEL_WIDTH_PX: f32 = 384.0;
 const LIBRARY_PAGE_SIZE: u32 = 128;
 
 gpui::actions!(
@@ -61,6 +67,7 @@ pub fn run(main_entry: Instant) {
         output: PathBuf::from(path),
         workload: match env::var(BENCHMARK_WORKLOAD_ENV).as_deref() {
             Ok("library-selection") => BenchmarkWorkload::LibrarySelection,
+            Ok("book-detail") => BenchmarkWorkload::BookDetail,
             Ok(workload) => panic!("unsupported GPUI benchmark workload {workload:?}"),
             Err(env::VarError::NotPresent) => BenchmarkWorkload::EmptyLibraryAddBooks,
             Err(error) => panic!("read GPUI benchmark workload: {error}"),
@@ -69,6 +76,7 @@ pub fn run(main_entry: Instant) {
         initial_render: None,
         action_started: None,
         selection_painted: None,
+        detail_painted: None,
         confirmation_started: None,
     });
 
@@ -108,6 +116,7 @@ struct LecternView {
     selection: GridSelection,
     selection_generation: u64,
     selection_pending: Option<PendingSelection>,
+    detail_book: Option<Book>,
     removal_confirmation: Option<BulkRemovalConfirmation>,
     removing: bool,
     busy: bool,
@@ -123,18 +132,17 @@ impl LecternView {
         } else {
             LibraryState::Loading
         };
-        let library_selection_benchmark = benchmark
-            .as_ref()
-            .is_some_and(|benchmark| benchmark.workload == BenchmarkWorkload::LibrarySelection);
+        let populated_benchmark = benchmark.as_ref().is_some_and(|benchmark| {
+            matches!(
+                benchmark.workload,
+                BenchmarkWorkload::LibrarySelection | BenchmarkWorkload::BookDetail
+            )
+        });
         Self {
             database_path: default_database_path(),
             library_state,
-            library_total: if library_selection_benchmark {
-                50_000
-            } else {
-                0
-            },
-            books: if library_selection_benchmark {
+            library_total: if populated_benchmark { 50_000 } else { 0 },
+            books: if populated_benchmark {
                 benchmark_library_books()
             } else {
                 Vec::new()
@@ -143,6 +151,7 @@ impl LecternView {
             selection: GridSelection::default(),
             selection_generation: 0,
             selection_pending: None,
+            detail_book: None,
             removal_confirmation: None,
             removing: false,
             busy: false,
@@ -160,6 +169,7 @@ impl LecternView {
                 BenchmarkWorkload::LibrarySelection => {
                     self.start_benchmark_selection(window, cx);
                 }
+                BenchmarkWorkload::BookDetail => self.start_benchmark_book_detail(window, cx),
             }
             return;
         }
@@ -205,6 +215,47 @@ impl LecternView {
         benchmark.confirmation_started = Some(Instant::now());
         cx.notify();
         cx.on_next_frame(window, Self::benchmark_confirmation_presented);
+    }
+
+    fn start_benchmark_book_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let benchmark = self
+            .benchmark
+            .as_mut()
+            .expect("book-detail benchmark state is present");
+        benchmark.action_started = Some(Instant::now());
+        self.detail_book = Some(benchmark_book_detail());
+        cx.notify();
+        cx.on_next_frame(window, Self::benchmark_book_detail_presented);
+    }
+
+    fn benchmark_book_detail_presented(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let book = self
+            .detail_book
+            .as_ref()
+            .expect("book-detail benchmark has a presented book");
+        let title = book.title.clone();
+        let contributor_count = book.contributors.len();
+        let tag_count = book.tags.len();
+        let asset_count = book.assets.len();
+        let mut benchmark = self
+            .benchmark
+            .take()
+            .expect("book-detail benchmark state is present");
+        benchmark.detail_painted = Some(
+            benchmark
+                .action_started
+                .expect("book-detail action was started")
+                .elapsed(),
+        );
+        benchmark.finish_book_detail(
+            self.library_total,
+            self.books.len(),
+            title,
+            contributor_count,
+            tag_count,
+            asset_count,
+        );
+        cx.quit();
     }
 
     fn benchmark_confirmation_presented(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -897,45 +948,55 @@ impl LecternView {
             )
             .child(
                 div()
-                    .id("library-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .bg(theme.surface.muted_background)
-                    .p(theme.spacing.extra_large)
                     .flex()
-                    .flex_col()
-                    .gap(theme.spacing.large)
-                    .when_some(self.status.clone(), |content, status| {
-                        content.child(
-                            div()
-                                .text_color(theme.surface.muted_foreground)
-                                .text_size(theme.typography.body_size)
-                                .child(status),
-                        )
-                    })
                     .child(
                         div()
+                            .id("library-scroll")
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_y_scroll()
+                            .bg(theme.surface.muted_background)
+                            .p(theme.spacing.extra_large)
                             .flex()
-                            .flex_wrap()
-                            .items_start()
-                            .gap(theme.spacing.extra_large)
-                            .children(cards),
-                    )
-                    .when(
-                        self.library_total > u64::try_from(self.books.len()).unwrap_or(u64::MAX),
-                        |content| {
-                            content.child(
+                            .flex_col()
+                            .gap(theme.spacing.large)
+                            .when_some(self.status.clone(), |content, status| {
+                                content.child(
+                                    div()
+                                        .text_color(theme.surface.muted_foreground)
+                                        .text_size(theme.typography.body_size)
+                                        .child(status),
+                                )
+                            })
+                            .child(
                                 div()
-                                    .text_color(theme.surface.muted_foreground)
-                                    .text_size(theme.typography.body_size)
-                                    .child(format!(
-                                        "Showing the first {} books.",
-                                        self.books.len()
-                                    )),
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_start()
+                                    .gap(theme.spacing.extra_large)
+                                    .children(cards),
                             )
-                        },
-                    ),
+                            .when(
+                                self.library_total
+                                    > u64::try_from(self.books.len()).unwrap_or(u64::MAX),
+                                |content| {
+                                    content.child(
+                                        div()
+                                            .text_color(theme.surface.muted_foreground)
+                                            .text_size(theme.typography.body_size)
+                                            .child(format!(
+                                                "Showing the first {} books.",
+                                                self.books.len()
+                                            )),
+                                    )
+                                },
+                            ),
+                    )
+                    .when_some(self.detail_book.as_ref(), |body, book| {
+                        body.child(book_detail_panel(book, theme))
+                    }),
             )
             .child(
                 div()
@@ -1239,6 +1300,206 @@ fn import_status(summary: &ImportSummary) -> Option<SharedString> {
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one declarative detail skeleton keeps benchmark coverage visibly representative"
+)]
+fn book_detail_panel(book: &Book, theme: &PrimerTheme) -> gpui::AnyElement {
+    let contributor_rows = book.contributors.iter().map(|credit| {
+        detail_summary_row(
+            credit.role.to_string(),
+            credit.contributor.display_name.clone(),
+            theme,
+        )
+    });
+    let tag_rows = book.tags.iter().map(|tag| {
+        div()
+            .px(theme.spacing.small)
+            .py(theme.spacing.small)
+            .rounded(theme.button.radius)
+            .border(theme.border.thin)
+            .border_color(theme.border.muted)
+            .child(tag.name.clone())
+    });
+    let asset_rows = book.assets.iter().map(|asset| {
+        div()
+            .py(theme.spacing.small)
+            .border_b(theme.border.thin)
+            .border_color(theme.border.muted)
+            .flex()
+            .flex_col()
+            .gap(theme.spacing.small)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(format!(
+                        "{} · {} · {}",
+                        asset.format, asset.storage, asset.health
+                    ))
+                    .child(Button::new(
+                        format!("detail-open-asset-{}", asset.id.value()),
+                        "Open",
+                    )),
+            )
+            .child(
+                div()
+                    .truncate()
+                    .text_color(theme.surface.muted_foreground)
+                    .child(asset.path.to_string_lossy().into_owned()),
+            )
+    });
+
+    div()
+        .id("book-detail-panel")
+        .w(px(BOOK_DETAIL_PANEL_WIDTH_PX))
+        .flex_none()
+        .min_h_0()
+        .border_l(theme.border.thin)
+        .border_color(theme.border.muted)
+        .bg(theme.surface.background)
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .flex_none()
+                .p(theme.spacing.extra_large)
+                .border_b(theme.border.thin)
+                .border_color(theme.border.muted)
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(theme.typography.title_size)
+                        .font_weight(theme.typography.title_weight)
+                        .child("Book details"),
+                )
+                .child(Button::new("close-book-detail", "Close")),
+        )
+        .child(
+            div()
+                .id("book-detail-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .p(theme.spacing.extra_large)
+                .flex()
+                .flex_col()
+                .gap(theme.spacing.extra_large)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(theme.spacing.small)
+                        .child(
+                            Button::new("save-book-detail", "Save").variant(ButtonVariant::Primary),
+                        )
+                        .child(Button::new("reset-book-detail", "Reset")),
+                )
+                .child(detail_section("Title", book.title.clone(), theme))
+                .child(
+                    detail_section_container("Contributors", theme)
+                        .children(contributor_rows)
+                        .child(Button::new("add-book-contributor", "Add contributor")),
+                )
+                .child(detail_section(
+                    "Series",
+                    book.series_membership.as_ref().map_or_else(
+                        || "Not in a series".to_owned(),
+                        |membership| {
+                            membership.index.map_or_else(
+                                || membership.series.name.clone(),
+                                |index| format!("{} · Book {index}", membership.series.name),
+                            )
+                        },
+                    ),
+                    theme,
+                ))
+                .child(
+                    detail_section_container("Tags", theme).child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(theme.spacing.small)
+                            .children(tag_rows),
+                    ),
+                )
+                .child(detail_section(
+                    "Publisher",
+                    book.publisher
+                        .clone()
+                        .unwrap_or_else(|| "Not set".to_owned()),
+                    theme,
+                ))
+                .child(detail_section(
+                    "Language",
+                    book.language
+                        .clone()
+                        .unwrap_or_else(|| "Not set".to_owned()),
+                    theme,
+                ))
+                .child(detail_section(
+                    "Description",
+                    book.description
+                        .clone()
+                        .unwrap_or_else(|| "Not set".to_owned()),
+                    theme,
+                ))
+                .child(
+                    detail_section_container("Files", theme)
+                        .children(asset_rows)
+                        .child(Button::new("add-book-asset", "Add EPUB or PDF")),
+                )
+                .child(
+                    detail_section_container("Library", theme)
+                        .child(div().text_color(theme.surface.muted_foreground).child(
+                            "Remove this entry and its cached cover. Book files stay on disk.",
+                        ))
+                        .child(
+                            Button::new("remove-detail-book", "Remove from library")
+                                .variant(ButtonVariant::Danger),
+                        ),
+                ),
+        )
+        .into_any_element()
+}
+
+fn detail_section(
+    label: &'static str,
+    value: impl Into<SharedString>,
+    theme: &PrimerTheme,
+) -> gpui::Div {
+    detail_section_container(label, theme).child(value.into())
+}
+
+fn detail_section_container(label: &'static str, theme: &PrimerTheme) -> gpui::Div {
+    div().flex().flex_col().gap(theme.spacing.small).child(
+        div()
+            .font_weight(theme.typography.button_weight)
+            .child(label),
+    )
+}
+
+fn detail_summary_row(
+    label: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    theme: &PrimerTheme,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(theme.spacing.medium)
+        .child(
+            div()
+                .text_color(theme.surface.muted_foreground)
+                .child(label.into()),
+        )
+        .child(div().truncate().child(value.into()))
+}
+
 fn book_card(
     book: &LibraryBook,
     index: usize,
@@ -1404,6 +1665,82 @@ fn benchmark_library_books() -> Vec<LibraryBook> {
         .collect()
 }
 
+fn benchmark_book_detail() -> Book {
+    Book {
+        id: BookId::new(1),
+        title: "Benchmark book 001".to_owned(),
+        authors: "Ada Author".to_owned(),
+        series: Some("The Measured Shelf".to_owned()),
+        contributors: vec![
+            ContributorCredit {
+                contributor: Contributor {
+                    id: ContributorId::new(1),
+                    display_name: "Ada Author".to_owned(),
+                    sort_name: "Author, Ada".to_owned(),
+                },
+                role: ContributorRole::Author,
+                position: 0,
+            },
+            ContributorCredit {
+                contributor: Contributor {
+                    id: ContributorId::new(2),
+                    display_name: "Terry Translator".to_owned(),
+                    sort_name: "Translator, Terry".to_owned(),
+                },
+                role: ContributorRole::Translator,
+                position: 0,
+            },
+            ContributorCredit {
+                contributor: Contributor {
+                    id: ContributorId::new(3),
+                    display_name: "Iris Illustrator".to_owned(),
+                    sort_name: "Illustrator, Iris".to_owned(),
+                },
+                role: ContributorRole::Illustrator,
+                position: 0,
+            },
+        ],
+        series_membership: Some(SeriesMembership {
+            series: Series {
+                id: SeriesId::new(1),
+                name: "The Measured Shelf".to_owned(),
+            },
+            index: Some(SeriesIndex::from_scaled(1_500_000).expect("valid benchmark index")),
+        }),
+        tags: vec![
+            Tag {
+                id: TagId::new(1),
+                name: "Performance".to_owned(),
+            },
+            Tag {
+                id: TagId::new(2),
+                name: "Reference".to_owned(),
+            },
+        ],
+        publisher: Some("Lectern Press".to_owned()),
+        language: Some("English".to_owned()),
+        description: Some(
+            "A deterministic book used to verify complete detail-panel presentation.".to_owned(),
+        ),
+        assets: vec![
+            BookAsset {
+                id: lectern_core::AssetId::new(1),
+                format: BookFormat::Epub,
+                storage: AssetStorage::Reference,
+                health: AssetHealth::Available,
+                path: PathBuf::from("/benchmark/Benchmark book 001.epub"),
+            },
+            BookAsset {
+                id: lectern_core::AssetId::new(2),
+                format: BookFormat::Pdf,
+                storage: AssetStorage::Reference,
+                health: AssetHealth::Available,
+                path: PathBuf::from("/benchmark/Benchmark book 001.pdf"),
+            },
+        ],
+    }
+}
+
 #[cfg(test)]
 mod selection_tests {
     use super::*;
@@ -1467,6 +1804,7 @@ mod selection_tests {
 enum BenchmarkWorkload {
     EmptyLibraryAddBooks,
     LibrarySelection,
+    BookDetail,
 }
 
 struct BenchmarkRun {
@@ -1476,6 +1814,7 @@ struct BenchmarkRun {
     initial_render: Option<Duration>,
     action_started: Option<Instant>,
     selection_painted: Option<Duration>,
+    detail_painted: Option<Duration>,
     confirmation_started: Option<Instant>,
 }
 
@@ -1567,6 +1906,54 @@ impl BenchmarkRun {
             )
         });
     }
+
+    fn finish_book_detail(
+        self,
+        library_total: u64,
+        rendered_books: usize,
+        title: String,
+        contributor_count: usize,
+        tag_count: usize,
+        asset_count: usize,
+    ) {
+        assert_eq!(
+            self.workload,
+            BenchmarkWorkload::BookDetail,
+            "book-detail completion belongs to the book-detail benchmark"
+        );
+        let sample = UiBookDetailBenchmarkSample {
+            schema_version: 1,
+            workload: "book-detail",
+            initial_render_ms: millis(self.initial_render.expect("initial frame was measured")),
+            detail_to_paint_ms: millis(
+                self.detail_painted
+                    .expect("book-detail state was presented"),
+            ),
+            peak_rss_bytes: peak_rss_bytes(),
+            correctness: UiBookDetailBenchmarkCorrectness {
+                library_total,
+                rendered_books,
+                title,
+                contributor_count,
+                tag_count,
+                asset_count,
+                markers: vec![
+                    "bounded_first_page",
+                    "book_detail_panel_presented",
+                    "complete_metadata_fixture",
+                    "multiple_assets_presented",
+                ],
+            },
+        };
+        let json = serde_json::to_vec_pretty(&sample)
+            .expect("serialize GPUI book-detail benchmark sample");
+        fs::write(&self.output, json).unwrap_or_else(|error| {
+            panic!(
+                "write GPUI book-detail benchmark sample {}: {error}",
+                self.output.display()
+            )
+        });
+    }
 }
 
 fn millis(duration: Duration) -> f64 {
@@ -1627,5 +2014,26 @@ struct UiSelectionBenchmarkCorrectness {
     library_total: u64,
     rendered_books: usize,
     selected_books: u64,
+    markers: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct UiBookDetailBenchmarkSample {
+    schema_version: u32,
+    workload: &'static str,
+    initial_render_ms: f64,
+    detail_to_paint_ms: f64,
+    peak_rss_bytes: Option<u64>,
+    correctness: UiBookDetailBenchmarkCorrectness,
+}
+
+#[derive(Serialize)]
+struct UiBookDetailBenchmarkCorrectness {
+    library_total: u64,
+    rendered_books: usize,
+    title: String,
+    contributor_count: usize,
+    tag_count: usize,
+    asset_count: usize,
     markers: Vec<&'static str>,
 }

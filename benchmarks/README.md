@@ -102,6 +102,13 @@ and measures the initial populated-library paint, selection dispatch through the
 bar, and destructive-confirmation dispatch through its painted modal. The exact removal transaction
 and refreshed first page remain covered by `bulk-remove-regression-v1`.
 
+The GPUI book-detail workload in
+[`ui-book-detail-regression-v1.json`](ui-book-detail-regression-v1.json) paints the same bounded
+50,000-book projection, opens a representative single-book details panel, and verifies complete
+contributor, series, tag, publication, description, and multi-asset presentation markers. It gates
+the populated first paint and book-selection-to-painted-sidebar p95 plus peak RSS while retaining
+every fresh-process sample.
+
 Performance-sensitive pull requests additionally run the base and candidate revisions three times
 each on the same runner. The gate compares the median of their run-level p95 values and fails a
 scenario when it exceeds both the versioned percentage limit and minimum material latency delta.
@@ -149,6 +156,8 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/ui-bootstrap-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/ui-selection-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/ui-book-detail-regression-v1.json
 ```
 
 Use `--output-dir PATH` to choose a new artifact directory, or `--budget PATH` to evaluate a
