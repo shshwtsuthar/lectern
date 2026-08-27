@@ -8,7 +8,7 @@ mod icon;
 mod theme;
 
 pub use assets::LecternAssets;
-pub use components::{Button, ButtonSize, ButtonVariant};
+pub use components::{Button, ButtonSize, ButtonVariant, TextArea, TextInput};
 pub use icon::TablerIcon;
 pub use theme::{ColorMode, PrimerTheme, install_theme};
 

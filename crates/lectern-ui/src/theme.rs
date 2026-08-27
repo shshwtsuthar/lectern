@@ -110,6 +110,33 @@ pub struct ButtonTheme {
     pub border_width: Rems,
 }
 
+/// Text-entry colors and geometry shared by single- and multi-line fields.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InputTheme {
+    /// Rest background.
+    pub background: Hsla,
+    /// Disabled background.
+    pub disabled_background: Hsla,
+    /// Rest border.
+    pub border: Hsla,
+    /// Disabled border.
+    pub disabled_border: Hsla,
+    /// Entered text.
+    pub foreground: Hsla,
+    /// Placeholder text.
+    pub placeholder: Hsla,
+    /// Disabled text.
+    pub disabled_foreground: Hsla,
+    /// Corner radius.
+    pub radius: Rems,
+    /// Border width.
+    pub border_width: Rems,
+    /// Standard single-line field height.
+    pub height: Rems,
+    /// Inline field padding.
+    pub padding_inline: Rems,
+}
+
 /// Focus-visible ring presentation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FocusTheme {
@@ -167,6 +194,8 @@ pub struct PrimerTheme {
     pub dialog: DialogTheme,
     /// Button colors and geometry.
     pub button: ButtonTheme,
+    /// Text-entry colors and geometry.
+    pub input: InputTheme,
     /// Focus-visible ring.
     pub focus: FocusTheme,
     /// Typography.
@@ -304,6 +333,19 @@ impl PrimerTheme {
                 },
                 radius: rems(common::BORDER_RADIUS_MEDIUM),
                 border_width: rems(common::BORDER_WIDTH_THIN),
+            },
+            input: InputTheme {
+                background: color(choose!(CONTROL_BG_REST)),
+                disabled_background: color(choose!(CONTROL_BG_DISABLED)),
+                border: color(choose!(CONTROL_BORDER_REST)),
+                disabled_border: color(choose!(CONTROL_BORDER_DISABLED)),
+                foreground: color(choose!(CONTROL_FG_REST)),
+                placeholder: color(choose!(CONTROL_FG_PLACEHOLDER)),
+                disabled_foreground: color(choose!(CONTROL_FG_DISABLED)),
+                radius: rems(common::BORDER_RADIUS_MEDIUM),
+                border_width: rems(common::BORDER_WIDTH_THIN),
+                height: rems(common::CONTROL_MEDIUM_SIZE),
+                padding_inline: rems(common::CONTROL_MEDIUM_PADDING_INLINE),
             },
             focus: FocusTheme {
                 color: color(choose!(FOCUS_OUTLINE_COLOR)),

@@ -43,6 +43,55 @@ kind = "color"
 scope = "theme"
 
 [[tokens]]
+name = "control-bgColor-rest"
+rust_name = "CONTROL_BG_REST"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "control-bgColor-disabled"
+rust_name = "CONTROL_BG_DISABLED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "control-borderColor-rest"
+rust_name = "CONTROL_BORDER_REST"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "control-borderColor-disabled"
+rust_name = "CONTROL_BORDER_DISABLED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "control-fgColor-rest"
+rust_name = "CONTROL_FG_REST"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "control-fgColor-disabled"
+rust_name = "CONTROL_FG_DISABLED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "control-fgColor-placeholder"
+rust_name = "CONTROL_FG_PLACEHOLDER"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
 name = "button-default-bgColor-rest"
 rust_name = "BUTTON_DEFAULT_BG_REST"
 source = "functional/themes"
