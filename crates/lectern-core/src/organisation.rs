@@ -333,6 +333,78 @@ pub struct Tag {
     pub id: TagId,
     /// Display-ready tag name.
     pub name: String,
+    /// User-selected presentation color.
+    pub color: TagColor,
+}
+
+/// Restrained, named colors available to library tags.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum TagColor {
+    /// Neutral slate, including tags created before colors were introduced.
+    #[default]
+    Slate,
+    /// Warm coral red.
+    Coral,
+    /// Warm amber orange.
+    Amber,
+    /// Fresh mint green.
+    Mint,
+    /// Clear azure blue.
+    Azure,
+    /// Soft lilac purple.
+    Lilac,
+}
+
+impl TagColor {
+    /// Every selectable tag color in presentation order.
+    pub const ALL: [Self; 6] = [
+        Self::Coral,
+        Self::Amber,
+        Self::Mint,
+        Self::Azure,
+        Self::Lilac,
+        Self::Slate,
+    ];
+
+    /// Returns the stable lowercase storage value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Slate => "slate",
+            Self::Coral => "coral",
+            Self::Amber => "amber",
+            Self::Mint => "mint",
+            Self::Azure => "azure",
+            Self::Lilac => "lilac",
+        }
+    }
+
+    /// Parses a stable lowercase storage value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "slate" => Some(Self::Slate),
+            "coral" => Some(Self::Coral),
+            "amber" => Some(Self::Amber),
+            "mint" => Some(Self::Mint),
+            "azure" => Some(Self::Azure),
+            "lilac" => Some(Self::Lilac),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for TagColor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Slate => "Slate",
+            Self::Coral => "Coral",
+            Self::Amber => "Amber",
+            Self::Mint => "Mint",
+            Self::Azure => "Azure",
+            Self::Lilac => "Lilac",
+        })
+    }
 }
 
 /// Existing or not-yet-persisted contributor selected in a book edit.
@@ -385,6 +457,13 @@ pub enum TagReference {
     Existing(TagId),
     /// Create or reuse the tag identified by this name.
     New(String),
+    /// Create or reuse the tag identified by this name and color.
+    NewColored {
+        /// Display-ready tag name.
+        name: String,
+        /// Presentation color used when a new identity is created.
+        color: TagColor,
+    },
 }
 
 /// Complete metadata-editor payload for one logical book.

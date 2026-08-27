@@ -27,7 +27,7 @@ aggregation.
 | --- | --- | --- |
 | Contributors | Stable people, ordered credits, roles, sort names, rename, and merge | No aliases, authority IDs, or fuzzy matching |
 | Series | One normalized series per book, optional numeric index, browse/filter, rename, merge, and series sort | One series membership per book |
-| Tags | Flat normalized tags, single-book editing, rename, merge, delete, include/exclude filtering | No hierarchy, colors, or automatic rules |
+| Tags | Flat normalized tags, durable named colors, single-book editing, rename, merge, delete, include/exclude filtering | No hierarchy or automatic rules |
 | Selection | Toggle, ordered range, clear, and all-current-results selection | No persistent selection across query or library changes |
 | Bulk actions | Add and remove several tags atomically; remove books from the library with confirmation and an exact affected count | No bulk contributor, series, title, file-asset, or export operations |
 | Search | Safe fielded prefix/phrase search plus exact facet chips | Conjunctive grammar only; no raw FTS, OR, regex, or parentheses |
@@ -50,8 +50,14 @@ owned by a logical book and never by `BookAsset`:
 - the supported roles are **Author**, **Editor**, **Translator**, **Illustrator**, and **Other**;
 - the same contributor may have several roles on one book but only one credit per role;
 - a book has zero or one series membership and an optional series index;
+- each non-empty series index is unique within that series;
 - a book/tag pair is unique; and
 - unused entities remain available until deliberately removed or merged.
+
+Each tag owns one durable presentation color from the closed **Slate**, **Coral**, **Amber**,
+**Mint**, **Azure**, and **Lilac** palette. Color is presentation metadata, not part of tag identity:
+an existing normalized name is always reused, and merging tags keeps the explicitly selected target
+tag's color.
 
 Names use the identity-key algorithm in ADR 0003. Creating an entity with an existing key returns
 the existing entity instead of creating a case- or whitespace-only duplicate. A colliding rename is
@@ -71,7 +77,8 @@ Input validation is shared across import, desktop, service, and storage boundari
 
 Control characters are rejected. A series index is a decimal domain value, not an unchecked
 floating-point value; canonical display removes redundant trailing zeroes. Duplicate indices in one
-series are allowed and fall back to title then book ID for deterministic ordering.
+series are rejected. Unnumbered books remain valid and fall back to title then book ID for
+deterministic ordering.
 
 ### Book projections
 
@@ -115,7 +122,8 @@ Vocabulary mutations are library-wide transactions:
 - If both contributors credit the same book in the same role, merge keeps the earlier position and
   compacts that role's positions. Credits in different roles remain distinct.
 - Tag merge deduplicates book/tag pairs. Series merge retains every membership because this slice
-  permits only one series per book.
+  permits only one series per book, but rejects a merge when source and target contain the same
+  non-empty book number.
 - A contributor or series can be deleted only when no book or saved search references it.
 - Deleting a used tag requires confirmation naming both its book count and saved-search count. The
   transaction removes those assignments and facets; the affected saved searches remain, with that
@@ -127,20 +135,33 @@ derived projections, FTS, and saved-search references together.
 ## Single-book curation
 
 Replace the free-form **Authors** field in **Book details** with an ordered contributor editor. Each
-row has an entity autocomplete, role, sort-name access, reorder controls, and remove action. Typing
+row has an entity autocomplete, compact role menu, reorder controls, and remove action. Typing
 a new exact name offers **Create contributor**; selecting an existing name reuses its ID. A user can
 split a conservatively migrated combined author string by removing that credit and adding the
-individual contributors.
+individual contributors. The common editor hides sort name: it preserves an existing custom value
+while the display name is unchanged and derives the sort name from a changed or new display name.
+Explicit sort-name refinement belongs in vocabulary management because it remains important to
+author ordering but is not part of the ordinary correction path.
 
-Replace the free-form **Series** field with an entity autocomplete and adjacent **Book number**
-field. Clearing the series also clears its index after confirmation when the index is non-empty.
-Choosing another series retains the index in the form until save so the user can decide whether it
-still applies. Invalid index input is shown inline and cannot be saved.
+Replace the free-form **Series** field with one removable entity chip and a **+ Series** action.
+Its anchored **Add or find a series** menu returns at most 50 selected-first prefix matches. A book
+can select one existing series or explicitly create one normalized series, and either choice closes
+the menu. Removing the chip clears both membership and number without a redundant **Clear** button.
+The consistently labeled **Book number** field is disabled until a series is selected. Changing an
+existing selection retains the entered number long enough to run a bounded indexed availability
+check. Invalid or duplicate input is shown inline and cannot be saved; storage repeats the check in
+the atomic save transaction and a partial unique index protects concurrent writers.
 
-Add a type-ahead **Tags** chip editor. Entering a new normalized label creates it as part of the
-book-save transaction; removing a chip removes only that book/tag relationship. The picker shows
-exact-name matches before prefix matches and includes global usage counts, but never creates an
-entity from a highlighted value without an explicit selection or Enter action.
+Add a type-ahead **Tags** chip editor behind one **+ Tag** action. Its anchored menu says **Add or
+find a tag**, returns at most 50 selected-first prefix matches, and supports multi-selection without
+closing between choices. Entering a new normalized label first offers an explicit **Create new
+tag** row, then a second explicit color choice. The tag is created only as part of the book-save
+transaction, and choosing that color closes the menu. Removing a chip removes only that book/tag
+relationship.
+
+The ordinary language value uses an ISO 639-1 dropdown with English language names and stores the
+two-letter code. An unrecognized legacy value remains visible until the user chooses a supported
+language or **Not specified**.
 
 Saving book details atomically updates ordinary metadata, credits, series membership, tags,
 derived projections, and FTS while leaving assets unchanged. A failed save keeps every edit in the
@@ -330,9 +351,19 @@ still marked as import-owned by the implementation contract. If ownership proven
 in this tranche, preserve all existing curated relational values on known-path re-import.
 
 Migration validation covers foreign keys, unique identity keys, contiguous contributor positions,
-one-series-per-book, valid decimal indices, projection equivalence, FTS integrity, saved-search
-references, and the existing one-or-more-assets invariant. Any failure rolls back the schema version
-and all migrated data.
+one-series-per-book, valid and series-unique decimal indices, projection equivalence, FTS integrity,
+saved-search references, and the existing one-or-more-assets invariant. Any failure rolls back the
+schema version and all migrated data.
+
+Schema version 7 adds the required tag color column without changing tag IDs or relationships.
+Every version-6 tag migrates to **Slate**; fresh color choices are stored only after an explicit
+user action. This migration performs no publication-file reads and remains covered by the existing
+version-five-to-current representative migration workload.
+
+Schema version 8 adds the partial unique series-number index. A deterministic repair keeps the
+number on the lowest-ID book and clears only the duplicate numbers on later books, retaining their
+series membership and synchronizing the book projection. The version-five-to-current migration
+workload measures index installation; a version-seven duplicate fixture verifies the repair path.
 
 ## Performance evidence
 
@@ -343,7 +374,7 @@ later changes also use the repository's paired 10%/material-delta regression rul
 
 ### Normalized query workload
 
-Add `organisation-query-regression-v1.json` over 50,000 books with deterministic distributions of
+Add `organisation-query-regression-v2.json` over 50,000 books with deterministic distributions of
 20,000 contributors, 2,500 series, 500 tags, eight tags per book, one to four contributor credits
 per book, 70% series membership, existing mixed assets/covers, and 250 saved searches. Retain 10
 warmups and 40 measured samples for:
@@ -354,16 +385,17 @@ warmups and 40 measured samples for:
 - first 128 plus count for included and excluded tags;
 - a combined fielded-search, contributor, tag, format, and sort projection;
 - a deep bounded page without recounting; and
-- contributor, series, and tag autocomplete capped at 50 results.
+- contributor, series, and tag autocomplete capped at 50 results; and
+- an indexed series-number conflict check that distinguishes another book from the edited book.
 
-Every first/deep page and autocomplete scenario has a 50 ms p95 product budget on the pinned runner.
+Every first/deep page, autocomplete, and number-availability scenario has a 50 ms p95 product budget on the pinned runner.
 Correctness checks reconcile exact IDs, result counts, ordering, absence of duplicate book rows, and
 the query plan's intended covering indexes. All existing registered query and lifecycle suites also
 run for schema, FTS, or query-plan changes.
 
 ### Selection and bulk-tag workload
 
-Add `bulk-tags-regression-v1.json` over the same library. It must select all 10,000 books matching a
+Add `bulk-tags-regression-v2.json` over the same library. It must select all 10,000 books matching a
 deterministic query without materializing summaries, add two tags and remove one in one durable
 transaction, refresh the first affected page, then perform and verify the inverse operation. Retain
 raw samples and check matched/added/removed counts, unchanged ordinary metadata and assets, exact
@@ -377,7 +409,7 @@ operation is capped at 32 MiB above the seeded idle phase; the operation must no
 
 ### Migration workload
 
-Add `organisation-migration-regression-v1.json` using independent copies of a version-five
+Use `organisation-migration-regression-v2.json` with independent copies of a version-five
 50,000-book database. It verifies byte-equivalent visible author/series projections, stable book and
 asset identities, FTS equivalence, empty initial tags/searches, and every schema invariant. Retain at
 least 20 optimized samples; migration has a 5 second p95 wall-time budget and a 256 MiB peak-RSS
@@ -441,7 +473,8 @@ The completed tranche must pass these product-level scenarios in addition to foc
 
 ## Explicitly out of scope
 
-- Hierarchical, colored, private, automatically assigned, or AI-generated tags.
+- Hierarchical, private, automatically assigned, or AI-generated tags, and arbitrary colors outside
+  the named palette.
 - Manual shelves/collections, reading lists, reading status, progress, ratings, reviews, and dates
   other than the existing added/modified metadata.
 - Bulk title, contributor, series, publisher, language, description, cover, asset, or export

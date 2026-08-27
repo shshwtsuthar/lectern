@@ -421,5 +421,21 @@ kind = "fontWeight"
 scope = "common"
 
 [[icons]]
+name = "chevron-down"
+rust_name = "ChevronDown"
+
+[[icons]]
+name = "chevron-up"
+rust_name = "ChevronUp"
+
+[[icons]]
+name = "eye"
+rust_name = "Eye"
+
+[[icons]]
+name = "palette"
+rust_name = "Palette"
+
+[[icons]]
 name = "upload"
 rust_name = "Upload"

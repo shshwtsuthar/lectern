@@ -8,7 +8,7 @@ use lectern_core::{
         BookEdit, Contributor, ContributorCredit, ContributorCreditEdit, ContributorId,
         ContributorReference, ContributorRole, ContributorUsage, ImportedContributorCredit,
         ImportedOrganisation, NameKind, SavedSearch, SavedSearchId, Series, SeriesId, SeriesIndex,
-        SeriesMembership, SeriesMembershipEdit, SeriesReference, SeriesUsage, Tag, TagId,
+        SeriesMembership, SeriesMembershipEdit, SeriesReference, SeriesUsage, Tag, TagColor, TagId,
         TagReference, TagUsage, VocabularyMutationResult, identity_key, normalize_name,
     },
 };
@@ -294,6 +294,40 @@ pub(super) fn migrate_v5_to_v6(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Adds the durable presentation color introduced for tags in schema version 7.
+pub(super) fn migrate_v6_to_v7(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "ALTER TABLE tags ADD COLUMN color TEXT NOT NULL DEFAULT 'slate' \
+         CHECK (color IN ('slate', 'coral', 'amber', 'mint', 'azure', 'lilac'));",
+    )?;
+    Ok(())
+}
+
+/// Makes non-empty book numbers unique within a series in schema version 8.
+///
+/// Older libraries could contain duplicate numbers. The lowest stable book ID retains each number;
+/// later duplicates remain in the series but become unnumbered before the unique index is added.
+pub(super) fn migrate_v7_to_v8(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "UPDATE series_memberships AS membership SET series_index = NULL \
+         WHERE membership.series_index IS NOT NULL AND EXISTS( \
+             SELECT 1 FROM series_memberships earlier \
+             WHERE earlier.series_id = membership.series_id \
+               AND earlier.series_index = membership.series_index \
+               AND earlier.book_id < membership.book_id \
+         ); \
+         UPDATE books SET series_index = ( \
+             SELECT membership.series_index FROM series_memberships membership \
+             WHERE membership.book_id = books.id \
+         ) WHERE EXISTS( \
+             SELECT 1 FROM series_memberships membership WHERE membership.book_id = books.id \
+         ); \
+         CREATE UNIQUE INDEX series_memberships_series_number_uidx \
+             ON series_memberships(series_id, series_index) WHERE series_index IS NOT NULL;",
+    )?;
+    Ok(())
+}
+
 fn validate_legacy_name(kind: NameKind, value: &str) -> Result<String> {
     normalize_name(kind, value).map_err(|error| {
         StorageError::Integrity(format!("legacy {kind} cannot be normalized: {error}"))
@@ -456,8 +490,20 @@ pub(super) fn replace_imported_organisation(
                 ))
             },
         )?;
-        let series_index = imported
-            .series_index
+        let series_index = match imported.series_index {
+            Some(index)
+                if series_index_is_available(
+                    transaction,
+                    SeriesId::new(series_id),
+                    index,
+                    BookId::new(book_id),
+                )? =>
+            {
+                Some(index)
+            }
+            _ => None,
+        };
+        let series_index = series_index
             .map(|index| i64::try_from(index.scaled()).expect("valid series index fits in SQLite"));
         transaction.execute(
             "INSERT INTO series_memberships( \
@@ -556,14 +602,16 @@ pub(super) fn load_book_curation(
 
     let tags = {
         let mut statement = connection.prepare_cached(
-            "SELECT t.id, t.name FROM book_tags bt \
+            "SELECT t.id, t.name, t.color FROM book_tags bt \
              JOIN tags t ON t.id = bt.tag_id \
              WHERE bt.book_id = ?1 ORDER BY t.identity_key, t.id",
         )?;
         let rows = statement.query_map([book_id.value()], |row| {
+            let color = row.get::<_, String>(2)?;
             Ok(Tag {
                 id: TagId::new(row.get(0)?),
                 name: row.get(1)?,
+                color: tag_color_from_database(&color, 2)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -612,6 +660,7 @@ pub(super) fn save_book_edit(transaction: &Transaction<'_>, edit: &BookEdit) -> 
         .as_ref()
         .map(|membership| resolve_series(transaction, membership))
         .transpose()?;
+    ensure_resolved_series_index_available(transaction, resolved_series.as_ref(), edit.id)?;
     let mut resolved_tags = edit
         .tags
         .iter()
@@ -764,6 +813,21 @@ fn resolve_series(
     Ok((id, name, key, membership.index))
 }
 
+fn ensure_resolved_series_index_available(
+    transaction: &Transaction<'_>,
+    series: Option<&(SeriesId, String, String, Option<SeriesIndex>)>,
+    book: BookId,
+) -> Result<()> {
+    if let Some((series_id, name, _, Some(index))) = series
+        && !series_index_is_available(transaction, *series_id, *index, book)?
+    {
+        return Err(StorageError::InvalidCuration(format!(
+            "book number {index} is already used in {name}"
+        )));
+    }
+    Ok(())
+}
+
 fn resolve_tag(
     transaction: &Transaction<'_>,
     tag: &TagReference,
@@ -777,20 +841,27 @@ fn resolve_tag(
             )
             .optional()?
             .ok_or_else(|| StorageError::InvalidCuration(format!("tag {id} does not exist"))),
-        TagReference::New(name) => {
-            let name = normalize_user_name(NameKind::Tag, name)?;
-            let key = identity_key(&name);
-            transaction
-                .query_row(
-                    "INSERT INTO tags(name, identity_key) VALUES (?1, ?2) \
+        TagReference::New(name) => resolve_new_tag(transaction, name, TagColor::default()),
+        TagReference::NewColored { name, color } => resolve_new_tag(transaction, name, *color),
+    }
+}
+
+fn resolve_new_tag(
+    transaction: &Transaction<'_>,
+    name: &str,
+    color: TagColor,
+) -> Result<(TagId, String, String)> {
+    let name = normalize_user_name(NameKind::Tag, name)?;
+    let key = identity_key(&name);
+    transaction
+        .query_row(
+            "INSERT INTO tags(name, identity_key, color) VALUES (?1, ?2, ?3) \
                  ON CONFLICT(identity_key) DO UPDATE SET identity_key = excluded.identity_key \
                  RETURNING id, name, identity_key",
-                    params![name, key],
-                    |row| Ok((TagId::new(row.get(0)?), row.get(1)?, row.get(2)?)),
-                )
-                .map_err(Into::into)
-        }
-    }
+            params![name, key, color.as_str()],
+            |row| Ok((TagId::new(row.get(0)?), row.get(1)?, row.get(2)?)),
+        )
+        .map_err(Into::into)
 }
 
 /// Returns selected contributors first, followed by bounded identity-prefix matches.
@@ -916,6 +987,26 @@ pub(super) fn autocomplete_series(
     Ok(results)
 }
 
+/// Reports whether an exact index is unused by every other book in one series.
+pub(super) fn series_index_is_available(
+    connection: &Connection,
+    series: SeriesId,
+    index: SeriesIndex,
+    excluding_book: BookId,
+) -> Result<bool> {
+    let scaled = i64::try_from(index.scaled()).expect("valid series index fits in SQLite");
+    connection
+        .query_row(
+            "SELECT NOT EXISTS( \
+                 SELECT 1 FROM series_memberships \
+                 WHERE series_id = ?1 AND series_index = ?2 AND book_id <> ?3 \
+             )",
+            params![series.value(), scaled, excluding_book.value()],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
 /// Returns selected tags first, followed by bounded identity-prefix matches.
 pub(super) fn autocomplete_tags(
     connection: &Connection,
@@ -929,7 +1020,7 @@ pub(super) fn autocomplete_tags(
     }
     let mut results = Vec::with_capacity(limit);
     let mut seen = HashSet::with_capacity(selected.len());
-    let sql = "SELECT t.name, count(DISTINCT bt.book_id), \
+    let sql = "SELECT t.name, t.color, count(DISTINCT bt.book_id), \
                       count(DISTINCT sti.saved_search_id) + count(DISTINCT ste.saved_search_id) \
                FROM tags t LEFT JOIN book_tags bt ON bt.tag_id = t.id \
                LEFT JOIN saved_search_included_tags sti ON sti.tag_id = t.id \
@@ -940,14 +1031,20 @@ pub(super) fn autocomplete_tags(
         if !seen.insert(id) {
             continue;
         }
-        if let Some((name, books, searches)) = selected_statement
+        if let Some((name, color, books, searches)) = selected_statement
             .query_row([id.value()], |row| {
-                Ok((row.get(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+                let color = row.get::<_, String>(1)?;
+                Ok((
+                    row.get(0)?,
+                    tag_color_from_database(&color, 1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
             })
             .optional()?
         {
             results.push(TagUsage {
-                tag: Tag { id, name },
+                tag: Tag { id, name, color },
                 books: checked_count(books)?,
                 saved_searches: checked_count(searches)?,
             });
@@ -960,7 +1057,7 @@ pub(super) fn autocomplete_tags(
     let (lower, upper) = prefix_bounds(NameKind::Tag, prefix)?;
     let candidate_limit = i64::try_from(limit + seen.len()).unwrap_or(i64::MAX);
     let mut statement = connection.prepare_cached(
-        "SELECT t.id, t.name, count(DISTINCT bt.book_id), \
+        "SELECT t.id, t.name, t.color, count(DISTINCT bt.book_id), \
                 count(DISTINCT sti.saved_search_id) + count(DISTINCT ste.saved_search_id) \
          FROM tags t LEFT JOIN book_tags bt ON bt.tag_id = t.id \
          LEFT JOIN saved_search_included_tags sti ON sti.tag_id = t.id \
@@ -969,18 +1066,20 @@ pub(super) fn autocomplete_tags(
          GROUP BY t.id ORDER BY t.identity_key, t.id LIMIT ?3",
     )?;
     let rows = statement.query_map(params![lower, upper, candidate_limit], |row| {
+        let color = row.get::<_, String>(2)?;
         Ok((
             TagId::new(row.get(0)?),
             row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
+            tag_color_from_database(&color, 2)?,
             row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
         ))
     })?;
     for row in rows {
-        let (id, name, books, searches) = row?;
+        let (id, name, color, books, searches) = row?;
         if seen.insert(id) {
             results.push(TagUsage {
-                tag: Tag { id, name },
+                tag: Tag { id, name, color },
                 books: checked_count(books)?,
                 saved_searches: checked_count(searches)?,
             });
@@ -1070,7 +1169,7 @@ pub(super) fn search_tags(
     let (lower, upper) = prefix_bounds(NameKind::Tag, prefix)?;
     let offset = i64::try_from(offset).unwrap_or(i64::MAX);
     let mut statement = connection.prepare_cached(
-        "SELECT t.id, t.name, \
+        "SELECT t.id, t.name, t.color, \
              (SELECT count(*) FROM book_tags bt WHERE bt.tag_id = t.id), \
              (SELECT count(*) FROM saved_search_included_tags sti WHERE sti.tag_id = t.id) + \
              (SELECT count(*) FROM saved_search_excluded_tags ste WHERE ste.tag_id = t.id) \
@@ -1078,17 +1177,19 @@ pub(super) fn search_tags(
          ORDER BY t.identity_key, t.id LIMIT ?3 OFFSET ?4",
     )?;
     let rows = statement.query_map(params![lower, upper, limit, offset], |row| {
+        let color = row.get::<_, String>(2)?;
         Ok((
             TagId::new(row.get(0)?),
             row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
+            tag_color_from_database(&color, 2)?,
             row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
         ))
     })?;
     rows.map(|row| {
-        let (id, name, books, saved_searches) = row?;
+        let (id, name, color, books, saved_searches) = row?;
         Ok(TagUsage {
-            tag: Tag { id, name },
+            tag: Tag { id, name, color },
             books: checked_count(books)?,
             saved_searches: checked_count(saved_searches)?,
         })
@@ -1321,6 +1422,23 @@ pub(super) fn merge_series(
         )
         .optional()?
         .ok_or_else(|| StorageError::InvalidCuration(format!("series {target} does not exist")))?;
+    let duplicate_number = transaction.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM series_memberships source_membership \
+             JOIN series_memberships target_membership \
+               ON target_membership.series_id = ?1 \
+              AND target_membership.series_index = source_membership.series_index \
+             WHERE source_membership.series_id = ?2 \
+               AND source_membership.series_index IS NOT NULL \
+         )",
+        params![target.value(), source.value()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if duplicate_number {
+        return Err(StorageError::InvalidCuration(
+            "series merge would create duplicate book numbers".into(),
+        ));
+    }
     let affected_books = prepare_affected_books(
         transaction,
         "series_memberships",
@@ -2458,12 +2576,34 @@ fn role_display(role: &str) -> &'static str {
     }
 }
 
+fn tag_color_from_database(value: &str, column: usize) -> rusqlite::Result<TagColor> {
+    TagColor::parse(value).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            format!("invalid tag color {value:?}").into(),
+        )
+    })
+}
+
 /// Verifies normalized relationships, derived projections, and identity keys.
 pub(super) fn validate_organisation_schema(transaction: &Transaction<'_>) -> Result<()> {
     validate_identity_keys(transaction, "contributors", "display_name", "identity_key")?;
     validate_identity_keys(transaction, "series_entities", "name", "identity_key")?;
     validate_identity_keys(transaction, "tags", "name", "identity_key")?;
     validate_identity_keys(transaction, "saved_searches", "name", "identity_key")?;
+
+    let invalid_tag_color = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tags WHERE color NOT IN \
+         ('slate', 'coral', 'amber', 'mint', 'azure', 'lilac'))",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if invalid_tag_color {
+        return Err(StorageError::Integrity(
+            "tags contain an unsupported presentation color".into(),
+        ));
+    }
 
     let invalid_positions = transaction.query_row(
         "SELECT EXISTS( \
@@ -2477,6 +2617,21 @@ pub(super) fn validate_organisation_schema(transaction: &Transaction<'_>) -> Res
     if invalid_positions {
         return Err(StorageError::Integrity(
             "contributor positions are not contiguous within a role".into(),
+        ));
+    }
+
+    let duplicate_series_number = transaction.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM series_memberships \
+             WHERE series_index IS NOT NULL \
+             GROUP BY series_id, series_index HAVING count(*) > 1 \
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if duplicate_series_number {
+        return Err(StorageError::Integrity(
+            "a series contains duplicate book numbers".into(),
         ));
     }
 
@@ -2641,6 +2796,7 @@ mod tests {
     use rusqlite::Connection;
 
     use super::super::{SCHEMA, SCHEMA_VERSION, initialize_schema_transaction};
+    use super::{migrate_v5_to_v6, migrate_v6_to_v7};
 
     fn version_five_library() -> Connection {
         let connection = Connection::open_in_memory().expect("open version-five fixture");
@@ -2676,6 +2832,65 @@ mod tests {
             .pragma_update(None, "user_version", 5)
             .expect("mark v5 schema");
         connection
+    }
+
+    #[test]
+    fn version_eight_migration_repairs_duplicate_series_numbers_deterministically() {
+        let mut connection = version_five_library();
+        {
+            let transaction = connection.transaction().expect("begin v5 migration");
+            migrate_v5_to_v6(&transaction).expect("migrate organisation schema");
+            migrate_v6_to_v7(&transaction).expect("add tag colors");
+            transaction
+                .execute(
+                    "UPDATE series_memberships SET series_index = 1000000 \
+                     WHERE book_id IN (7, 8)",
+                    [],
+                )
+                .expect("seed duplicate series numbers");
+            transaction
+                .execute(
+                    "UPDATE books SET series_index = 1000000 WHERE id IN (7, 8)",
+                    [],
+                )
+                .expect("seed duplicate projections");
+            transaction
+                .pragma_update(None, "user_version", 7)
+                .expect("mark version seven");
+            transaction.commit().expect("commit version-seven fixture");
+        }
+
+        initialize_schema_transaction(&mut connection).expect("migrate version-seven library");
+
+        let numbers = connection
+            .prepare("SELECT book_id, series_index FROM series_memberships ORDER BY book_id")
+            .expect("prepare memberships")
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            })
+            .expect("query memberships")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("read memberships");
+        assert_eq!(numbers, vec![(7, Some(1_000_000)), (8, None)]);
+        assert_eq!(
+            connection
+                .query_row("SELECT series_index FROM books WHERE id = 8", [], |row| {
+                    row.get::<_, Option<i64>>(0)
+                })
+                .expect("read repaired projection"),
+            None
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema \
+                     WHERE type = 'index' AND name = 'series_memberships_series_number_uidx'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("check unique index"),
+            1
+        );
     }
 
     #[test]
@@ -2795,6 +3010,7 @@ mod tests {
             "book_contributors_book_role_position_idx",
             "book_contributors_contributor_role_book_idx",
             "series_memberships_series_index_book_idx",
+            "series_memberships_series_number_uidx",
             "book_tags_tag_book_idx",
         ] {
             let exists = connection

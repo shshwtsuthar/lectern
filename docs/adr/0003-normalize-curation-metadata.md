@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-25
+- Amended: 2026-08-27 (durable named tag colors)
 
 ## Context
 
@@ -43,13 +44,17 @@ line shown on a cover card. A contributor owns a display name and an independent
 name. Lectern does not automatically invert personal names.
 
 A book has at most one series membership in this slice. A membership may have an optional exact,
-non-negative decimal index with no more than six fractional digits. Duplicate indices are valid.
+non-negative decimal index with no more than six fractional digits. A non-empty index is unique
+within its series; two books in the same series cannot claim the same number.
 Series order is normalized series name, indexed entries before unindexed entries, numeric index,
 normalized title, then stable book ID. Multiple simultaneous series memberships are a later model
 change, not a hidden capability of this relation.
 
-Tags are flat, library-wide labels. A book/tag pair is unique and assignment is idempotent. Tag
-order is display-name order; relation insertion order has no product meaning.
+Tags are flat, library-wide labels. A book/tag pair is unique and assignment is idempotent. Each tag
+owns one color from the closed Slate, Coral, Amber, Mint, Azure, and Lilac presentation palette.
+Color is not part of the identity key, does not affect ordering or search, and is retained from the
+explicit target when tags merge. Tag order is display-name order; relation insertion order has no
+product meaning.
 
 Contributor names, series names, tag names, and saved-search names share one identity-key
 algorithm: Unicode NFKC normalization, leading/trailing Unicode-whitespace removal, internal
@@ -80,6 +85,14 @@ The migration from flattened metadata is deliberately lossless and conservative:
 - existing author and series display values remain unchanged in the derived book projection;
 - existing books begin with no tags, and no saved searches are synthesized; and
 - the migration performs no publication-file reads or metadata reparsing.
+
+The later schema-version-7 migration adds tag color independently. It assigns Slate to every
+existing version-6 tag, preserves all tag IDs and relationships, and performs no file reads.
+
+Schema version 8 makes non-empty series numbers unique per series. If an older library contains a
+duplicate, the lowest stable book ID retains the number and later books remain in the series as
+unnumbered entries. This repair is deterministic, preserves every membership, and reads no
+publication file.
 
 New EPUB imports preserve separate creator elements as separate ordered author credits. A PDF
 Author field remains one credit because its internal delimiter semantics are unknown. Automatic

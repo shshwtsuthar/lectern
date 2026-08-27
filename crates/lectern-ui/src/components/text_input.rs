@@ -73,9 +73,11 @@ impl RenderOnce for TextInput {
                     })
             })
             .when(!disabled, |input| {
-                input.on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                    state.update(cx, |state, cx| state.focus(window, cx));
-                })
+                input
+                    .on_mouse_down_out(|_, window, _| window.blur())
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        state.update(cx, |state, cx| state.focus(window, cx));
+                    })
             })
             .child(BaseInput::new(&self.state))
             .render(window, cx)
@@ -154,9 +156,11 @@ impl RenderOnce for TextArea {
                     })
             })
             .when(!disabled, |input| {
-                input.on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                    state.update(cx, |state, cx| state.focus(window, cx));
-                })
+                input
+                    .on_mouse_down_out(|_, window, _| window.blur())
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        state.update(cx, |state, cx| state.focus(window, cx));
+                    })
             })
             .child(div().size_full().child(BaseTextarea::new(&self.state)))
             .render(window, cx)

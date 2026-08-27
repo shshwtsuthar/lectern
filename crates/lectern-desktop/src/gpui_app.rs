@@ -4,32 +4,40 @@ use std::{
     collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
 use gpui::{
-    App, Bounds, Context, Image, ImageFormat, KeyBinding, ObjectFit, Render, SharedString,
-    StatefulInteractiveElement, StyledImage, Window, WindowBounds, WindowOptions, div, img,
-    prelude::*, px, relative, size,
+    App, Bounds, Context, Entity, Image, ImageFormat, KeyBinding, ListAlignment, ListState,
+    ObjectFit, Render, SharedString, StatefulInteractiveElement, StyledImage, Window, WindowBounds,
+    WindowDecorations, WindowOptions, div, img, list, prelude::*, px, relative, rems, size,
 };
 use gpui_base::{
     AlertDialog, AlertDialogBackdrop, AlertDialogDescription, AlertDialogPopup, AlertDialogTitle,
     Checkbox, CheckboxState,
+    input::{InputEvent, InputState, TextareaState},
 };
 use gpui_platform::application;
 use lectern_core::{
-    AssetHealth, AssetStorage, Book, BookAsset, BookFormat, BookId, BookSummary, ImportSummary,
-    LibraryQuery, LibraryService,
+    AssetHealth, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId, BookSummary,
+    ImportSummary, LibraryQuery, LibraryService,
     organisation::{
         BookSelection, BulkRemovalResult, Contributor, ContributorCredit, ContributorId,
-        ContributorRole, LibraryGeneration, SelectionSnapshot, Series, SeriesId, SeriesIndex,
-        SeriesMembership, Tag, TagId,
+        ContributorRole, LibraryGeneration, NameKind, SelectionSnapshot, Series, SeriesId,
+        SeriesIndex, SeriesMembership, SeriesUsage, Tag, TagColor, TagId, TagUsage, identity_key,
+        normalize_name,
     },
 };
 use lectern_service::{LibraryServiceError, SqliteLibraryService, default_database_path};
-use lectern_ui::{Button, ButtonVariant, LecternAssets, PrimerTheme, TablerIcon, install_theme};
-use serde::Serialize;
+use lectern_ui::{
+    AccentColor, ActionListItem, ActionMenu, Button, ButtonSize, ButtonVariant, ColorMode,
+    ColorSwatch, EntityChip, IconButton, LecternAssets, PrimerTheme, TablerIcon, TagChip, TextArea,
+    TextInput, install_fonts, install_theme,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::curation::BookCurationDraft;
 
 const BENCHMARK_OUTPUT_ENV: &str = "LECTERN_GPUI_BENCHMARK_OUTPUT";
 const BENCHMARK_WORKLOAD_ENV: &str = "LECTERN_GPUI_BENCHMARK_WORKLOAD";
@@ -43,7 +51,8 @@ const TOP_BAR_HEIGHT_PX: f32 = 48.0;
 const SELECTION_BAR_HEIGHT_PX: f32 = 48.0;
 const BOTTOM_BAR_HEIGHT_PX: f32 = 24.0;
 const BULK_REMOVAL_DIALOG_WIDTH_PX: f32 = 460.0;
-const BOOK_DETAIL_PANEL_WIDTH_PX: f32 = 384.0;
+const BOOK_DETAIL_PANEL_WIDTH_PX: f32 = 420.0;
+const THEME_DIALOG_WIDTH_PX: f32 = 400.0;
 const LIBRARY_PAGE_SIZE: u32 = 128;
 
 gpui::actions!(
@@ -84,22 +93,33 @@ pub fn run(main_entry: Instant) {
         .with_assets(LecternAssets)
         .run(move |cx: &mut App| {
             gpui_base::init(cx);
+            install_fonts(cx).expect("install bundled Lectern fonts");
             cx.bind_keys([
                 KeyBinding::new("cmd-a", SelectAllBooks, Some("LecternLibrary")),
                 KeyBinding::new("ctrl-a", SelectAllBooks, Some("LecternLibrary")),
                 KeyBinding::new("escape", ClearBookSelection, Some("LecternLibrary")),
             ]);
-            install_theme(cx, PrimerTheme::light());
+            let database_path = default_database_path();
+            let appearance = load_appearance(&database_path);
+            install_theme(
+                cx,
+                PrimerTheme::with_accent(appearance.mode, appearance.accent),
+            );
             let bounds =
                 Bounds::centered(None, size(px(WINDOW_WIDTH_PX), px(WINDOW_HEIGHT_PX)), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Lectern".into()),
+                        ..Default::default()
+                    }),
+                    window_decorations: Some(WindowDecorations::Server),
                     ..Default::default()
                 },
                 move |window, cx| {
                     window.set_rem_size(px(ROOT_REM_PX));
-                    cx.new(|_| LecternView::new(benchmark))
+                    cx.new(|_| LecternView::new(benchmark, database_path, appearance))
                 },
             )
             .expect("open Lectern GPUI window");
@@ -107,6 +127,10 @@ pub fn run(main_entry: Instant) {
         });
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent asynchronous UI operations require independent flags"
+)]
 struct LecternView {
     database_path: PathBuf,
     library_state: LibraryState,
@@ -116,8 +140,12 @@ struct LecternView {
     selection: GridSelection,
     selection_generation: u64,
     selection_pending: Option<PendingSelection>,
-    detail_book: Option<Book>,
+    detail_editor: Option<BookDetailEditor>,
+    detail_loading: Option<BookId>,
     removal_confirmation: Option<BulkRemovalConfirmation>,
+    appearance: AppearanceSettings,
+    appearance_dirty: bool,
+    theme_dialog_open: bool,
     removing: bool,
     busy: bool,
     status: Option<SharedString>,
@@ -125,8 +153,367 @@ struct LecternView {
     benchmark: Option<BenchmarkRun>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AppearanceSettings {
+    mode: ColorMode,
+    accent: AccentColor,
+}
+
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            mode: ColorMode::Light,
+            accent: AccentColor::Mauve,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct PersistedAppearance {
+    mode: String,
+    accent: String,
+}
+
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent editor menus and operations require independent flags"
+)]
+struct BookDetailEditor {
+    original: Book,
+    curation: BookCurationDraft,
+    list_state: ListState,
+    title: Entity<InputState>,
+    contributors: Vec<ContributorField>,
+    series_input: Option<Entity<InputState>>,
+    series_menu_open: bool,
+    series_suggestions: Vec<SeriesUsage>,
+    series_suggestion_generation: u64,
+    series_suggestions_loading: bool,
+    series_index: Option<Entity<InputState>>,
+    series_index_generation: u64,
+    series_index_availability: SeriesIndexAvailability,
+    publisher: Option<Entity<InputState>>,
+    language: String,
+    language_menu_open: bool,
+    description: Option<Entity<TextareaState>>,
+    tag_input: Option<Entity<InputState>>,
+    tag_menu_open: bool,
+    tag_creation_name: Option<String>,
+    tag_suggestions: Vec<TagUsage>,
+    tag_suggestion_generation: u64,
+    tag_suggestions_loading: bool,
+    role_picker: Option<u64>,
+    dirty: bool,
+    operation: DetailOperation,
+    remove_confirmation: bool,
+    error: Option<SharedString>,
+    error_section: DetailErrorSection,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DetailOperation {
+    #[default]
+    Idle,
+    Saving,
+    Assets,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DetailErrorSection {
+    #[default]
+    Information,
+    Files,
+    Series,
+    Contributors,
+    Tags,
+    Library,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SeriesIndexAvailability {
+    #[default]
+    Idle,
+    Checking,
+    Available,
+    Conflict,
+}
+
+struct ContributorField {
+    row_id: u64,
+    persisted_id: Option<ContributorId>,
+    persisted_name: String,
+    persisted_sort_name: String,
+    name: Entity<InputState>,
+    role: ContributorRole,
+}
+
+impl BookDetailEditor {
+    fn new(book: Book, window: &mut Window, cx: &mut Context<LecternView>) -> Self {
+        let curation = BookCurationDraft::from_book(&book);
+        let contributors = curation
+            .contributors
+            .iter()
+            .map(|draft| ContributorField {
+                row_id: draft.row_id,
+                persisted_id: draft.existing_id,
+                persisted_name: draft.name.clone(),
+                persisted_sort_name: draft.sort_name.clone(),
+                name: metadata_input(window, cx, "Contributor name", draft.name.clone()),
+                role: draft.role,
+            })
+            .collect::<Vec<_>>();
+        let contributor_count = contributors.len();
+        Self {
+            title: metadata_input(window, cx, "Book title", book.title.clone()),
+            contributors,
+            series_input: None,
+            series_menu_open: false,
+            series_suggestions: Vec::new(),
+            series_suggestion_generation: 0,
+            series_suggestions_loading: false,
+            series_index: None,
+            series_index_generation: 0,
+            series_index_availability: SeriesIndexAvailability::Idle,
+            publisher: None,
+            language: book.language.clone().unwrap_or_default(),
+            language_menu_open: false,
+            description: None,
+            tag_input: None,
+            tag_menu_open: false,
+            tag_creation_name: None,
+            tag_suggestions: Vec::new(),
+            tag_suggestion_generation: 0,
+            tag_suggestions_loading: false,
+            role_picker: None,
+            list_state: ListState::new(
+                detail_item_count(contributor_count),
+                ListAlignment::Top,
+                px(64.),
+            ),
+            original: book,
+            curation,
+            dirty: false,
+            operation: DetailOperation::Idle,
+            remove_confirmation: false,
+            error: None,
+            error_section: DetailErrorSection::Information,
+        }
+    }
+
+    fn build_edit(&self, cx: &App) -> Result<lectern_core::organisation::BookEdit, String> {
+        let mut curation = self.curation.clone();
+        for (draft, field) in curation.contributors.iter_mut().zip(&self.contributors) {
+            let name = field.name.read(cx).value().to_string();
+            draft.name.clone_from(&name);
+            draft.role = field.role;
+            let unchanged_existing = field.persisted_id.is_some() && name == field.persisted_name;
+            if unchanged_existing {
+                draft.existing_id = field.persisted_id;
+                draft.sort_name.clone_from(&field.persisted_sort_name);
+                draft.confirmed_new = false;
+            } else {
+                draft.existing_id = None;
+                draft.sort_name.clone_from(&name);
+                draft.confirm_new()?;
+            }
+        }
+
+        curation.series.index = self.series_index.as_ref().map_or_else(
+            || curation.series.index.clone(),
+            |state| state.read(cx).value().to_string(),
+        );
+        if curation.series.name.trim().is_empty() {
+            curation.series.clear();
+        }
+
+        let publisher = self.publisher.as_ref().map_or_else(
+            || self.original.publisher.clone().unwrap_or_default(),
+            |state| state.read(cx).value().to_string(),
+        );
+        let language = self.language.clone();
+        let description = self.description.as_ref().map_or_else(
+            || self.original.description.clone().unwrap_or_default(),
+            |state| state.read(cx).value().to_string(),
+        );
+        curation.to_book_edit(
+            &self.original,
+            self.title.read(cx).value().as_str(),
+            &publisher,
+            &language,
+            &description,
+        )
+    }
+
+    fn set_inputs_disabled(&self, disabled: bool, cx: &mut App) {
+        self.title
+            .update(cx, |state, cx| state.set_disabled(disabled, cx));
+        for contributor in &self.contributors {
+            contributor
+                .name
+                .update(cx, |state, cx| state.set_disabled(disabled, cx));
+        }
+        for state in [
+            self.series_input.as_ref(),
+            self.series_index.as_ref(),
+            self.publisher.as_ref(),
+            self.tag_input.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            state.update(cx, |state, cx| state.set_disabled(disabled, cx));
+        }
+        if let Some(state) = &self.description {
+            state.update(cx, |state, cx| state.set_disabled(disabled, cx));
+        }
+    }
+}
+
+fn metadata_input(
+    window: &mut Window,
+    cx: &mut Context<LecternView>,
+    placeholder: &'static str,
+    value: String,
+) -> Entity<InputState> {
+    let state = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(placeholder)
+            .default_value(value)
+    });
+    cx.subscribe(&state, |this, _, event: &InputEvent, cx| {
+        if matches!(event, InputEvent::Change)
+            && let Some(editor) = &mut this.detail_editor
+        {
+            editor.dirty = true;
+            editor.error = None;
+        }
+        cx.notify();
+    })
+    .detach();
+    state
+}
+
+fn metadata_textarea(
+    window: &mut Window,
+    cx: &mut Context<LecternView>,
+    placeholder: &'static str,
+    value: String,
+) -> Entity<TextareaState> {
+    let state = cx.new(|cx| {
+        TextareaState::new(window, cx)
+            .rows(8)
+            .placeholder(placeholder)
+            .default_value(value)
+    });
+    cx.subscribe(&state, |this, _, event: &InputEvent, cx| {
+        if matches!(event, InputEvent::Change)
+            && let Some(editor) = &mut this.detail_editor
+        {
+            editor.dirty = true;
+            editor.error = None;
+        }
+        cx.notify();
+    })
+    .detach();
+    state
+}
+
+fn tag_search_input(window: &mut Window, cx: &mut Context<LecternView>) -> Entity<InputState> {
+    let state = cx.new(|cx| InputState::new(window, cx).placeholder("Add or find a tag…"));
+    cx.subscribe(&state, |this, state, event: &InputEvent, cx| {
+        if matches!(event, InputEvent::Change) {
+            let query = state.read(cx).value().to_string();
+            this.request_detail_tag_suggestions(query, cx);
+        }
+        cx.notify();
+    })
+    .detach();
+    state
+}
+
+fn series_search_input(window: &mut Window, cx: &mut Context<LecternView>) -> Entity<InputState> {
+    let state = cx.new(|cx| InputState::new(window, cx).placeholder("Add or find a series…"));
+    cx.subscribe(&state, |this, state, event: &InputEvent, cx| {
+        if matches!(event, InputEvent::Change) {
+            let query = state.read(cx).value().to_string();
+            this.request_detail_series_suggestions(query, cx);
+        }
+        cx.notify();
+    })
+    .detach();
+    state
+}
+
+fn series_index_input(
+    window: &mut Window,
+    cx: &mut Context<LecternView>,
+    value: String,
+) -> Entity<InputState> {
+    let state = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder("Book number")
+            .default_value(value)
+    });
+    cx.subscribe(&state, |this, state, event: &InputEvent, cx| {
+        if matches!(event, InputEvent::Change) {
+            if let Some(editor) = &mut this.detail_editor {
+                editor.dirty = true;
+                editor.error = None;
+            }
+            let value = state.read(cx).value().to_string();
+            this.request_series_index_availability(&value, cx);
+        }
+        cx.notify();
+    })
+    .detach();
+    state
+}
+
+fn appearance_path(database_path: &Path) -> PathBuf {
+    database_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("appearance.json")
+}
+
+fn load_appearance(database_path: &Path) -> AppearanceSettings {
+    let Ok(bytes) = fs::read(appearance_path(database_path)) else {
+        return AppearanceSettings::default();
+    };
+    let Ok(persisted) = serde_json::from_slice::<PersistedAppearance>(&bytes) else {
+        return AppearanceSettings::default();
+    };
+    let Some(mode) = ColorMode::parse(&persisted.mode) else {
+        return AppearanceSettings::default();
+    };
+    let Some(accent) = AccentColor::parse(&persisted.accent) else {
+        return AppearanceSettings::default();
+    };
+    AppearanceSettings { mode, accent }
+}
+
+fn persist_appearance(database_path: &Path, appearance: AppearanceSettings) -> Result<(), String> {
+    let path = appearance_path(database_path);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let bytes = serde_json::to_vec_pretty(&PersistedAppearance {
+        mode: appearance.mode.as_str().to_owned(),
+        accent: appearance.accent.as_str().to_owned(),
+    })
+    .map_err(|error| error.to_string())?;
+    fs::write(path, bytes).map_err(|error| error.to_string())
+}
+
 impl LecternView {
-    fn new(benchmark: Option<BenchmarkRun>) -> Self {
+    fn new(
+        benchmark: Option<BenchmarkRun>,
+        database_path: PathBuf,
+        appearance: AppearanceSettings,
+    ) -> Self {
         let library_state = if benchmark.is_some() {
             LibraryState::Ready
         } else {
@@ -139,7 +526,7 @@ impl LecternView {
             )
         });
         Self {
-            database_path: default_database_path(),
+            database_path,
             library_state,
             library_total: if populated_benchmark { 50_000 } else { 0 },
             books: if populated_benchmark {
@@ -151,8 +538,12 @@ impl LecternView {
             selection: GridSelection::default(),
             selection_generation: 0,
             selection_pending: None,
-            detail_book: None,
+            detail_editor: None,
+            detail_loading: None,
             removal_confirmation: None,
+            appearance,
+            appearance_dirty: false,
+            theme_dialog_open: false,
             removing: false,
             busy: false,
             status: None,
@@ -223,16 +614,18 @@ impl LecternView {
             .as_mut()
             .expect("book-detail benchmark state is present");
         benchmark.action_started = Some(Instant::now());
-        self.detail_book = Some(benchmark_book_detail());
+        self.detail_editor = Some(BookDetailEditor::new(benchmark_book_detail(), window, cx));
         cx.notify();
         cx.on_next_frame(window, Self::benchmark_book_detail_presented);
     }
 
     fn benchmark_book_detail_presented(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let book = self
-            .detail_book
+            .detail_editor
             .as_ref()
-            .expect("book-detail benchmark has a presented book");
+            .expect("book-detail benchmark has a presented book")
+            .original
+            .clone();
         let title = book.title.clone();
         let contributor_count = book.contributors.len();
         let tag_count = book.tags.len();
@@ -407,6 +800,68 @@ impl LecternView {
         cx.notify();
     }
 
+    fn open_theme_dialog(&mut self, cx: &mut Context<Self>) {
+        self.theme_dialog_open = true;
+        cx.notify();
+    }
+
+    fn close_theme_dialog(&mut self, cx: &mut Context<Self>) {
+        self.theme_dialog_open = false;
+        if self.appearance_dirty {
+            self.appearance_dirty = false;
+            let database_path = self.database_path.clone();
+            let appearance = self.appearance;
+            let save = cx
+                .background_executor()
+                .spawn(async move { persist_appearance(&database_path, appearance) });
+            cx.spawn(async move |this, cx| {
+                let result = save.await;
+                this.update(cx, |this, cx| {
+                    if let Err(error) = result {
+                        this.status = Some(format!("Could not save appearance: {error}").into());
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    fn set_color_mode(&mut self, mode: ColorMode, cx: &mut Context<Self>) {
+        self.apply_appearance(
+            AppearanceSettings {
+                mode,
+                ..self.appearance
+            },
+            cx,
+        );
+    }
+
+    fn set_accent_color(&mut self, accent: AccentColor, cx: &mut Context<Self>) {
+        self.apply_appearance(
+            AppearanceSettings {
+                accent,
+                ..self.appearance
+            },
+            cx,
+        );
+    }
+
+    fn apply_appearance(&mut self, appearance: AppearanceSettings, cx: &mut Context<Self>) {
+        if self.appearance == appearance {
+            return;
+        }
+        self.appearance = appearance;
+        self.appearance_dirty = true;
+        install_theme(
+            cx,
+            PrimerTheme::with_accent(appearance.mode, appearance.accent),
+        );
+        cx.notify();
+    }
+
     fn clear_selection_action(&mut self, cx: &mut Context<Self>) {
         if self.removing || (!self.selection.is_active() && self.selection_pending.is_none()) {
             return;
@@ -438,7 +893,888 @@ impl LecternView {
             self.select_range_to(index, window, cx);
         } else if self.selection.is_active() || modifiers.secondary() {
             self.toggle_book(id, index, cx);
+        } else {
+            self.open_book_detail(id, window, cx);
         }
+    }
+
+    fn open_book_detail(&mut self, id: BookId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.removing || self.detail_loading.is_some() {
+            return;
+        }
+        if let Some(editor) = &self.detail_editor {
+            if editor.original.id == id {
+                return;
+            }
+            if editor.dirty {
+                self.status = Some("Save or reset the open book before switching books.".into());
+                cx.notify();
+                return;
+            }
+        }
+        self.detail_loading = Some(id);
+        self.status = Some("Opening book details…".into());
+        cx.notify();
+
+        let database_path = self.database_path.clone();
+        let load = cx
+            .background_executor()
+            .spawn(async move { load_book(&database_path, id).map_err(|error| error.to_string()) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = load.await;
+            this.update_in(cx, |this, window, cx| {
+                if this.detail_loading != Some(id) {
+                    return;
+                }
+                this.detail_loading = None;
+                match result {
+                    Ok(Some(book)) => {
+                        this.detail_editor = Some(BookDetailEditor::new(book, window, cx));
+                        this.status = None;
+                    }
+                    Ok(None) => {
+                        this.status = Some("That book is no longer in the library.".into());
+                    }
+                    Err(error) => {
+                        this.status = Some(format!("Could not open book details: {error}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn close_book_detail(&mut self, cx: &mut Context<Self>) {
+        self.detail_editor = None;
+        self.detail_loading = None;
+        self.status = None;
+        cx.notify();
+    }
+
+    fn reset_book_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(book) = self
+            .detail_editor
+            .as_ref()
+            .map(|editor| editor.original.clone())
+        else {
+            return;
+        };
+        self.detail_editor = Some(BookDetailEditor::new(book, window, cx));
+        self.status = Some("Book details reset.".into());
+        cx.notify();
+    }
+
+    fn add_detail_contributor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        if editor.operation != DetailOperation::Idle || self.removing {
+            return;
+        }
+        let row_id = editor.curation.add_contributor();
+        let field = ContributorField {
+            row_id,
+            persisted_id: None,
+            persisted_name: String::new(),
+            persisted_sort_name: String::new(),
+            name: metadata_input(window, cx, "Contributor name", String::new()),
+            role: ContributorRole::Author,
+        };
+        let editor = self
+            .detail_editor
+            .as_mut()
+            .expect("detail editor remains available");
+        editor.contributors.push(field);
+        editor
+            .list_state
+            .reset(detail_item_count(editor.contributors.len()));
+        editor.list_state.scroll_to_reveal_item(
+            DETAIL_CONTRIBUTOR_START_ITEM + editor.contributors.len().saturating_sub(1),
+        );
+        editor.dirty = true;
+        editor.error = None;
+        cx.notify();
+    }
+
+    fn set_contributor_role(&mut self, row_id: u64, role: ContributorRole, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        let Some(field) = editor
+            .contributors
+            .iter_mut()
+            .find(|field| field.row_id == row_id)
+        else {
+            return;
+        };
+        field.role = role;
+        if let Some(draft) = editor
+            .curation
+            .contributors
+            .iter_mut()
+            .find(|draft| draft.row_id == row_id)
+        {
+            draft.role = role;
+        }
+        editor.dirty = true;
+        editor.role_picker = None;
+        editor.error = None;
+        cx.notify();
+    }
+
+    fn set_contributor_role_picker_open(
+        &mut self,
+        row_id: u64,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        editor.role_picker = open.then_some(row_id);
+        cx.notify();
+    }
+
+    fn set_detail_language(&mut self, code: &'static str, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        if editor.operation != DetailOperation::Idle || editor.language == code {
+            return;
+        }
+        code.clone_into(&mut editor.language);
+        editor.language_menu_open = false;
+        editor.dirty = true;
+        editor.error = None;
+        cx.notify();
+    }
+
+    fn set_language_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if let Some(editor) = &mut self.detail_editor {
+            editor.language_menu_open = open;
+            cx.notify();
+        }
+    }
+
+    fn move_detail_contributor(&mut self, row_id: u64, offset: isize, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        let Some(index) = editor
+            .contributors
+            .iter()
+            .position(|field| field.row_id == row_id)
+        else {
+            return;
+        };
+        let Some(target) = index.checked_add_signed(offset) else {
+            return;
+        };
+        if target >= editor.contributors.len() {
+            return;
+        }
+        editor.contributors.swap(index, target);
+        editor.curation.contributors.swap(index, target);
+        editor.list_state.remeasure_items(
+            DETAIL_CONTRIBUTOR_START_ITEM
+                ..DETAIL_CONTRIBUTOR_START_ITEM + editor.contributors.len(),
+        );
+        editor.dirty = true;
+        editor.error = None;
+        cx.notify();
+    }
+
+    fn set_series_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        let query = {
+            let Some(editor) = &mut self.detail_editor else {
+                return;
+            };
+            editor.series_menu_open = open;
+            if !open {
+                cx.notify();
+                return;
+            }
+            editor
+                .series_input
+                .as_ref()
+                .map_or_else(String::new, |input| input.read(cx).value().to_string())
+        };
+        self.request_detail_series_suggestions(query, cx);
+    }
+
+    fn request_detail_series_suggestions(&mut self, query: String, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        if !editor.series_menu_open {
+            return;
+        }
+        editor.series_suggestion_generation = editor.series_suggestion_generation.wrapping_add(1);
+        let generation = editor.series_suggestion_generation;
+        editor.series_suggestions_loading = true;
+        let selected = editor.curation.existing_series_id();
+        let database_path = self.database_path.clone();
+        let load = cx.background_executor().spawn(async move {
+            let mut service =
+                SqliteLibraryService::open(&database_path).map_err(|error| error.to_string())?;
+            service
+                .autocomplete_series(query.trim(), &selected, 50)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                let Some(editor) = &mut this.detail_editor else {
+                    return;
+                };
+                if editor.series_suggestion_generation != generation {
+                    return;
+                }
+                editor.series_suggestions_loading = false;
+                match result {
+                    Ok(suggestions) => {
+                        editor.series_suggestions = suggestions;
+                        editor.error = None;
+                    }
+                    Err(error) => {
+                        editor.error = Some(error.into());
+                        editor.error_section = DetailErrorSection::Series;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn select_existing_detail_series(
+        &mut self,
+        series: &Series,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = {
+            let Some(editor) = &mut self.detail_editor else {
+                return;
+            };
+            editor
+                .curation
+                .series
+                .select_existing(series.id, &series.name);
+            editor.series_menu_open = false;
+            editor.dirty = true;
+            editor.error = None;
+            if let Some(input) = &editor.series_input {
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+            }
+            if let Some(input) = &editor.series_index {
+                input.update(cx, |state, cx| state.set_disabled(false, cx));
+            }
+            editor
+                .series_index
+                .as_ref()
+                .map_or_else(String::new, |input| input.read(cx).value().to_string())
+        };
+        self.request_series_index_availability(&index, cx);
+        cx.notify();
+    }
+
+    fn create_detail_series(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        editor.curation.series.name = name;
+        editor.curation.series.name_edited();
+        match editor.curation.series.confirm_new() {
+            Ok(()) => {
+                editor.series_menu_open = false;
+                editor.series_index_availability = SeriesIndexAvailability::Idle;
+                editor.dirty = true;
+                editor.error = None;
+                if let Some(input) = &editor.series_input {
+                    input.update(cx, |state, cx| state.set_value("", window, cx));
+                }
+                if let Some(input) = &editor.series_index {
+                    input.update(cx, |state, cx| state.set_disabled(false, cx));
+                }
+            }
+            Err(error) => {
+                editor.error = Some(error.into());
+                editor.error_section = DetailErrorSection::Series;
+            }
+        }
+        cx.notify();
+    }
+
+    fn remove_detail_series(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        editor.curation.series.clear();
+        editor.series_menu_open = false;
+        editor.series_index_generation = editor.series_index_generation.wrapping_add(1);
+        editor.series_index_availability = SeriesIndexAvailability::Idle;
+        editor.dirty = true;
+        editor.error = None;
+        if let Some(input) = &editor.series_input {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        if let Some(input) = &editor.series_index {
+            input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                state.set_disabled(true, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn request_series_index_availability(&mut self, value: &str, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        editor.series_index_generation = editor.series_index_generation.wrapping_add(1);
+        let generation = editor.series_index_generation;
+        let Some(series_id) = editor.curation.series.existing_id else {
+            editor.series_index_availability = SeriesIndexAvailability::Idle;
+            cx.notify();
+            return;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            editor.series_index_availability = SeriesIndexAvailability::Idle;
+            cx.notify();
+            return;
+        }
+        let Ok(index) = value.parse::<SeriesIndex>() else {
+            editor.series_index_availability = SeriesIndexAvailability::Idle;
+            cx.notify();
+            return;
+        };
+        let book_id = editor.original.id;
+        editor.series_index_availability = SeriesIndexAvailability::Checking;
+        let database_path = self.database_path.clone();
+        let check = cx.background_executor().spawn(async move {
+            let mut service =
+                SqliteLibraryService::open(&database_path).map_err(|error| error.to_string())?;
+            service
+                .series_index_is_available(series_id, index, book_id)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = check.await;
+            this.update(cx, |this, cx| {
+                let Some(editor) = &mut this.detail_editor else {
+                    return;
+                };
+                if editor.series_index_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(true) => {
+                        editor.series_index_availability = SeriesIndexAvailability::Available;
+                        editor.error = None;
+                    }
+                    Ok(false) => {
+                        editor.series_index_availability = SeriesIndexAvailability::Conflict;
+                    }
+                    Err(error) => {
+                        editor.series_index_availability = SeriesIndexAvailability::Idle;
+                        editor.error = Some(error.into());
+                        editor.error_section = DetailErrorSection::Series;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn remove_detail_contributor(&mut self, row_id: u64, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        let Some(index) = editor
+            .contributors
+            .iter()
+            .position(|field| field.row_id == row_id)
+        else {
+            return;
+        };
+        editor.contributors.remove(index);
+        editor.curation.contributors.remove(index);
+        editor
+            .list_state
+            .reset(detail_item_count(editor.contributors.len()));
+        editor.dirty = true;
+        editor.error = None;
+        cx.notify();
+    }
+
+    fn set_tag_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        let query = {
+            let Some(editor) = &mut self.detail_editor else {
+                return;
+            };
+            editor.tag_menu_open = open;
+            if !open {
+                editor.tag_creation_name = None;
+                cx.notify();
+                return;
+            }
+            editor
+                .tag_input
+                .as_ref()
+                .map_or_else(String::new, |input| input.read(cx).value().to_string())
+        };
+        self.request_detail_tag_suggestions(query, cx);
+    }
+
+    fn request_detail_tag_suggestions(&mut self, query: String, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        if !editor.tag_menu_open {
+            return;
+        }
+        editor.tag_suggestion_generation = editor.tag_suggestion_generation.wrapping_add(1);
+        let generation = editor.tag_suggestion_generation;
+        editor.tag_suggestions_loading = true;
+        editor.tag_creation_name = None;
+        let selected = editor.curation.existing_tag_ids();
+        let database_path = self.database_path.clone();
+        let load = cx.background_executor().spawn(async move {
+            let mut service =
+                SqliteLibraryService::open(&database_path).map_err(|error| error.to_string())?;
+            service
+                .autocomplete_tags(query.trim(), &selected, 50)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                let Some(editor) = &mut this.detail_editor else {
+                    return;
+                };
+                if editor.tag_suggestion_generation != generation {
+                    return;
+                }
+                editor.tag_suggestions_loading = false;
+                match result {
+                    Ok(suggestions) => {
+                        editor.tag_suggestions = suggestions;
+                        editor.error = None;
+                    }
+                    Err(error) => {
+                        editor.error = Some(error.into());
+                        editor.error_section = DetailErrorSection::Tags;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn toggle_existing_detail_tag(&mut self, tag: &Tag, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        let changed = if editor
+            .curation
+            .tags
+            .iter()
+            .any(|selected| selected.existing_id == Some(tag.id))
+        {
+            editor.curation.remove_tag_id(tag.id)
+        } else {
+            editor
+                .curation
+                .add_existing_tag(tag.id, &tag.name, tag.color)
+        };
+        if changed {
+            let tags_item = detail_tags_item_index(editor.contributors.len());
+            editor.list_state.remeasure_items(tags_item..tags_item + 1);
+            editor.dirty = true;
+            editor.error = None;
+        }
+        cx.notify();
+    }
+
+    fn begin_detail_tag_creation(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        match normalize_name(NameKind::Tag, name) {
+            Ok(name) => {
+                editor.tag_creation_name = Some(name);
+                editor.error = None;
+            }
+            Err(error) => {
+                editor.error = Some(error.to_string().into());
+                editor.error_section = DetailErrorSection::Tags;
+            }
+        }
+        cx.notify();
+    }
+
+    fn create_detail_tag(&mut self, color: TagColor, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        let Some(name) = editor.tag_creation_name.clone() else {
+            return;
+        };
+        match editor.curation.add_new_tag(&name, color) {
+            Ok(added) => {
+                if let Some(input) = &editor.tag_input {
+                    input.update(cx, |state, cx| state.set_value("", window, cx));
+                }
+                editor.tag_creation_name = None;
+                editor.tag_menu_open = false;
+                editor.dirty |= added;
+                editor.error = None;
+                let tags_item = detail_tags_item_index(editor.contributors.len());
+                editor.list_state.remeasure_items(tags_item..tags_item + 1);
+            }
+            Err(error) => {
+                editor.error = Some(error.into());
+                editor.error_section = DetailErrorSection::Tags;
+            }
+        }
+        cx.notify();
+    }
+
+    fn remove_detail_tag(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        if index >= editor.curation.tags.len() {
+            return;
+        }
+        editor.curation.tags.remove(index);
+        let tags_item = detail_tags_item_index(editor.contributors.len());
+        editor.list_state.remeasure_items(tags_item..tags_item + 1);
+        editor.dirty = true;
+        editor.error = None;
+        cx.notify();
+    }
+
+    fn save_book_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &self.detail_editor else {
+            return;
+        };
+        if editor.operation != DetailOperation::Idle
+            || self.removing
+            || !editor.dirty
+            || matches!(
+                editor.series_index_availability,
+                SeriesIndexAvailability::Checking | SeriesIndexAvailability::Conflict
+            )
+        {
+            return;
+        }
+        let edit = match editor.build_edit(cx) {
+            Ok(edit) => edit,
+            Err(error) => {
+                let error_section = metadata_error_section(&error);
+                let editor = self
+                    .detail_editor
+                    .as_mut()
+                    .expect("detail editor remains available");
+                editor.error = Some(error.into());
+                editor.error_section = error_section;
+                let item = match error_section {
+                    DetailErrorSection::Information => DETAIL_INFORMATION_ITEM,
+                    DetailErrorSection::Files => DETAIL_FILES_ITEM,
+                    DetailErrorSection::Series => DETAIL_SERIES_ITEM,
+                    DetailErrorSection::Contributors => DETAIL_CONTRIBUTOR_START_ITEM,
+                    DetailErrorSection::Tags => detail_tags_item_index(editor.contributors.len()),
+                    DetailErrorSection::Library => {
+                        detail_library_item_index(editor.contributors.len())
+                    }
+                };
+                editor.list_state.scroll_to_reveal_item(item);
+                cx.notify();
+                return;
+            }
+        };
+        self.detail_editor
+            .as_mut()
+            .expect("detail editor remains available")
+            .operation = DetailOperation::Saving;
+        self.detail_editor
+            .as_ref()
+            .expect("detail editor remains available")
+            .set_inputs_disabled(true, cx);
+        self.status = Some("Saving book details…".into());
+        cx.notify();
+
+        let id = edit.id;
+        let database_path = self.database_path.clone();
+        let save = cx
+            .background_executor()
+            .spawn(async move { save_book_and_load_library(&database_path, &edit) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = save.await;
+            this.update_in(cx, |this, window, cx| {
+                if this
+                    .detail_editor
+                    .as_ref()
+                    .is_none_or(|editor| editor.original.id != id)
+                {
+                    return;
+                }
+                match result {
+                    Ok((book, snapshot)) => {
+                        this.apply_snapshot(snapshot);
+                        this.detail_editor = Some(BookDetailEditor::new(book, window, cx));
+                        this.status = Some("Book details saved.".into());
+                    }
+                    Err(error) => {
+                        let editor = this
+                            .detail_editor
+                            .as_mut()
+                            .expect("matching detail editor remains available");
+                        editor.operation = DetailOperation::Idle;
+                        editor.error_section = metadata_error_section(&error);
+                        editor.error = Some(error.into());
+                        editor.set_inputs_disabled(false, cx);
+                        this.status = Some("Could not save book details.".into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn prompt_for_detail_assets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        if editor.operation != DetailOperation::Idle || editor.dirty || self.removing {
+            return;
+        }
+        editor.operation = DetailOperation::Assets;
+        editor.set_inputs_disabled(true, cx);
+        cx.notify();
+        let response = rfd::AsyncFileDialog::new()
+            .set_title("Add EPUB or PDF assets")
+            .add_filter("EPUB or PDF", &["epub", "pdf"])
+            .pick_files();
+        cx.spawn_in(window, async move |this, cx| {
+            let paths = response.await.map(|files| {
+                files
+                    .into_iter()
+                    .map(|file| file.path().to_path_buf())
+                    .collect::<Vec<_>>()
+            });
+            this.update_in(cx, |this, window, cx| match paths {
+                Some(paths) if !paths.is_empty() => this.attach_detail_assets(paths, window, cx),
+                _ => {
+                    if let Some(editor) = &mut this.detail_editor {
+                        editor.operation = DetailOperation::Idle;
+                        editor.set_inputs_disabled(false, cx);
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn attach_detail_assets(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.detail_editor.as_ref().map(|editor| editor.original.id) else {
+            return;
+        };
+        self.status = Some("Adding book assets…".into());
+        let database_path = self.database_path.clone();
+        let attach = cx
+            .background_executor()
+            .spawn(async move { attach_assets_and_load_library(&database_path, id, &paths) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = attach.await;
+            this.update_in(cx, |this, window, cx| {
+                if this
+                    .detail_editor
+                    .as_ref()
+                    .is_none_or(|editor| editor.original.id != id)
+                {
+                    return;
+                }
+                match result {
+                    Ok(completion) => {
+                        this.apply_snapshot(completion.snapshot);
+                        this.detail_editor =
+                            Some(BookDetailEditor::new(completion.book, window, cx));
+                        this.status = Some(completion.message.into());
+                    }
+                    Err(error) => {
+                        let editor = this
+                            .detail_editor
+                            .as_mut()
+                            .expect("matching detail editor remains available");
+                        editor.operation = DetailOperation::Idle;
+                        editor.error = Some(error.into());
+                        editor.error_section = DetailErrorSection::Files;
+                        editor.set_inputs_disabled(false, cx);
+                        this.status = Some("Could not add book assets.".into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn detach_detail_asset(&mut self, asset: AssetId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        if editor.original.assets.len() <= 1
+            || editor.dirty
+            || editor.operation != DetailOperation::Idle
+            || self.removing
+        {
+            return;
+        }
+        let id = editor.original.id;
+        editor.operation = DetailOperation::Assets;
+        editor.set_inputs_disabled(true, cx);
+        self.status = Some("Removing book asset…".into());
+        cx.notify();
+        let database_path = self.database_path.clone();
+        let detach = cx
+            .background_executor()
+            .spawn(async move { detach_asset_and_load_library(&database_path, id, asset) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = detach.await;
+            this.update_in(cx, |this, window, cx| {
+                if this
+                    .detail_editor
+                    .as_ref()
+                    .is_none_or(|editor| editor.original.id != id)
+                {
+                    return;
+                }
+                match result {
+                    Ok((book, snapshot)) => {
+                        this.apply_snapshot(snapshot);
+                        this.detail_editor = Some(BookDetailEditor::new(book, window, cx));
+                        this.status = Some("Book asset removed.".into());
+                    }
+                    Err(error) => {
+                        let editor = this
+                            .detail_editor
+                            .as_mut()
+                            .expect("matching detail editor remains available");
+                        editor.operation = DetailOperation::Idle;
+                        editor.error = Some(error.into());
+                        editor.error_section = DetailErrorSection::Files;
+                        editor.set_inputs_disabled(false, cx);
+                        this.status = Some("Could not remove book asset.".into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn request_detail_removal(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        if editor.operation != DetailOperation::Idle || self.removing {
+            return;
+        }
+        editor.remove_confirmation = true;
+        let library_item = detail_item_count(editor.contributors.len()) - 1;
+        editor
+            .list_state
+            .remeasure_items(library_item..library_item + 1);
+        cx.notify();
+    }
+
+    fn cancel_detail_removal(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = &mut self.detail_editor {
+            editor.remove_confirmation = false;
+            let library_item = detail_item_count(editor.contributors.len()) - 1;
+            editor
+                .list_state
+                .remeasure_items(library_item..library_item + 1);
+            cx.notify();
+        }
+    }
+
+    fn start_detail_removal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &self.detail_editor else {
+            return;
+        };
+        if !editor.remove_confirmation || editor.operation != DetailOperation::Idle || self.removing
+        {
+            return;
+        }
+        let id = editor.original.id;
+        self.removing = true;
+        self.detail_editor
+            .as_ref()
+            .expect("detail editor remains available")
+            .set_inputs_disabled(true, cx);
+        self.status = Some("Removing book from the library…".into());
+        cx.notify();
+        let database_path = self.database_path.clone();
+        let remove = cx
+            .background_executor()
+            .spawn(async move { remove_book_and_load_library(&database_path, id) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = remove.await;
+            this.update(cx, |this, cx| {
+                this.removing = false;
+                match result {
+                    Ok((removed, snapshot)) => {
+                        this.apply_snapshot(snapshot);
+                        this.detail_editor = None;
+                        this.status = Some(if removed {
+                            "Removed the book from the library; book files were kept.".into()
+                        } else {
+                            "That book was already absent from the library.".into()
+                        });
+                    }
+                    Err(error) => {
+                        let editor = this
+                            .detail_editor
+                            .as_mut()
+                            .expect("detail editor remains available after failed removal");
+                        editor.remove_confirmation = false;
+                        editor.error = Some(error.into());
+                        editor.error_section = DetailErrorSection::Library;
+                        editor.set_inputs_disabled(false, cx);
+                        this.status = Some("Could not remove the book.".into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn select_range_to(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -821,6 +2157,159 @@ impl LecternView {
             )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the function declares one cohesive appearance-dialog hierarchy"
+    )]
+    fn theme_dialog(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> AlertDialog {
+        let close_entity = cx.entity().downgrade();
+        let cancel_entity = close_entity.clone();
+        let mode_buttons = ColorMode::ALL
+            .into_iter()
+            .map(|mode| {
+                let label = if self.appearance.mode == mode {
+                    format!("✓ {mode}")
+                } else {
+                    mode.to_string()
+                };
+                let button = Button::new(format!("appearance-mode-{}", mode.as_str()), label)
+                    .size(ButtonSize::Small);
+                let button = if self.appearance.mode == mode {
+                    button.variant(ButtonVariant::Primary)
+                } else {
+                    button
+                };
+                button.on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_color_mode(mode, cx);
+                }))
+            })
+            .collect::<Vec<_>>();
+        let accent_choices = AccentColor::ALL
+            .into_iter()
+            .map(|accent| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(theme.spacing.small)
+                    .child(
+                        ColorSwatch::new(
+                            format!("appearance-accent-{}", accent.as_str()),
+                            accent.to_string(),
+                            theme.accent_swatch(accent),
+                        )
+                        .selected(self.appearance.accent == accent)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_accent_color(accent, cx);
+                        })),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme.typography.body_size)
+                            .text_color(theme.surface.muted_foreground)
+                            .child(accent.to_string()),
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        AlertDialog::new(cx)
+            .open(true)
+            .on_open_change(move |open, _, _, cx| {
+                if !open {
+                    _ = close_entity.update(cx, LecternView::close_theme_dialog);
+                }
+            })
+            .on_cancel(move |_, _, cx| {
+                _ = cancel_entity.update(cx, LecternView::close_theme_dialog);
+                true
+            })
+            .backdrop(
+                AlertDialogBackdrop::new()
+                    .absolute()
+                    .inset_0()
+                    .bg(theme.dialog.backdrop),
+            )
+            .popup(
+                AlertDialogPopup::new()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(THEME_DIALOG_WIDTH_PX))
+                            .p(theme.spacing.extra_large)
+                            .rounded(theme.dialog.radius)
+                            .border(theme.border.thin)
+                            .border_color(theme.border.muted)
+                            .bg(theme.surface.background)
+                            .flex()
+                            .flex_col()
+                            .gap(theme.spacing.large)
+                            .child(
+                                AlertDialogTitle::new()
+                                    .text_size(theme.typography.title_size)
+                                    .font_weight(theme.typography.title_weight)
+                                    .child("Appearance"),
+                            )
+                            .child(
+                                AlertDialogDescription::new()
+                                    .text_size(theme.typography.body_size)
+                                    .text_color(theme.surface.muted_foreground)
+                                    .child("Choose Lectern’s main theme and accent color."),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(theme.spacing.small)
+                                    .child(
+                                        div()
+                                            .font_weight(theme.typography.button_weight)
+                                            .child("Theme"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(theme.spacing.small)
+                                            .children(mode_buttons),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(theme.spacing.medium)
+                                    .child(
+                                        div()
+                                            .font_weight(theme.typography.button_weight)
+                                            .child("Accent color"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_start()
+                                            .justify_between()
+                                            .gap(theme.spacing.medium)
+                                            .children(accent_choices),
+                                    ),
+                            )
+                            .child(
+                                div().mt(theme.spacing.small).flex().justify_end().child(
+                                    Button::new("close-theme-dialog", "Done")
+                                        .size(ButtonSize::Small)
+                                        .variant(ButtonVariant::Primary)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.close_theme_dialog(cx);
+                                        })),
+                                ),
+                            ),
+                    ),
+            )
+    }
+
     fn loading_view(theme: &PrimerTheme) -> gpui::Div {
         div()
             .size_full()
@@ -836,41 +2325,94 @@ impl LecternView {
         div()
             .size_full()
             .flex()
-            .items_center()
-            .justify_center()
+            .flex_col()
+            .child(self.top_bar(theme, false, true, cx))
             .child(
-                div()
-                    .w(px(EMPTY_LIBRARY_CONTENT_WIDTH_PX))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .text_center()
-                    .gap(theme.spacing.medium)
-                    .child(
-                        div()
-                            .text_size(theme.typography.title_size)
-                            .font_weight(theme.typography.title_weight)
-                            .line_height(relative(theme.typography.title_line_height))
-                            .child("Your library is empty"),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.surface.muted_foreground)
-                            .text_size(theme.typography.body_size)
-                            .font_weight(theme.typography.body_weight)
-                            .line_height(relative(theme.typography.body_line_height))
-                            .child("Add EPUB or PDF files to start building your library."),
-                    )
-                    .child(div().h(theme.spacing.small))
-                    .child(self.add_books_button("empty-add-books", cx))
-                    .when_some(self.status.clone(), |content, status| {
-                        content.child(
+                div().flex_1().flex().items_center().justify_center().child(
+                    div()
+                        .w(px(EMPTY_LIBRARY_CONTENT_WIDTH_PX))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .text_center()
+                        .gap(theme.spacing.medium)
+                        .child(
+                            div()
+                                .text_size(theme.typography.title_size)
+                                .font_weight(theme.typography.title_weight)
+                                .line_height(relative(theme.typography.title_line_height))
+                                .child("Your library is empty"),
+                        )
+                        .child(
                             div()
                                 .text_color(theme.surface.muted_foreground)
                                 .text_size(theme.typography.body_size)
-                                .child(status),
+                                .font_weight(theme.typography.body_weight)
+                                .line_height(relative(theme.typography.body_line_height))
+                                .child("Add EPUB or PDF files to start building your library."),
                         )
-                    }),
+                        .child(div().h(theme.spacing.small))
+                        .child(self.add_books_button("empty-add-books", cx))
+                        .when_some(self.status.clone(), |content, status| {
+                            content.child(
+                                div()
+                                    .text_color(theme.surface.muted_foreground)
+                                    .text_size(theme.typography.body_size)
+                                    .child(status),
+                            )
+                        }),
+                ),
+            )
+    }
+
+    fn top_bar(
+        &self,
+        theme: &PrimerTheme,
+        selection_active: bool,
+        selection_locked: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .flex_none()
+            .h(px(TOP_BAR_HEIGHT_PX))
+            .flex()
+            .items_center()
+            .justify_between()
+            .px(theme.spacing.large)
+            .py(theme.spacing.small)
+            .border_b(theme.border.thin)
+            .border_color(theme.border.muted)
+            .child(
+                div()
+                    .font_family(theme.typography.wordmark_family)
+                    .text_size(theme.typography.title_size)
+                    .font_weight(theme.typography.wordmark_weight)
+                    .child("Lectern"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(theme.spacing.small)
+                    .child(
+                        IconButton::new(
+                            "open-theme-dialog",
+                            "Choose theme and accent color",
+                            TablerIcon::Palette,
+                        )
+                        .disabled(self.removing)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_theme_dialog(cx);
+                        })),
+                    )
+                    .child(
+                        Button::new("begin-selection", "Select books")
+                            .disabled(selection_active || selection_locked)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.begin_selection(cx);
+                            })),
+                    )
+                    .child(self.add_books_button("library-add-books", cx)),
             )
     }
 
@@ -890,6 +2432,11 @@ impl LecternView {
         );
         let selection_active = self.selection.is_active();
         let selection_locked = self.busy || self.removing || self.selection_pending.is_some();
+        let detail_book = self
+            .detail_editor
+            .as_ref()
+            .map(|editor| editor.original.id)
+            .or(self.detail_loading);
         let cards = self
             .books
             .iter()
@@ -898,7 +2445,8 @@ impl LecternView {
                 book_card(
                     book,
                     index,
-                    self.selection.contains(book.summary.id),
+                    self.selection.contains(book.summary.id)
+                        || detail_book == Some(book.summary.id),
                     selection_active,
                     selection_locked,
                     theme,
@@ -911,37 +2459,7 @@ impl LecternView {
             .size_full()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .flex_none()
-                    .h(px(TOP_BAR_HEIGHT_PX))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .p(theme.spacing.small)
-                    .border_b(theme.border.thin)
-                    .border_color(theme.border.muted)
-                    .child(
-                        div()
-                            .text_size(theme.typography.title_size)
-                            .font_weight(theme.typography.title_weight)
-                            .child("Lectern"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(theme.spacing.small)
-                            .child(
-                                Button::new("begin-selection", "Select books")
-                                    .disabled(selection_active || selection_locked)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.begin_selection(cx);
-                                    })),
-                            )
-                            .child(self.add_books_button("library-add-books", cx)),
-                    ),
-            )
+            .child(self.top_bar(theme, selection_active, selection_locked, cx))
             .when(
                 selection_active || self.selection_pending.is_some(),
                 |content| content.child(self.selection_bar(theme, cx)),
@@ -962,14 +2480,6 @@ impl LecternView {
                             .flex()
                             .flex_col()
                             .gap(theme.spacing.large)
-                            .when_some(self.status.clone(), |content, status| {
-                                content.child(
-                                    div()
-                                        .text_color(theme.surface.muted_foreground)
-                                        .text_size(theme.typography.body_size)
-                                        .child(status),
-                                )
-                            })
                             .child(
                                 div()
                                     .flex()
@@ -994,8 +2504,8 @@ impl LecternView {
                                 },
                             ),
                     )
-                    .when_some(self.detail_book.as_ref(), |body, book| {
-                        body.child(book_detail_panel(book, theme))
+                    .when_some(self.detail_editor.as_ref(), |body, editor| {
+                        body.child(book_detail_panel(editor, theme, cx))
                     }),
             )
             .child(
@@ -1007,9 +2517,21 @@ impl LecternView {
                     .border_color(theme.border.muted)
                     .flex()
                     .items_center()
+                    .justify_between()
                     .text_color(theme.surface.muted_foreground)
                     .text_size(theme.typography.body_size)
-                    .child(book_count),
+                    .child(div().flex_none().child(book_count))
+                    .when_some(self.status.clone(), |bar, status| {
+                        bar.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .ml(theme.spacing.medium)
+                                .truncate()
+                                .text_right()
+                                .child(status),
+                        )
+                    }),
             )
     }
 }
@@ -1030,6 +2552,7 @@ impl Render for LecternView {
         div()
             .size_full()
             .bg(theme.surface.background)
+            .font_family(theme.typography.body_family)
             .text_color(theme.surface.foreground)
             .flex()
             .flex_col()
@@ -1043,6 +2566,9 @@ impl Render for LecternView {
             .child(content)
             .when(self.removal_confirmation.is_some(), |root| {
                 root.child(self.bulk_removal_dialog(&theme, cx))
+            })
+            .when(self.theme_dialog_open, |root| {
+                root.child(self.theme_dialog(&theme, cx))
             })
     }
 }
@@ -1223,6 +2749,11 @@ fn load_library_snapshot(path: &Path) -> Result<LibrarySnapshot, LibraryServiceE
     load_library_snapshot_from(&mut service)
 }
 
+fn load_book(path: &Path, id: BookId) -> Result<Option<Book>, LibraryServiceError> {
+    let mut service = SqliteLibraryService::open(path)?;
+    service.get_book(id)
+}
+
 fn load_library_snapshot_from(
     service: &mut SqliteLibraryService,
 ) -> Result<LibrarySnapshot, LibraryServiceError> {
@@ -1280,6 +2811,115 @@ fn remove_books_and_load_library(
     Ok(RemovalCompletion { result, snapshot })
 }
 
+fn save_book_and_load_library(
+    path: &Path,
+    edit: &lectern_core::organisation::BookEdit,
+) -> Result<(Book, LibrarySnapshot), String> {
+    let mut service = SqliteLibraryService::open(path).map_err(|error| error.to_string())?;
+    service
+        .update_metadata(edit)
+        .map_err(|error| error.to_string())?;
+    let book = service
+        .get_book(edit.id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "The saved book is no longer in the library.".to_owned())?;
+    let snapshot = load_library_snapshot_from(&mut service).map_err(|error| error.to_string())?;
+    Ok((book, snapshot))
+}
+
+struct AssetAttachCompletion {
+    book: Book,
+    snapshot: LibrarySnapshot,
+    message: String,
+}
+
+fn attach_assets_and_load_library(
+    path: &Path,
+    id: BookId,
+    paths: &[PathBuf],
+) -> Result<AssetAttachCompletion, String> {
+    let mut service = SqliteLibraryService::open(path).map_err(|error| error.to_string())?;
+    let mut attached = 0_usize;
+    let mut failures = Vec::new();
+    for asset_path in paths {
+        let Some(format) = book_format_for_path(asset_path) else {
+            failures.push(format!(
+                "{} is not an EPUB or PDF",
+                asset_path.to_string_lossy()
+            ));
+            continue;
+        };
+        match service.attach_asset(id, format, asset_path) {
+            Ok(_) => attached += 1,
+            Err(error) => failures.push(format!("{}: {error}", asset_path.to_string_lossy())),
+        }
+    }
+    let book = service
+        .get_book(id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "The book is no longer in the library.".to_owned())?;
+    let snapshot = load_library_snapshot_from(&mut service).map_err(|error| error.to_string())?;
+    let message = if failures.is_empty() {
+        format!(
+            "Added {attached} book {}.",
+            if attached == 1 { "asset" } else { "assets" }
+        )
+    } else {
+        format!(
+            "Added {attached} book {}; {} failed. {}",
+            if attached == 1 { "asset" } else { "assets" },
+            failures.len(),
+            failures[0]
+        )
+    };
+    Ok(AssetAttachCompletion {
+        book,
+        snapshot,
+        message,
+    })
+}
+
+fn detach_asset_and_load_library(
+    path: &Path,
+    id: BookId,
+    asset: AssetId,
+) -> Result<(Book, LibrarySnapshot), String> {
+    let mut service = SqliteLibraryService::open(path).map_err(|error| error.to_string())?;
+    let detached_book = service
+        .detach_asset(asset)
+        .map_err(|error| error.to_string())?;
+    if detached_book != id {
+        return Err("The selected asset belongs to a different book.".to_owned());
+    }
+    let book = service
+        .get_book(id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "The book is no longer in the library.".to_owned())?;
+    let snapshot = load_library_snapshot_from(&mut service).map_err(|error| error.to_string())?;
+    Ok((book, snapshot))
+}
+
+fn remove_book_and_load_library(
+    path: &Path,
+    id: BookId,
+) -> Result<(bool, LibrarySnapshot), String> {
+    let mut service = SqliteLibraryService::open(path).map_err(|error| error.to_string())?;
+    let removed = service.remove_book(id).map_err(|error| error.to_string())?;
+    let snapshot = load_library_snapshot_from(&mut service).map_err(|error| error.to_string())?;
+    Ok((removed, snapshot))
+}
+
+fn book_format_for_path(path: &Path) -> Option<BookFormat> {
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("epub") {
+        Some(BookFormat::Epub)
+    } else if extension.eq_ignore_ascii_case("pdf") {
+        Some(BookFormat::Pdf)
+    } else {
+        None
+    }
+}
+
 fn import_status(summary: &ImportSummary) -> Option<SharedString> {
     if summary.discovered == 0 {
         return Some("No EPUB or PDF files were found.".into());
@@ -1300,57 +2940,32 @@ fn import_status(summary: &ImportSummary) -> Option<SharedString> {
     )
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one declarative detail skeleton keeps benchmark coverage visibly representative"
-)]
-fn book_detail_panel(book: &Book, theme: &PrimerTheme) -> gpui::AnyElement {
-    let contributor_rows = book.contributors.iter().map(|credit| {
-        detail_summary_row(
-            credit.role.to_string(),
-            credit.contributor.display_name.clone(),
-            theme,
-        )
-    });
-    let tag_rows = book.tags.iter().map(|tag| {
-        div()
-            .px(theme.spacing.small)
-            .py(theme.spacing.small)
-            .rounded(theme.button.radius)
-            .border(theme.border.thin)
-            .border_color(theme.border.muted)
-            .child(tag.name.clone())
-    });
-    let asset_rows = book.assets.iter().map(|asset| {
-        div()
-            .py(theme.spacing.small)
-            .border_b(theme.border.thin)
-            .border_color(theme.border.muted)
-            .flex()
-            .flex_col()
-            .gap(theme.spacing.small)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(format!(
-                        "{} · {} · {}",
-                        asset.format, asset.storage, asset.health
-                    ))
-                    .child(Button::new(
-                        format!("detail-open-asset-{}", asset.id.value()),
-                        "Open",
-                    )),
-            )
-            .child(
-                div()
-                    .truncate()
-                    .text_color(theme.surface.muted_foreground)
-                    .child(asset.path.to_string_lossy().into_owned()),
-            )
-    });
+const DETAIL_INFORMATION_ITEM: usize = 0;
+const DETAIL_FILES_ITEM: usize = 1;
+const DETAIL_SERIES_ITEM: usize = 2;
+const DETAIL_CONTRIBUTOR_START_ITEM: usize = 3;
 
+const fn detail_contributor_footer_item(contributor_count: usize) -> usize {
+    DETAIL_CONTRIBUTOR_START_ITEM + contributor_count
+}
+
+const fn detail_tags_item_index(contributor_count: usize) -> usize {
+    detail_contributor_footer_item(contributor_count) + 1
+}
+
+const fn detail_library_item_index(contributor_count: usize) -> usize {
+    detail_tags_item_index(contributor_count) + 1
+}
+
+const fn detail_item_count(contributor_count: usize) -> usize {
+    detail_library_item_index(contributor_count) + 1
+}
+
+fn book_detail_panel(
+    editor: &BookDetailEditor,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
     div()
         .id("book-detail-panel")
         .w(px(BOOK_DETAIL_PANEL_WIDTH_PX))
@@ -1364,140 +2979,1143 @@ fn book_detail_panel(book: &Book, theme: &PrimerTheme) -> gpui::AnyElement {
         .child(
             div()
                 .flex_none()
-                .p(theme.spacing.extra_large)
+                .h(px(TOP_BAR_HEIGHT_PX))
+                .px(theme.spacing.large)
+                .py(theme.spacing.small)
                 .border_b(theme.border.thin)
                 .border_color(theme.border.muted)
                 .flex()
                 .items_center()
                 .justify_between()
+                .gap(theme.spacing.small)
                 .child(
                     div()
+                        .flex_none()
                         .text_size(theme.typography.title_size)
                         .font_weight(theme.typography.title_weight)
                         .child("Book details"),
                 )
-                .child(Button::new("close-book-detail", "Close")),
+                .child(
+                    Button::new("close-book-detail", "Close")
+                        .disabled(editor.operation != DetailOperation::Idle)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_book_detail(cx);
+                        })),
+                ),
         )
         .child(
+            list(
+                editor.list_state.clone(),
+                cx.processor(LecternView::render_book_detail_item),
+            )
+            .flex_1()
+            .min_h_0(),
+        )
+        .into_any_element()
+}
+
+impl LecternView {
+    fn ensure_book_detail_item_inputs(
+        &mut self,
+        item: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = &self.detail_editor else {
+            return;
+        };
+        let contributor_count = editor.contributors.len();
+        let disabled = editor.operation != DetailOperation::Idle;
+
+        if item == DETAIL_INFORMATION_ITEM
+            && (editor.publisher.is_none() || editor.description.is_none())
+        {
+            let publisher = editor.original.publisher.clone().unwrap_or_default();
+            let description = editor.original.description.clone().unwrap_or_default();
+            let publisher = metadata_input(window, cx, "Publisher", publisher);
+            let description = metadata_textarea(window, cx, "Add a description", description);
+            if disabled {
+                publisher.update(cx, |state, cx| state.set_disabled(true, cx));
+                description.update(cx, |state, cx| state.set_disabled(true, cx));
+            }
+            if let Some(editor) = &mut self.detail_editor {
+                editor.publisher = Some(publisher);
+                editor.description = Some(description);
+            }
+        } else if item == DETAIL_SERIES_ITEM && editor.series_input.is_none() {
+            let index = editor.curation.series.index.clone();
+            let series_input = series_search_input(window, cx);
+            let index = series_index_input(window, cx, index);
+            if disabled {
+                series_input.update(cx, |state, cx| state.set_disabled(true, cx));
+            }
+            let index_disabled = disabled || editor.curation.series.name.trim().is_empty();
+            index.update(cx, |state, cx| state.set_disabled(index_disabled, cx));
+            if let Some(editor) = &mut self.detail_editor {
+                editor.series_input = Some(series_input);
+                editor.series_index = Some(index);
+            }
+        } else if item == detail_tags_item_index(contributor_count) && editor.tag_input.is_none() {
+            let input = tag_search_input(window, cx);
+            if disabled {
+                input.update(cx, |state, cx| state.set_disabled(true, cx));
+            }
+            if let Some(editor) = &mut self.detail_editor {
+                editor.tag_input = Some(input);
+            }
+        }
+    }
+
+    fn render_book_detail_item(
+        &mut self,
+        item: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        self.ensure_book_detail_item_inputs(item, window, cx);
+        let theme = PrimerTheme::current(cx);
+        let Some(editor) = &self.detail_editor else {
+            return div().into_any_element();
+        };
+        let contributor_count = editor.contributors.len();
+        let contributor_footer = detail_contributor_footer_item(contributor_count);
+        let tags = detail_tags_item_index(contributor_count);
+        let library = detail_library_item_index(contributor_count);
+        let editing_busy = editor.operation != DetailOperation::Idle;
+
+        let content = if item == DETAIL_INFORMATION_ITEM {
+            detail_information_item(editor, &theme, cx)
+        } else if item == DETAIL_FILES_ITEM {
+            detail_files_item(editor, &theme, cx)
+        } else if item == DETAIL_SERIES_ITEM {
+            detail_series_item(editor, &theme, cx)
+        } else if (DETAIL_CONTRIBUTOR_START_ITEM..contributor_footer).contains(&item) {
+            let index = item - DETAIL_CONTRIBUTOR_START_ITEM;
+            let row = contributor_field_row(
+                &editor.contributors[index],
+                ContributorRowPresentation {
+                    index,
+                    contributor_count,
+                    editing_busy,
+                    role_picker_open: editor.role_picker == Some(editor.contributors[index].row_id),
+                },
+                &theme,
+                cx,
+            );
             div()
-                .id("book-detail-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .p(theme.spacing.extra_large)
+                .when(index == 0, |item| {
+                    item.child(detail_section_label("Contributors", &theme))
+                })
+                .child(row)
+                .into_any_element()
+        } else if item == contributor_footer {
+            detail_contributor_footer(editor, &theme, cx)
+        } else if item == tags {
+            detail_tags_item(editor, &theme, cx)
+        } else if item == library {
+            detail_library_item(editor, &theme, cx)
+        } else {
+            div().into_any_element()
+        };
+
+        let starts_section = matches!(
+            item,
+            DETAIL_INFORMATION_ITEM | DETAIL_FILES_ITEM | DETAIL_SERIES_ITEM
+        ) || item == DETAIL_CONTRIBUTOR_START_ITEM
+            || item == tags
+            || item == library;
+        let ends_section = matches!(
+            item,
+            DETAIL_INFORMATION_ITEM | DETAIL_FILES_ITEM | DETAIL_SERIES_ITEM
+        ) || item == contributor_footer
+            || item == tags;
+
+        div()
+            .px(theme.spacing.large)
+            .pt(if starts_section {
+                theme.spacing.large
+            } else {
+                rems(0.)
+            })
+            .pb(if ends_section || item == library {
+                theme.spacing.large
+            } else {
+                rems(0.)
+            })
+            .when(ends_section, |section| {
+                section
+                    .border_b(theme.border.thin)
+                    .border_color(theme.border.muted)
+            })
+            .child(content)
+            .into_any_element()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LanguageOption {
+    code: &'static str,
+    name: &'static str,
+}
+
+fn language_options() -> &'static [LanguageOption] {
+    static LANGUAGES: OnceLock<Vec<LanguageOption>> = OnceLock::new();
+    LANGUAGES.get_or_init(|| {
+        let mut languages = isolang::languages()
+            .filter_map(|language| {
+                Some(LanguageOption {
+                    code: language.to_639_1()?,
+                    name: language.to_name(),
+                })
+            })
+            .collect::<Vec<_>>();
+        languages.sort_unstable_by_key(|language| language.name);
+        languages
+    })
+}
+
+fn detail_language_menu(
+    editor: &BookDetailEditor,
+    _theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let language_label = if editor.language.is_empty() {
+        "Select language".to_owned()
+    } else if let Some(language) = language_options()
+        .iter()
+        .find(|language| language.code == editor.language)
+    {
+        format!("{} — {}", language.name, language.code)
+    } else {
+        editor.language.clone()
+    };
+    let current = editor.language.clone();
+    let options = std::iter::once(
+        ActionListItem::new("language-unspecified", "Not specified")
+            .selected(current.is_empty())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.set_detail_language("", cx);
+            })),
+    )
+    .chain(language_options().iter().map(|language| {
+        let code = language.code;
+        ActionListItem::new(
+            format!("language-{code}"),
+            format!("{} — {code}", language.name),
+        )
+        .selected(current == code)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.set_detail_language(code, cx);
+        }))
+    }));
+    ActionMenu::new(
+        "detail-language-menu",
+        Button::new("detail-language-trigger", format!("{language_label} ▾"))
+            .full_width()
+            .disabled(editor.operation != DetailOperation::Idle),
+        div().flex().flex_col().children(options),
+    )
+    .width(rems(17.))
+    .open(editor.language_menu_open)
+    .on_open_change(cx.listener(|this, open, _, cx| {
+        this.set_language_menu_open(*open, cx);
+    }))
+    .into_any_element()
+}
+
+fn tag_color(theme: &PrimerTheme, color: TagColor) -> gpui::Hsla {
+    match color {
+        TagColor::Slate => theme.tag_palette.slate,
+        TagColor::Coral => theme.tag_palette.coral,
+        TagColor::Amber => theme.tag_palette.amber,
+        TagColor::Mint => theme.tag_palette.mint,
+        TagColor::Azure => theme.tag_palette.azure,
+        TagColor::Lilac => theme.tag_palette.lilac,
+    }
+}
+
+fn metadata_error_section(error: &str) -> DetailErrorSection {
+    let error = error.to_ascii_lowercase();
+    if error.contains("contributor") {
+        DetailErrorSection::Contributors
+    } else if error.contains("series") || error.contains("book number") {
+        DetailErrorSection::Series
+    } else if error.contains("tag") {
+        DetailErrorSection::Tags
+    } else {
+        DetailErrorSection::Information
+    }
+}
+
+fn detail_error(editor: &BookDetailEditor, section: DetailErrorSection) -> Option<SharedString> {
+    (editor.error_section == section)
+        .then(|| editor.error.clone())
+        .flatten()
+}
+
+fn detail_error_text(error: SharedString, theme: &PrimerTheme) -> gpui::Div {
+    div()
+        .text_color(theme.button.danger.foreground)
+        .child(error)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the function declares one cohesive metadata-section hierarchy"
+)]
+fn detail_information_item(
+    editor: &BookDetailEditor,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let editing_busy = editor.operation != DetailOperation::Idle;
+    div()
+        .flex()
+        .flex_col()
+        .gap(theme.spacing.large)
+        .child(
+            div()
                 .flex()
-                .flex_col()
-                .gap(theme.spacing.extra_large)
+                .items_center()
+                .justify_between()
+                .gap(theme.spacing.medium)
+                .child(detail_section_heading("Book information", theme))
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap(theme.spacing.small)
-                        .child(
-                            Button::new("save-book-detail", "Save").variant(ButtonVariant::Primary),
-                        )
-                        .child(Button::new("reset-book-detail", "Reset")),
-                )
-                .child(detail_section("Title", book.title.clone(), theme))
-                .child(
-                    detail_section_container("Contributors", theme)
-                        .children(contributor_rows)
-                        .child(Button::new("add-book-contributor", "Add contributor")),
-                )
-                .child(detail_section(
-                    "Series",
-                    book.series_membership.as_ref().map_or_else(
-                        || "Not in a series".to_owned(),
-                        |membership| {
-                            membership.index.map_or_else(
-                                || membership.series.name.clone(),
-                                |index| format!("{} · Book {index}", membership.series.name),
+                        .when(editor.dirty, |row| {
+                            row.child(
+                                div()
+                                    .text_color(theme.surface.muted_foreground)
+                                    .child("Unsaved"),
                             )
-                        },
-                    ),
-                    theme,
-                ))
-                .child(
-                    detail_section_container("Tags", theme).child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap(theme.spacing.small)
-                            .children(tag_rows),
-                    ),
-                )
-                .child(detail_section(
-                    "Publisher",
-                    book.publisher
-                        .clone()
-                        .unwrap_or_else(|| "Not set".to_owned()),
-                    theme,
-                ))
-                .child(detail_section(
-                    "Language",
-                    book.language
-                        .clone()
-                        .unwrap_or_else(|| "Not set".to_owned()),
-                    theme,
-                ))
-                .child(detail_section(
-                    "Description",
-                    book.description
-                        .clone()
-                        .unwrap_or_else(|| "Not set".to_owned()),
-                    theme,
-                ))
-                .child(
-                    detail_section_container("Files", theme)
-                        .children(asset_rows)
-                        .child(Button::new("add-book-asset", "Add EPUB or PDF")),
-                )
-                .child(
-                    detail_section_container("Library", theme)
-                        .child(div().text_color(theme.surface.muted_foreground).child(
-                            "Remove this entry and its cached cover. Book files stay on disk.",
-                        ))
+                        })
                         .child(
-                            Button::new("remove-detail-book", "Remove from library")
-                                .variant(ButtonVariant::Danger),
+                            Button::new(
+                                "save-book-detail",
+                                if editor.operation == DetailOperation::Saving {
+                                    "Saving…"
+                                } else {
+                                    "Save"
+                                },
+                            )
+                            .size(ButtonSize::Small)
+                            .variant(ButtonVariant::Primary)
+                            .disabled(
+                                !editor.dirty
+                                    || editing_busy
+                                    || matches!(
+                                        editor.series_index_availability,
+                                        SeriesIndexAvailability::Checking
+                                            | SeriesIndexAvailability::Conflict
+                                    ),
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.save_book_detail(window, cx);
+                                },
+                            )),
+                        )
+                        .child(
+                            Button::new("reset-book-detail", "Reset")
+                                .size(ButtonSize::Small)
+                                .disabled(!editor.dirty || editing_busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.reset_book_detail(window, cx);
+                                })),
                         ),
+                ),
+        )
+        .child(detail_field_container("Title", theme).child(TextInput::new(
+            "detail-title",
+            "Book title",
+            &editor.title,
+        )))
+        .child(
+            div()
+                .flex()
+                .gap(theme.spacing.medium)
+                .child(
+                    detail_field_container("Publisher", theme)
+                        .flex_1()
+                        .min_w_0()
+                        .child(TextInput::new(
+                            "detail-publisher",
+                            "Publisher",
+                            editor
+                                .publisher
+                                .as_ref()
+                                .expect("rendered publisher is initialized"),
+                        )),
+                )
+                .child(
+                    detail_field_container("Language", theme)
+                        .flex_1()
+                        .min_w_0()
+                        .child(detail_language_menu(editor, theme, cx)),
+                ),
+        )
+        .child(
+            detail_field_container("Description", theme).child(
+                TextArea::new(
+                    "detail-description",
+                    "Book description",
+                    editor
+                        .description
+                        .as_ref()
+                        .expect("rendered description is initialized"),
+                )
+                .height(rems(6.)),
+            ),
+        )
+        .when_some(
+            detail_error(editor, DetailErrorSection::Information),
+            |content, error| content.child(detail_error_text(error, theme)),
+        )
+        .into_any_element()
+}
+
+fn detail_contributor_footer(
+    editor: &BookDetailEditor,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    div()
+        .pt(theme.spacing.small)
+        .flex()
+        .flex_col()
+        .gap(theme.spacing.small)
+        .when(editor.contributors.is_empty(), |item| {
+            item.child(detail_section_label("Contributors", theme))
+                .child(
+                    div()
+                        .text_color(theme.surface.muted_foreground)
+                        .child("No contributors assigned."),
+                )
+        })
+        .when_some(
+            detail_error(editor, DetailErrorSection::Contributors),
+            |content, error| content.child(detail_error_text(error, theme)),
+        )
+        .child(
+            Button::new("add-book-contributor", "Add contributor")
+                .size(ButtonSize::Small)
+                .disabled(editor.operation != DetailOperation::Idle)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.add_detail_contributor(window, cx);
+                })),
+        )
+        .into_any_element()
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the function declares one cohesive searchable-series hierarchy"
+)]
+fn detail_series_item(
+    editor: &BookDetailEditor,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let editing_busy = editor.operation != DetailOperation::Idle;
+    let query = editor
+        .series_input
+        .as_ref()
+        .expect("rendered series input is initialized")
+        .read(cx)
+        .value()
+        .to_string();
+    let selected_key = (!editor.curation.series.name.trim().is_empty())
+        .then(|| identity_key(&editor.curation.series.name));
+    let selected_series = selected_key.as_ref().map(|_| {
+        EntityChip::new(
+            "detail-selected-series",
+            editor.curation.series.name.clone(),
+        )
+        .disabled(editing_busy)
+        .on_remove(cx.listener(|this, _, window, cx| {
+            this.remove_detail_series(window, cx);
+        }))
+    });
+    let selected_item = selected_key.as_ref().map(|_| {
+        let name = editor.curation.series.name.clone();
+        if let Some(id) = editor.curation.series.existing_id {
+            let series = Series {
+                id,
+                name: name.clone(),
+            };
+            ActionListItem::new("selected-detail-series", name)
+                .selected(true)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.select_existing_detail_series(&series, window, cx);
+                }))
+        } else {
+            let action_name = name.clone();
+            ActionListItem::new("selected-detail-series", name)
+                .selected(true)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.create_detail_series(action_name.clone(), window, cx);
+                }))
+        }
+    });
+    let suggestions = editor
+        .series_suggestions
+        .iter()
+        .filter(|usage| {
+            editor.curation.series.existing_id != Some(usage.series.id)
+                && selected_key
+                    .as_ref()
+                    .is_none_or(|key| identity_key(&usage.series.name) != *key)
+        })
+        .map(|usage| {
+            let series = usage.series.clone();
+            ActionListItem::new(
+                format!("series-suggestion-{}", series.id.value()),
+                series.name.clone(),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_existing_detail_series(&series, window, cx);
+            }))
+        })
+        .collect::<Vec<_>>();
+    let has_suggestions = selected_item.is_some() || !suggestions.is_empty();
+    let normalized_query = normalize_name(NameKind::Series, &query).ok();
+    let exact_match = normalized_query.as_ref().is_some_and(|query| {
+        let key = identity_key(query);
+        selected_key.as_ref() == Some(&key)
+            || editor
+                .series_suggestions
+                .iter()
+                .any(|usage| identity_key(&usage.series.name) == key)
+    });
+    let create_name = normalized_query.filter(|_| !exact_match);
+    let menu_content = div()
+        .flex()
+        .flex_col()
+        .gap(theme.spacing.small)
+        .child(TextInput::new(
+            "detail-series-input",
+            "Add or find a series",
+            editor
+                .series_input
+                .as_ref()
+                .expect("rendered series input is initialized"),
+        ))
+        .when(editor.series_suggestions_loading, |content| {
+            content.child(
+                div()
+                    .px(theme.spacing.medium)
+                    .py(theme.spacing.small)
+                    .text_color(theme.surface.muted_foreground)
+                    .child("Finding series…"),
+            )
+        })
+        .when(
+            !editor.series_suggestions_loading && !has_suggestions,
+            |content| {
+                content.child(
+                    div()
+                        .px(theme.spacing.medium)
+                        .py(theme.spacing.small)
+                        .text_color(theme.surface.muted_foreground)
+                        .child(if query.trim().is_empty() {
+                            "No series yet. Start typing to create one."
+                        } else {
+                            "No existing series found."
+                        }),
+                )
+            },
+        )
+        .when_some(selected_item, ParentElement::child)
+        .when(!editor.series_suggestions_loading, |content| {
+            content.children(suggestions)
+        })
+        .when_some(create_name, |content, name| {
+            let action_name = name.clone();
+            content.child(
+                ActionListItem::new(
+                    "create-detail-series",
+                    format!("+  Create new series: “{name}”"),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.create_detail_series(action_name.clone(), window, cx);
+                })),
+            )
+        });
+
+    detail_section_container("Series", theme)
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(theme.spacing.small)
+                .items_center()
+                .when_some(selected_series, ParentElement::child)
+                .child(
+                    ActionMenu::new(
+                        "detail-series-menu",
+                        Button::new("open-detail-series-menu", "+ Series")
+                            .size(ButtonSize::Small)
+                            .disabled(editing_busy),
+                        menu_content,
+                    )
+                    .width(rems(21.))
+                    .open(editor.series_menu_open)
+                    .on_open_change(cx.listener(|this, open, _, cx| {
+                        this.set_series_menu_open(*open, cx);
+                    })),
+                ),
+        )
+        .child(
+            detail_field_container("Book number", theme).child(TextInput::new(
+                "detail-series-index",
+                "Book number within series",
+                editor
+                    .series_index
+                    .as_ref()
+                    .expect("rendered series index is initialized"),
+            )),
+        )
+        .when(
+            editor.series_index_availability == SeriesIndexAvailability::Checking,
+            |content| {
+                content.child(
+                    div()
+                        .text_color(theme.surface.muted_foreground)
+                        .child("Checking whether this number is available…"),
+                )
+            },
+        )
+        .when(
+            editor.series_index_availability == SeriesIndexAvailability::Conflict,
+            |content| {
+                content.child(
+                    div()
+                        .text_color(theme.button.danger.foreground)
+                        .child("That book number is already used in this series."),
+                )
+            },
+        )
+        .when_some(
+            detail_error(editor, DetailErrorSection::Series),
+            |content, error| content.child(detail_error_text(error, theme)),
+        )
+        .into_any_element()
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the function declares one cohesive searchable-tag hierarchy"
+)]
+fn detail_tags_item(
+    editor: &BookDetailEditor,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let editing_busy = editor.operation != DetailOperation::Idle;
+    let tags = editor.curation.tags.iter().enumerate().map(|(index, tag)| {
+        TagChip::new(
+            format!("detail-tag-{index}"),
+            tag.name.clone(),
+            tag_color(theme, tag.color),
+        )
+        .disabled(editing_busy)
+        .on_remove(cx.listener(move |this, _, _, cx| {
+            this.remove_detail_tag(index, cx);
+        }))
+    });
+    let menu_content = if let Some(name) = &editor.tag_creation_name {
+        let colors = TagColor::ALL.into_iter().map(|color| {
+            ActionListItem::new(
+                format!("create-tag-color-{}", color.as_str()),
+                color.to_string(),
+            )
+            .leading_color(tag_color(theme, color))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.create_detail_tag(color, window, cx);
+            }))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(theme.spacing.small)
+            .child(
+                div()
+                    .px(theme.spacing.medium)
+                    .py(theme.spacing.small)
+                    .pb(theme.spacing.medium)
+                    .border_b(theme.border.thin)
+                    .border_color(theme.border.muted)
+                    .text_color(theme.surface.muted_foreground)
+                    .child(format!("Create “{name}”")),
+            )
+            .child(
+                div()
+                    .px(theme.spacing.medium)
+                    .font_weight(theme.typography.button_weight)
+                    .child("Pick a color"),
+            )
+            .children(colors)
+            .into_any_element()
+    } else {
+        let query = editor
+            .tag_input
+            .as_ref()
+            .expect("rendered tag input is initialized")
+            .read(cx)
+            .value()
+            .to_string();
+        let selected_ids = editor
+            .curation
+            .existing_tag_ids()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let selected_keys = editor
+            .curation
+            .tags
+            .iter()
+            .map(|tag| identity_key(&tag.name))
+            .collect::<HashSet<_>>();
+        let selected_tags = editor
+            .curation
+            .tags
+            .iter()
+            .enumerate()
+            .map(|(index, draft)| {
+                let item = ActionListItem::new(format!("selected-tag-{index}"), draft.name.clone())
+                    .leading_color(tag_color(theme, draft.color))
+                    .selected(true);
+                if let Some(id) = draft.existing_id {
+                    let tag = Tag {
+                        id,
+                        name: draft.name.clone(),
+                        color: draft.color,
+                    };
+                    item.on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_existing_detail_tag(&tag, cx);
+                    }))
+                } else {
+                    item.on_click(cx.listener(move |this, _, _, cx| {
+                        this.remove_detail_tag(index, cx);
+                    }))
+                }
+            })
+            .collect::<Vec<_>>();
+        let suggestions = editor
+            .tag_suggestions
+            .iter()
+            .filter(|usage| !selected_ids.contains(&usage.tag.id))
+            .filter(|usage| !selected_keys.contains(&identity_key(&usage.tag.name)))
+            .map(|usage| {
+                let tag = usage.tag.clone();
+                ActionListItem::new(
+                    format!("tag-suggestion-{}", tag.id.value()),
+                    tag.name.clone(),
+                )
+                .leading_color(tag_color(theme, tag.color))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_existing_detail_tag(&tag, cx);
+                }))
+            })
+            .collect::<Vec<_>>();
+        let has_suggestions = !selected_tags.is_empty() || !suggestions.is_empty();
+        let normalized_query = normalize_name(NameKind::Tag, &query).ok();
+        let exact_match = normalized_query.as_ref().is_some_and(|query| {
+            let key = identity_key(query);
+            editor
+                .curation
+                .tags
+                .iter()
+                .any(|tag| identity_key(&tag.name) == key)
+                || editor
+                    .tag_suggestions
+                    .iter()
+                    .any(|usage| identity_key(&usage.tag.name) == key)
+        });
+        let create_name = normalized_query.filter(|_| !exact_match);
+        div()
+            .flex()
+            .flex_col()
+            .gap(theme.spacing.small)
+            .child(TextInput::new(
+                "detail-tag-input",
+                "Add or find a tag",
+                editor
+                    .tag_input
+                    .as_ref()
+                    .expect("rendered tag input is initialized"),
+            ))
+            .when(editor.tag_suggestions_loading, |content| {
+                content.child(
+                    div()
+                        .px(theme.spacing.medium)
+                        .py(theme.spacing.small)
+                        .text_color(theme.surface.muted_foreground)
+                        .child("Finding tags…"),
+                )
+            })
+            .when(
+                !editor.tag_suggestions_loading && !has_suggestions,
+                |content| {
+                    content.child(
+                        div()
+                            .px(theme.spacing.medium)
+                            .py(theme.spacing.small)
+                            .text_color(theme.surface.muted_foreground)
+                            .child(if query.trim().is_empty() {
+                                "Start typing to create a tag."
+                            } else {
+                                "No existing tags found."
+                            }),
+                    )
+                },
+            )
+            .when(!editor.tag_suggestions_loading, |content| {
+                content.children(selected_tags).children(suggestions)
+            })
+            .when_some(create_name, |content, name| {
+                let action_name = name.clone();
+                content.child(
+                    ActionListItem::new(
+                        "create-detail-tag",
+                        format!("+  Create new tag: “{name}”"),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.begin_detail_tag_creation(&action_name, cx);
+                    })),
+                )
+            })
+            .into_any_element()
+    };
+    detail_section_container("Tags", theme)
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(theme.spacing.small)
+                .items_center()
+                .children(tags)
+                .child(
+                    ActionMenu::new(
+                        "detail-tag-menu",
+                        Button::new("open-detail-tag-menu", "+ Tag")
+                            .size(ButtonSize::Small)
+                            .disabled(editing_busy),
+                        menu_content,
+                    )
+                    .width(rems(21.))
+                    .open(editor.tag_menu_open)
+                    .on_open_change(cx.listener(|this, open, _, cx| {
+                        this.set_tag_menu_open(*open, cx);
+                    })),
+                ),
+        )
+        .when_some(
+            detail_error(editor, DetailErrorSection::Tags),
+            |content, error| content.child(detail_error_text(error, theme)),
+        )
+        .into_any_element()
+}
+
+fn detail_files_item(
+    editor: &BookDetailEditor,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let can_detach = editor.original.assets.len() > 1
+        && !editor.dirty
+        && editor.operation == DetailOperation::Idle;
+    let rows = editor
+        .original
+        .assets
+        .iter()
+        .map(|asset| asset_row(asset, can_detach, theme, cx));
+    detail_section_container("Files", theme)
+        .children(rows)
+        .child(
+            Button::new(
+                "add-book-asset",
+                if editor.operation == DetailOperation::Assets {
+                    "Updating assets…"
+                } else {
+                    "Add EPUB or PDF"
+                },
+            )
+            .size(ButtonSize::Small)
+            .disabled(editor.operation != DetailOperation::Idle || editor.dirty)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.prompt_for_detail_assets(window, cx);
+            })),
+        )
+        .when(editor.dirty, |section| {
+            section.child(
+                div()
+                    .text_color(theme.surface.muted_foreground)
+                    .child("Save or reset metadata before changing files."),
+            )
+        })
+        .when_some(
+            detail_error(editor, DetailErrorSection::Files),
+            |content, error| content.child(detail_error_text(error, theme)),
+        )
+        .into_any_element()
+}
+
+fn detail_library_item(
+    editor: &BookDetailEditor,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    detail_section_container("Library", theme)
+        .child(
+            div()
+                .text_color(theme.surface.muted_foreground)
+                .child("Remove this entry and its cached cover. Book files stay on disk."),
+        )
+        .when(!editor.remove_confirmation, |section| {
+            section.child(
+                Button::new("remove-detail-book", "Remove from library")
+                    .size(ButtonSize::Small)
+                    .variant(ButtonVariant::Danger)
+                    .disabled(editor.operation != DetailOperation::Idle)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.request_detail_removal(cx);
+                    })),
+            )
+        })
+        .when(editor.remove_confirmation, |section| {
+            section
+                .child(
+                    div()
+                        .font_weight(theme.typography.button_weight)
+                        .child("Remove this book from the library?"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(theme.spacing.small)
+                        .child(
+                            Button::new("cancel-detail-removal", "Cancel")
+                                .size(ButtonSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cancel_detail_removal(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("confirm-detail-removal", "Remove book")
+                                .size(ButtonSize::Small)
+                                .variant(ButtonVariant::Danger)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.start_detail_removal(window, cx);
+                                })),
+                        ),
+                )
+        })
+        .when_some(
+            detail_error(editor, DetailErrorSection::Library),
+            |content, error| content.child(detail_error_text(error, theme)),
+        )
+        .into_any_element()
+}
+
+fn detail_section_label(label: &'static str, theme: &PrimerTheme) -> gpui::Div {
+    div()
+        .mb(theme.spacing.small)
+        .child(detail_section_heading(label, theme))
+}
+
+fn detail_section_heading(label: &'static str, theme: &PrimerTheme) -> gpui::Div {
+    div()
+        .font_weight(theme.typography.button_weight)
+        .child(label)
+}
+
+#[derive(Clone, Copy)]
+struct ContributorRowPresentation {
+    index: usize,
+    contributor_count: usize,
+    editing_busy: bool,
+    role_picker_open: bool,
+}
+
+fn contributor_role_picker(
+    field: &ContributorField,
+    editing_busy: bool,
+    open: bool,
+    _theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let row_id = field.row_id;
+    let role_options = ContributorRole::ALL.into_iter().map(|role| {
+        ActionListItem::new(
+            format!("contributor-{row_id}-role-{}", role.as_str()),
+            role.to_string(),
+        )
+        .selected(role == field.role)
+        .disabled(editing_busy)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.set_contributor_role(row_id, role, cx);
+        }))
+    });
+    ActionMenu::new(
+        format!("contributor-{row_id}-role-menu"),
+        Button::new(
+            format!("contributor-{row_id}-role-picker"),
+            format!("{} ▾", field.role),
+        )
+        .size(ButtonSize::Medium)
+        .disabled(editing_busy),
+        div().flex().flex_col().children(role_options),
+    )
+    .width(rems(10.))
+    .open(open)
+    .on_open_change(cx.listener(move |this, open, _, cx| {
+        this.set_contributor_role_picker_open(row_id, *open, cx);
+    }))
+    .into_any_element()
+}
+
+fn contributor_field_row(
+    field: &ContributorField,
+    presentation: ContributorRowPresentation,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let row_id = field.row_id;
+    let index = presentation.index;
+    let editing_busy = presentation.editing_busy;
+    div()
+        .py(theme.spacing.small)
+        .border_b(theme.border.thin)
+        .border_color(theme.border.muted)
+        .flex()
+        .flex_col()
+        .gap(theme.spacing.small)
+        .child(
+            div()
+                .flex()
+                .gap(theme.spacing.small)
+                .child(div().flex_1().min_w_0().child(TextInput::new(
+                    format!("contributor-{row_id}-name"),
+                    format!("Contributor {} name", index + 1),
+                    &field.name,
+                )))
+                .child(contributor_role_picker(
+                    field,
+                    editing_busy,
+                    presentation.role_picker_open,
+                    theme,
+                    cx,
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .justify_end()
+                .gap(theme.spacing.small)
+                .child(
+                    IconButton::new(
+                        format!("contributor-{row_id}-up"),
+                        "Move contributor up",
+                        TablerIcon::ChevronUp,
+                    )
+                    .size(ButtonSize::Small)
+                    .disabled(editing_busy || index == 0)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.move_detail_contributor(row_id, -1, cx);
+                    })),
+                )
+                .child(
+                    IconButton::new(
+                        format!("contributor-{row_id}-down"),
+                        "Move contributor down",
+                        TablerIcon::ChevronDown,
+                    )
+                    .size(ButtonSize::Small)
+                    .disabled(editing_busy || index + 1 >= presentation.contributor_count)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.move_detail_contributor(row_id, 1, cx);
+                    })),
+                )
+                .child(
+                    Button::new(format!("contributor-{row_id}-remove"), "Remove")
+                        .size(ButtonSize::Small)
+                        .disabled(editing_busy)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.remove_detail_contributor(row_id, cx);
+                        })),
                 ),
         )
         .into_any_element()
 }
 
-fn detail_section(
-    label: &'static str,
-    value: impl Into<SharedString>,
-    theme: &PrimerTheme,
-) -> gpui::Div {
-    detail_section_container(label, theme).child(value.into())
+fn detail_section_container(label: &'static str, theme: &PrimerTheme) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(theme.spacing.medium)
+        .child(detail_section_heading(label, theme))
 }
 
-fn detail_section_container(label: &'static str, theme: &PrimerTheme) -> gpui::Div {
+fn detail_field_container(label: &'static str, theme: &PrimerTheme) -> gpui::Div {
     div().flex().flex_col().gap(theme.spacing.small).child(
         div()
-            .font_weight(theme.typography.button_weight)
+            .text_color(theme.surface.muted_foreground)
             .child(label),
     )
 }
 
-fn detail_summary_row(
-    label: impl Into<SharedString>,
-    value: impl Into<SharedString>,
+fn asset_row(
+    asset: &BookAsset,
+    can_detach: bool,
     theme: &PrimerTheme,
-) -> gpui::Div {
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let asset_id = asset.id;
+    let path = asset.path.clone();
     div()
+        .py(theme.spacing.small)
+        .border_b(theme.border.thin)
+        .border_color(theme.border.muted)
         .flex()
-        .items_center()
-        .justify_between()
-        .gap(theme.spacing.medium)
+        .flex_col()
+        .gap(theme.spacing.small)
         .child(
             div()
-                .text_color(theme.surface.muted_foreground)
-                .child(label.into()),
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(format!(
+                    "{} · {} · {}",
+                    asset.format, asset.storage, asset.health
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .gap(theme.spacing.small)
+                        .child(
+                            IconButton::new(
+                                format!("reveal-asset-{}", asset.id.value()),
+                                "Show file in folder",
+                                TablerIcon::Eye,
+                            )
+                            .size(ButtonSize::Small)
+                            .on_click(move |_, _, cx| cx.reveal_path(&path)),
+                        )
+                        .child(
+                            Button::new(format!("detach-asset-{}", asset.id.value()), "Remove")
+                                .size(ButtonSize::Small)
+                                .disabled(!can_detach)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.detach_detail_asset(asset_id, window, cx);
+                                })),
+                        ),
+                ),
         )
-        .child(div().truncate().child(value.into()))
+        .into_any_element()
 }
 
 fn book_card(
@@ -1543,7 +4161,9 @@ fn book_card(
         .rounded(theme.button.radius)
         .flex()
         .flex_col()
-        .gap(theme.spacing.small)
+        .text_center()
+        .font_weight(theme.typography.body_weight)
+        .line_height(relative(theme.typography.book_metadata_line_height))
         .relative()
         .when(selected, |card| {
             card.bg(theme.selection.background)
@@ -1562,9 +4182,10 @@ fn book_card(
         .child(
             div()
                 .w_full()
+                .mt(theme.spacing.small)
                 .truncate()
                 .text_size(theme.typography.body_size)
-                .font_weight(theme.typography.button_weight)
+                .font_weight(theme.typography.wordmark_weight)
                 .child(book.summary.title.clone()),
         )
         .child(
@@ -1711,27 +4332,29 @@ fn benchmark_book_detail() -> Book {
             Tag {
                 id: TagId::new(1),
                 name: "Performance".to_owned(),
+                color: TagColor::Lilac,
             },
             Tag {
                 id: TagId::new(2),
                 name: "Reference".to_owned(),
+                color: TagColor::Azure,
             },
         ],
         publisher: Some("Lectern Press".to_owned()),
-        language: Some("English".to_owned()),
+        language: Some("en".to_owned()),
         description: Some(
             "A deterministic book used to verify complete detail-panel presentation.".to_owned(),
         ),
         assets: vec![
             BookAsset {
-                id: lectern_core::AssetId::new(1),
+                id: AssetId::new(1),
                 format: BookFormat::Epub,
                 storage: AssetStorage::Reference,
                 health: AssetHealth::Available,
                 path: PathBuf::from("/benchmark/Benchmark book 001.epub"),
             },
             BookAsset {
-                id: lectern_core::AssetId::new(2),
+                id: AssetId::new(2),
                 format: BookFormat::Pdf,
                 storage: AssetStorage::Reference,
                 health: AssetHealth::Available,
@@ -1797,6 +4420,20 @@ mod selection_tests {
                 vec![excluded]
             ))
         );
+    }
+
+    #[test]
+    fn asset_format_detection_is_case_insensitive_and_closed() {
+        assert_eq!(
+            book_format_for_path(Path::new("/library/book.EPUB")),
+            Some(BookFormat::Epub)
+        );
+        assert_eq!(
+            book_format_for_path(Path::new("/library/book.Pdf")),
+            Some(BookFormat::Pdf)
+        );
+        assert_eq!(book_format_for_path(Path::new("/library/book.mobi")), None);
+        assert_eq!(book_format_for_path(Path::new("/library/book")), None);
     }
 }
 

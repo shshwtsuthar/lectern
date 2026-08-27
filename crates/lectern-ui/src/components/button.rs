@@ -43,6 +43,7 @@ pub struct Button {
     variant: ButtonVariant,
     size: ButtonSize,
     leading_icon: Option<TablerIcon>,
+    full_width: bool,
     disabled: bool,
     on_click: Option<ClickHandler>,
 }
@@ -56,6 +57,7 @@ impl Button {
             variant: ButtonVariant::default(),
             size: ButtonSize::default(),
             leading_icon: None,
+            full_width: false,
             disabled: false,
             on_click: None,
         }
@@ -79,6 +81,13 @@ impl Button {
     #[must_use]
     pub const fn leading_icon(mut self, icon: TablerIcon) -> Self {
         self.leading_icon = Some(icon);
+        self
+    }
+
+    /// Expands the control to its container and aligns its label to the leading edge.
+    #[must_use]
+    pub const fn full_width(mut self) -> Self {
+        self.full_width = true;
         self
     }
 
@@ -139,6 +148,7 @@ impl RenderOnce for Button {
             .h(height)
             .px(padding)
             .gap(gap)
+            .when(self.full_width, |button| button.w_full().justify_start())
             .border(theme.button.border_width)
             .border_color(colors.border)
             .rounded(theme.button.radius)

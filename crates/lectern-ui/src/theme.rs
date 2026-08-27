@@ -1,10 +1,15 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    fmt,
+    sync::{Arc, OnceLock},
+};
 
 use gpui::{App, FontWeight, Global, Hsla, Rems, rems, rgba};
 
 use crate::{
     brand::{
-        DARK_PRIMARY_BUTTON, DARK_SELECTION, DIALOG_BACKDROP, LIGHT_PRIMARY_BUTTON, LIGHT_SELECTION,
+        DARK_ACCENT_FOCUS, DARK_ACCENT_PRIMARY, DARK_ACCENT_SELECTION, DARK_TAG_COLORS,
+        DIALOG_BACKDROP, LIGHT_ACCENT_FOCUS, LIGHT_ACCENT_PRIMARY, LIGHT_ACCENT_SELECTION,
+        LIGHT_TAG_COLORS,
     },
     generated::{dark, light, primitive_metadata as common},
 };
@@ -16,6 +21,121 @@ pub enum ColorMode {
     Light,
     /// Lectern's dark theme.
     Dark,
+}
+
+impl ColorMode {
+    /// Every supported mode in presentation order.
+    pub const ALL: [Self; 2] = [Self::Light, Self::Dark];
+
+    /// Returns the durable settings value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    /// Parses a durable settings value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ColorMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        })
+    }
+}
+
+/// A user-selectable Lectern accent used for primary actions, focus, and selection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AccentColor {
+    /// Lectern's canonical brand mauve.
+    #[default]
+    Mauve,
+    /// Neutral slate.
+    Slate,
+    /// Warm coral.
+    Coral,
+    /// Warm amber.
+    Amber,
+    /// Fresh mint.
+    Mint,
+    /// Clear azure.
+    Azure,
+    /// Soft lilac.
+    Lilac,
+}
+
+impl AccentColor {
+    /// Every supported accent in presentation order.
+    pub const ALL: [Self; 7] = [
+        Self::Mauve,
+        Self::Slate,
+        Self::Coral,
+        Self::Amber,
+        Self::Mint,
+        Self::Azure,
+        Self::Lilac,
+    ];
+
+    /// Returns the stable array offset used by immutable token tables.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Mauve => 0,
+            Self::Slate => 1,
+            Self::Coral => 2,
+            Self::Amber => 3,
+            Self::Mint => 4,
+            Self::Azure => 5,
+            Self::Lilac => 6,
+        }
+    }
+
+    /// Returns the durable settings value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mauve => "mauve",
+            Self::Slate => "slate",
+            Self::Coral => "coral",
+            Self::Amber => "amber",
+            Self::Mint => "mint",
+            Self::Azure => "azure",
+            Self::Lilac => "lilac",
+        }
+    }
+
+    /// Parses a durable settings value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|accent| accent.as_str() == value)
+    }
+}
+
+impl fmt::Display for AccentColor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Mauve => "Mauve",
+            Self::Slate => "Slate",
+            Self::Coral => "Coral",
+            Self::Amber => "Amber",
+            Self::Mint => "Mint",
+            Self::Azure => "Azure",
+            Self::Lilac => "Lilac",
+        })
+    }
 }
 
 /// Colors used by the first Lectern empty-library screen.
@@ -60,6 +180,40 @@ pub struct DialogTheme {
     pub backdrop: Hsla,
     /// Dialog surface corner radius.
     pub radius: Rems,
+}
+
+/// Compact anchored-menu surface and row presentation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ActionMenuTheme {
+    /// Menu surface background.
+    pub background: Hsla,
+    /// Menu outline.
+    pub border: Hsla,
+    /// Hovered item background.
+    pub hover_background: Hsla,
+    /// Selected item background.
+    pub selected_background: Hsla,
+    /// Outer menu radius.
+    pub radius: Rems,
+    /// Concentric item radius after the standard small inset.
+    pub item_radius: Rems,
+}
+
+/// Theme-resolved dots used by the named tag palette.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TagPaletteTheme {
+    /// Neutral slate.
+    pub slate: Hsla,
+    /// Warm coral.
+    pub coral: Hsla,
+    /// Warm amber.
+    pub amber: Hsla,
+    /// Fresh mint.
+    pub mint: Hsla,
+    /// Clear azure.
+    pub azure: Hsla,
+    /// Soft lilac.
+    pub lilac: Hsla,
 }
 
 /// A complete visual state for one Button variant.
@@ -151,6 +305,14 @@ pub struct FocusTheme {
 /// Typography needed by the bootstrap UI.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TypographyTheme {
+    /// Default application font family.
+    pub body_family: &'static str,
+    /// Font family reserved for the Lectern wordmark.
+    pub wordmark_family: &'static str,
+    /// Lectern wordmark weight.
+    pub wordmark_weight: FontWeight,
+    /// Compact line height for centered library-card metadata.
+    pub book_metadata_line_height: f32,
     /// Body text size.
     pub body_size: Rems,
     /// Body text line height multiplier.
@@ -184,6 +346,7 @@ pub struct SpacingTheme {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PrimerTheme {
     mode: ColorMode,
+    accent: AccentColor,
     /// Surface and text colors.
     pub surface: SurfaceColors,
     /// Non-interactive surface borders.
@@ -192,6 +355,10 @@ pub struct PrimerTheme {
     pub selection: SelectionTheme,
     /// Modal surface presentation.
     pub dialog: DialogTheme,
+    /// Compact anchored menu presentation.
+    pub action_menu: ActionMenuTheme,
+    /// Named tag-dot palette.
+    pub tag_palette: TagPaletteTheme,
     /// Button colors and geometry.
     pub button: ButtonTheme,
     /// Text-entry colors and geometry.
@@ -214,20 +381,61 @@ impl PrimerTheme {
     #[must_use]
     pub fn light() -> Arc<Self> {
         static THEME: OnceLock<Arc<PrimerTheme>> = OnceLock::new();
-        Arc::clone(THEME.get_or_init(|| Arc::new(Self::from_generated(ColorMode::Light))))
+        Arc::clone(
+            THEME.get_or_init(|| {
+                Arc::new(Self::from_generated(ColorMode::Light, AccentColor::Mauve))
+            }),
+        )
     }
 
     /// Returns the process-wide immutable dark theme.
     #[must_use]
     pub fn dark() -> Arc<Self> {
         static THEME: OnceLock<Arc<PrimerTheme>> = OnceLock::new();
-        Arc::clone(THEME.get_or_init(|| Arc::new(Self::from_generated(ColorMode::Dark))))
+        Arc::clone(
+            THEME.get_or_init(|| {
+                Arc::new(Self::from_generated(ColorMode::Dark, AccentColor::Mauve))
+            }),
+        )
+    }
+
+    /// Builds one immutable theme for a color mode and accent choice.
+    #[must_use]
+    pub fn with_accent(mode: ColorMode, accent: AccentColor) -> Arc<Self> {
+        match (mode, accent) {
+            (ColorMode::Light, AccentColor::Mauve) => Self::light(),
+            (ColorMode::Dark, AccentColor::Mauve) => Self::dark(),
+            _ => Arc::new(Self::from_generated(mode, accent)),
+        }
     }
 
     /// Returns the theme's color mode.
     #[must_use]
     pub const fn mode(&self) -> ColorMode {
         self.mode
+    }
+
+    /// Returns the theme's selected accent.
+    #[must_use]
+    pub const fn accent(&self) -> AccentColor {
+        self.accent
+    }
+
+    /// Resolves one accent to its visible circular-swatch color in the current mode.
+    #[must_use]
+    pub fn accent_swatch(&self, accent: AccentColor) -> Hsla {
+        if accent == AccentColor::Mauve {
+            return rgba(crate::brand::MAUVE).into();
+        }
+        match accent {
+            AccentColor::Mauve => unreachable!("mauve returned above"),
+            AccentColor::Slate => self.tag_palette.slate,
+            AccentColor::Coral => self.tag_palette.coral,
+            AccentColor::Amber => self.tag_palette.amber,
+            AccentColor::Mint => self.tag_palette.mint,
+            AccentColor::Azure => self.tag_palette.azure,
+            AccentColor::Lilac => self.tag_palette.lilac,
+        }
     }
 
     /// Returns the installed theme, falling back to the immutable light theme.
@@ -241,7 +449,7 @@ impl PrimerTheme {
         clippy::too_many_lines,
         reason = "one exhaustive constructor makes every immutable theme field visibly complete"
     )]
-    fn from_generated(mode: ColorMode) -> Self {
+    fn from_generated(mode: ColorMode, accent: AccentColor) -> Self {
         macro_rules! choose {
             ($name:ident) => {
                 match mode {
@@ -253,15 +461,25 @@ impl PrimerTheme {
         let color = |value| rgba(value).into();
         let default_foreground = color(choose!(BUTTON_DEFAULT_FG_REST));
         let primary = match mode {
-            ColorMode::Light => LIGHT_PRIMARY_BUTTON,
-            ColorMode::Dark => DARK_PRIMARY_BUTTON,
+            ColorMode::Light => LIGHT_ACCENT_PRIMARY[accent.index()],
+            ColorMode::Dark => DARK_ACCENT_PRIMARY[accent.index()],
         };
         let selection = match mode {
-            ColorMode::Light => LIGHT_SELECTION,
-            ColorMode::Dark => DARK_SELECTION,
+            ColorMode::Light => LIGHT_ACCENT_SELECTION[accent.index()],
+            ColorMode::Dark => DARK_ACCENT_SELECTION[accent.index()],
         };
+        let tag_colors = match mode {
+            ColorMode::Light => LIGHT_TAG_COLORS,
+            ColorMode::Dark => DARK_TAG_COLORS,
+        };
+        let focus_color = match mode {
+            ColorMode::Light => LIGHT_ACCENT_FOCUS[accent.index()],
+            ColorMode::Dark => DARK_ACCENT_FOCUS[accent.index()],
+        };
+        let _upstream_focus_color = choose!(FOCUS_OUTLINE_COLOR);
         Self {
             mode,
+            accent,
             surface: SurfaceColors {
                 background: color(choose!(BG_COLOR_DEFAULT)),
                 muted_background: color(choose!(BG_COLOR_MUTED)),
@@ -281,6 +499,22 @@ impl PrimerTheme {
             dialog: DialogTheme {
                 backdrop: color(DIALOG_BACKDROP),
                 radius: rems(common::BORDER_RADIUS_LARGE),
+            },
+            action_menu: ActionMenuTheme {
+                background: color(choose!(BG_COLOR_DEFAULT)),
+                border: color(choose!(BORDER_COLOR_MUTED)),
+                hover_background: color(choose!(BUTTON_DEFAULT_BG_HOVER)),
+                selected_background: color(selection.background),
+                radius: rems(common::BORDER_RADIUS_LARGE),
+                item_radius: rems(common::BORDER_RADIUS_LARGE - common::SPACE_SM),
+            },
+            tag_palette: TagPaletteTheme {
+                slate: color(tag_colors.slate),
+                coral: color(tag_colors.coral),
+                amber: color(tag_colors.amber),
+                mint: color(tag_colors.mint),
+                azure: color(tag_colors.azure),
+                lilac: color(tag_colors.lilac),
             },
             button: ButtonTheme {
                 default: ButtonColors {
@@ -348,11 +582,15 @@ impl PrimerTheme {
                 padding_inline: rems(common::CONTROL_MEDIUM_PADDING_INLINE),
             },
             focus: FocusTheme {
-                color: color(choose!(FOCUS_OUTLINE_COLOR)),
+                color: color(focus_color),
                 width: rems(common::FOCUS_OUTLINE_WIDTH),
                 offset: rems(common::FOCUS_OUTLINE_OFFSET),
             },
             typography: TypographyTheme {
+                body_family: "Karla",
+                wordmark_family: "Newsreader 14pt",
+                wordmark_weight: FontWeight::MEDIUM,
+                book_metadata_line_height: 1.25,
                 body_size: rems(common::TEXT_BODY_SIZE_MEDIUM),
                 body_line_height: common::TEXT_BODY_LINE_HEIGHT_MEDIUM,
                 body_weight: FontWeight(f32::from(common::TEXT_BODY_WEIGHT)),
@@ -394,29 +632,46 @@ mod tests {
         assert_eq!(dark.border.muted, rgba(dark::BORDER_COLOR_MUTED).into());
         assert_eq!(light.border.thin, dark.border.thin);
         assert_eq!(light.button.radius, dark.button.radius);
+        assert_eq!(light.input.radius, dark.input.radius);
+        assert_eq!(light.input.height, dark.input.height);
+        assert_eq!(light.input.background, rgba(light::CONTROL_BG_REST).into());
+        assert_eq!(dark.input.background, rgba(dark::CONTROL_BG_REST).into());
+        assert_eq!(light.typography.body_family, "Karla");
+        assert_eq!(light.typography.wordmark_family, "Newsreader 14pt");
+        assert_eq!(light.typography.wordmark_weight, FontWeight::MEDIUM);
+        assert!((light.typography.book_metadata_line_height - 1.25).abs() < f32::EPSILON);
         assert_eq!(
             light.button.primary.background,
-            rgba(LIGHT_PRIMARY_BUTTON.background).into()
+            rgba(LIGHT_ACCENT_PRIMARY[AccentColor::Mauve.index()].background).into()
         );
         assert_eq!(
             dark.button.primary.background,
-            rgba(DARK_PRIMARY_BUTTON.background).into()
+            rgba(DARK_ACCENT_PRIMARY[AccentColor::Mauve.index()].background).into()
         );
         assert_eq!(
             light.button.primary.icon,
-            rgba(LIGHT_PRIMARY_BUTTON.icon).into()
+            rgba(LIGHT_ACCENT_PRIMARY[AccentColor::Mauve.index()].icon).into()
         );
         assert_eq!(
             dark.button.primary.icon,
-            rgba(DARK_PRIMARY_BUTTON.icon).into()
+            rgba(DARK_ACCENT_PRIMARY[AccentColor::Mauve.index()].icon).into()
         );
         assert_eq!(
             light.button.primary.disabled_icon,
-            rgba(LIGHT_PRIMARY_BUTTON.disabled_icon).into()
+            rgba(LIGHT_ACCENT_PRIMARY[AccentColor::Mauve.index()].disabled_icon).into()
         );
         assert_eq!(
             dark.button.primary.disabled_icon,
-            rgba(DARK_PRIMARY_BUTTON.disabled_icon).into()
+            rgba(DARK_ACCENT_PRIMARY[AccentColor::Mauve.index()].disabled_icon).into()
         );
+
+        for accent in AccentColor::ALL {
+            let themed = PrimerTheme::with_accent(ColorMode::Dark, accent);
+            assert_eq!(themed.accent(), accent);
+            assert_eq!(
+                themed.button.primary.background,
+                rgba(DARK_ACCENT_PRIMARY[accent.index()].background).into()
+            );
+        }
     }
 }

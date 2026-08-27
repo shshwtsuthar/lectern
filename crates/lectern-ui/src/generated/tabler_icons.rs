@@ -6,6 +6,14 @@
 /// A Tabler outline icon vendored for a committed Lectern control.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TablerIcon {
+    /// The `chevron-down` Tabler icon.
+    ChevronDown,
+    /// The `chevron-up` Tabler icon.
+    ChevronUp,
+    /// The `eye` Tabler icon.
+    Eye,
+    /// The `palette` Tabler icon.
+    Palette,
     /// The `upload` Tabler icon.
     Upload,
 }
@@ -15,6 +23,10 @@ impl TablerIcon {
     #[must_use]
     pub const fn path(self) -> &'static str {
         match self {
+            Self::ChevronDown => "tabler/chevron-down.svg",
+            Self::ChevronUp => "tabler/chevron-up.svg",
+            Self::Eye => "tabler/eye.svg",
+            Self::Palette => "tabler/palette.svg",
             Self::Upload => "tabler/upload.svg",
         }
     }

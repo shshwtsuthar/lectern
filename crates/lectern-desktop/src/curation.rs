@@ -6,7 +6,7 @@ use lectern_core::{
     Book,
     organisation::{
         BookEdit, ContributorCreditEdit, ContributorId, ContributorReference, ContributorRole,
-        NameKind, SeriesId, SeriesIndex, SeriesMembershipEdit, SeriesReference, TagId,
+        NameKind, SeriesId, SeriesIndex, SeriesMembershipEdit, SeriesReference, TagColor, TagId,
         TagReference, identity_key, normalize_name,
     },
 };
@@ -107,6 +107,7 @@ impl SeriesDraft {
 pub(crate) struct TagDraft {
     pub(crate) existing_id: Option<TagId>,
     pub(crate) name: String,
+    pub(crate) color: TagColor,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -150,6 +151,7 @@ impl BookCurationDraft {
             .map(|tag| TagDraft {
                 existing_id: Some(tag.id),
                 name: tag.name.clone(),
+                color: tag.color,
             })
             .collect();
         Self {
@@ -185,18 +187,19 @@ impl BookCurationDraft {
             .collect()
     }
 
-    pub(crate) fn add_existing_tag(&mut self, id: TagId, name: &str) -> bool {
+    pub(crate) fn add_existing_tag(&mut self, id: TagId, name: &str, color: TagColor) -> bool {
         if self.tags.iter().any(|tag| tag.existing_id == Some(id)) {
             return false;
         }
         self.tags.push(TagDraft {
             existing_id: Some(id),
             name: name.to_owned(),
+            color,
         });
         true
     }
 
-    pub(crate) fn add_new_tag(&mut self, name: &str) -> Result<bool, String> {
+    pub(crate) fn add_new_tag(&mut self, name: &str, color: TagColor) -> Result<bool, String> {
         let name = normalize_name(NameKind::Tag, name).map_err(display_error)?;
         let key = identity_key(&name);
         if self.tags.iter().any(|tag| identity_key(&tag.name) == key) {
@@ -205,8 +208,16 @@ impl BookCurationDraft {
         self.tags.push(TagDraft {
             existing_id: None,
             name,
+            color,
         });
         Ok(true)
+    }
+
+    #[allow(dead_code, reason = "used by the GPUI frontend during its migration")]
+    pub(crate) fn remove_tag_id(&mut self, id: TagId) -> bool {
+        let previous = self.tags.len();
+        self.tags.retain(|tag| tag.existing_id != Some(id));
+        self.tags.len() != previous
     }
 
     pub(crate) fn to_book_edit(
@@ -273,10 +284,13 @@ impl BookCurationDraft {
             if !tag_keys.insert(identity_key(&name)) {
                 return Err(format!("Tag '{name}' is assigned more than once."));
             }
-            tags.push(
-                tag.existing_id
-                    .map_or_else(|| TagReference::New(name), TagReference::Existing),
-            );
+            tags.push(tag.existing_id.map_or_else(
+                || TagReference::NewColored {
+                    name,
+                    color: tag.color,
+                },
+                TagReference::Existing,
+            ));
         }
 
         Ok(BookEdit {
@@ -340,7 +354,7 @@ mod tests {
         AssetHealth, AssetId, AssetStorage, BookAsset, BookFormat, BookId,
         organisation::{
             Contributor, ContributorCredit, ContributorId, ContributorRole, Series, SeriesId,
-            SeriesIndex, SeriesMembership, Tag, TagId,
+            SeriesIndex, SeriesMembership, Tag, TagColor, TagId,
         },
     };
 
@@ -371,6 +385,7 @@ mod tests {
             tags: vec![Tag {
                 id: TagId::new(4),
                 name: "Fantasy".into(),
+                color: TagColor::Slate,
             }],
             publisher: Some("Parnassus".into()),
             language: Some("en".into()),
@@ -460,8 +475,13 @@ mod tests {
     #[test]
     fn tags_deduplicate_by_normalized_identity() {
         let mut draft = BookCurationDraft::from_book(&book());
-        assert!(!draft.add_new_tag(" fantasy ").unwrap());
-        assert!(draft.add_new_tag("Science   Fiction").unwrap());
+        assert!(!draft.add_new_tag(" fantasy ", TagColor::Coral).unwrap());
+        assert!(
+            draft
+                .add_new_tag("Science   Fiction", TagColor::Azure)
+                .unwrap()
+        );
         assert_eq!(draft.tags[1].name, "Science Fiction");
+        assert_eq!(draft.tags[1].color, TagColor::Azure);
     }
 }

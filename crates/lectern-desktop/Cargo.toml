@@ -22,6 +22,7 @@ gpui.workspace = true
 gpui-base.workspace = true
 gpui_platform.workspace = true
 image.workspace = true
+isolang.workspace = true
 lectern-core.workspace = true
 lectern-ui.workspace = true
 lectern-service.workspace = true

@@ -6221,11 +6221,14 @@ fn tag_editor(
         let usage = &editor.tag_suggestions.results[suggestion_index];
         editor
             .curation
-            .add_existing_tag(usage.tag.id, &usage.tag.name);
+            .add_existing_tag(usage.tag.id, &usage.tag.name, usage.tag.color);
         editor.tag_input.clear();
         editor.tag_suggestions.results.clear();
     } else if create_new {
-        match editor.curation.add_new_tag(&editor.tag_input) {
+        match editor.curation.add_new_tag(
+            &editor.tag_input,
+            lectern_core::organisation::TagColor::Slate,
+        ) {
             Ok(_) => {
                 editor.tag_input.clear();
                 editor.tag_suggestions.results.clear();
@@ -6734,8 +6737,8 @@ mod tests {
     use eframe::egui;
     use lectern_core::ImportProgress;
     use lectern_core::organisation::{
-        BulkTagEdit, LibraryGeneration, SavedSearch, SavedSearchId, SelectionSnapshot, TagId,
-        TagReference,
+        BulkTagEdit, LibraryGeneration, SavedSearch, SavedSearchId, SelectionSnapshot, TagColor,
+        TagId, TagReference,
     };
     use lectern_core::{
         AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId,
@@ -7033,7 +7036,10 @@ mod tests {
         editor.curation.series.name = " Dune Chronicles ".into();
         editor.curation.series.confirm_new().unwrap();
         editor.curation.series.index = "2.000000".into();
-        editor.curation.add_new_tag("Science   Fiction").unwrap();
+        editor
+            .curation
+            .add_new_tag("Science   Fiction", TagColor::default())
+            .unwrap();
 
         let saved = editor.edit().unwrap();
 
@@ -7041,7 +7047,10 @@ mod tests {
         assert_eq!(saved.series.unwrap().index.unwrap().to_string(), "2");
         assert_eq!(
             saved.tags,
-            vec![TagReference::New("Science Fiction".to_owned())]
+            vec![TagReference::NewColored {
+                name: "Science Fiction".to_owned(),
+                color: TagColor::Slate,
+            }]
         );
         assert!(editor.changed());
         assert!(!editor.switching_would_discard_changes(BookId::new(7)));

@@ -686,6 +686,14 @@ pub trait LibraryService {
         limit: u32,
     ) -> Result<Vec<organisation::SeriesUsage>, Self::Error>;
 
+    /// Reports whether one exact book number is unused by the other books in a series.
+    fn series_index_is_available(
+        &mut self,
+        series: organisation::SeriesId,
+        index: organisation::SeriesIndex,
+        excluding_book: BookId,
+    ) -> Result<bool, Self::Error>;
+
     /// Returns bounded tag suggestions, prioritizing selected values.
     fn autocomplete_tags(
         &mut self,

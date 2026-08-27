@@ -9,6 +9,50 @@ When Lectern intentionally differs from Primer, represent the difference with an
 Lectern token rather than disguising it as an imported Primer primitive. Do not inherit a GitHub
 brand convention merely because the upstream Primer component uses it.
 
+## Product temperament
+
+Lectern should feel calm, compact, and precise: a fast personal-library tool rather than a spacious
+marketing surface or a collection of dashboard cards. Let the books and their metadata carry the
+visual interest. Application chrome should be restrained, controls should be no larger than their
+task requires, and repeated actions should stay close to the content they affect.
+
+The main top and bottom bars establish the application's density. On GNOME/Linux the application
+requests the compositor's ordinary server-side title bar so window move, minimize, maximize, and
+close behavior remains native; Lectern's own top bar stays application chrome beneath it. Side
+panels, toolbars, menus, and
+utility actions must use that same compact scale unless a larger target is needed for a primary
+journey or accessibility. Prefer the small control size for local Save, Reset, Add, Remove, reveal,
+and reorder actions. Use medium controls for ordinary text entry and prominent global actions.
+
+Do not repeat context merely to fill space. If the selected book is already visibly highlighted,
+the detail-panel title should say **Book details** without repeating the book name beside it. Keep a
+book visibly highlighted while its details are loading or open so the relationship between grid and
+panel remains clear. Selection must also have a non-color cue whenever it represents an actionable
+multi-selection state.
+
+## Dense side panels and section rhythm
+
+A detail side panel is one continuous surface. Divide its major groups with flush, low-contrast
+separators and shared horizontal insets; do not wrap every group in a rounded card or nested
+container. Group tightly related ordinary metadata together, then give files, series, contributors,
+tags, and library-level destructive actions one section each.
+
+Within a section, use the smallest spacing token between a label and its control, the medium token
+between related controls, and the large token between distinct field groups. Section headings and
+the panel heading share the same leading inset. A fixed 48 px application or panel bar may use the
+large horizontal inset and small vertical inset so its medium control remains centered; this is the
+documented compact-bar exception to equal perimeter padding.
+
+Use progressive disclosure for secondary choices. Contributor role choices, the language list, tag
+search, and tag-color creation belong in anchored menus rather than expanding a virtualized section
+or leaving every option permanently visible. Removing an advanced field from the common editor is
+appropriate when its value can be preserved safely and managed in a dedicated vocabulary surface.
+
+Anchored surfaces retain one small spacing token between trigger and menu so their outlines never
+visually collide. Validation feedback stays in the section that owns the failing value; a
+contributor error must not appear in Files merely because Files happens to be the next rendered
+section.
+
 ## Brand color
 
 Lectern's primary brand color is **Lectern Mauve** (`#9B6AA6`). It is a soft, luminous
@@ -17,8 +61,11 @@ conventional saturated purple. **Lectern Lavender** (`#D8C4E1`) is its supportin
 restrained accents, highlights, and decorative treatments; it is not a substitute for the primary
 color when the brand must be immediately recognizable.
 
-Lectern Mauve replaces the usual GitHub green in brand-primary roles, including primary actions.
-Do not use GitHub green as Lectern's default primary-action color. Green may still be used when it
+Lectern Mauve replaces the usual GitHub green in brand-primary roles, including primary actions,
+and remains the default accent. The Appearance dialog may replace it with Slate, Coral, Amber, Mint,
+Azure, or Lilac through complete named accent token sets; the choice applies to primary actions,
+focus, and selection and persists beside the local library. Do not use GitHub green as Lectern's
+default primary-action color. Green may still be used when it
 communicates an independent semantic meaning such as success, provided that meaning is not conveyed
 by color alone.
 
@@ -27,9 +74,58 @@ literals through components or relabel the colors as Primer primitives. Interact
 disabled, focus, and theme-specific values must be defined deliberately in the theme layer rather
 than calculated ad hoc during rendering.
 
+Focus-visible outlines use the selected Lectern accent's named light/dark token; the default is
+mauve in light mode and supporting lavender in dark mode. Do not expose Primer's default blue focus
+accent through Lectern controls.
+
 Brand color does not override semantics or accessibility. Do not use brand color alone to
 communicate status, and verify the contrast of the actual foreground/background pair for its text
 size and interaction state.
+
+## Typography
+
+Karla is Lectern's application typeface. Apply it at the application root so ordinary labels,
+metadata, controls, status copy, dialogs, and headings inherit one consistent family. Preserve the
+semantic size, weight, line-height, and color tokens for hierarchy rather than introducing
+component-local font declarations.
+
+Newsreader's bundled 14 pt optical-size Medium face is reserved for the **Lectern** wordmark in the
+main top bar. Render that wordmark at Medium 500 through explicitly named typography theme tokens.
+Do not use Newsreader as a general heading face; its literary character stays distinctive when the
+rest of the interface remains Karla. The application embeds a wordmark-only subset of the face and
+its OFL license so the wordmark never depends on a workstation font install or parses unused glyphs
+at startup. Give the wordmark the large horizontal inset
+used by other application bars, not the smaller vertical inset.
+
+Library-card metadata is centered beneath its cover. Use the small spacing token between the cover
+and title. Title and author use the shared compact metadata line-height with no additional margin,
+so the perceived gap follows the Karla glyphs rather than its ordinary body-text line box. The
+title uses a bold weight; the author uses the muted foreground and normal body weight. Both lines
+remain bounded to the card width and truncate independently so long metadata cannot disturb the
+grid.
+
+## Bottom-bar notifications
+
+Transient operation feedback belongs in the persistent bottom bar, not in the bookshelf canvas.
+This includes completed actions such as books removed or tags applied, cancellation feedback,
+recoverable errors, and similar future notifications. Keep the library count at the leading edge
+and place the latest notification at the trailing edge, truncating it before it can displace the
+count or change the bar's fixed height.
+
+The bookshelf canvas is reserved for books, empty/loading states, and durable content guidance such
+as pagination scope. Do not insert transient feedback above the grid, because doing so shifts book
+positions and makes repeated operations visually unstable.
+
+## Tags and supporting color
+
+Tags use compact, rounded pills with their text label and a small named color dot. The dot is a
+supporting recognition aid, never the only way to identify a tag. Selected pills sit immediately to
+the left of the **+ Tag** action and wrap as one compact row.
+
+The durable palette is **Slate**, **Coral**, **Amber**, **Mint**, **Azure**, and **Lilac**. Define
+light- and dark-mode values as named tag-palette tokens in the Lectern theme. Existing tags default
+to Slate. New tags require an explicit color choice after their normalized name is confirmed. Do
+not introduce arbitrary per-tag color literals in product render code.
 
 ## Subtle surface separators
 

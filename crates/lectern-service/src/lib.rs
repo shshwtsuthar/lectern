@@ -14,7 +14,7 @@ use lectern_core::{
     organisation::{
         BookEdit, BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, ContributorId,
         ContributorUsage, SavedSearch, SavedSearchId, SelectionSnapshot, SelectionTagUsage,
-        SeriesId, SeriesUsage, TagId, TagUsage, VocabularyMutationResult,
+        SeriesId, SeriesIndex, SeriesUsage, TagId, TagUsage, VocabularyMutationResult,
     },
 };
 use lectern_import::{import_paths_into, validate_publication};
@@ -160,6 +160,17 @@ impl LibraryService for SqliteLibraryService {
         limit: u32,
     ) -> Result<Vec<SeriesUsage>, Self::Error> {
         Ok(self.database.autocomplete_series(prefix, selected, limit)?)
+    }
+
+    fn series_index_is_available(
+        &mut self,
+        series: SeriesId,
+        index: SeriesIndex,
+        excluding_book: BookId,
+    ) -> Result<bool, Self::Error> {
+        Ok(self
+            .database
+            .series_index_is_available(series, index, excluding_book)?)
     }
 
     fn autocomplete_tags(

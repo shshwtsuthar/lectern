@@ -3,7 +3,9 @@
 ## Journey and workload
 
 The first call site is the right-side book-details editor: changing title, contributor names,
-series and sequence, tags, publisher, language, and description for one selected book. Its
+series book number, publisher, description, and the search queries inside the Series and Tag menus
+for one selected book. Language, Series identity, and contributor roles use the ActionMenu contract
+rather than a free-form metadata field. Its
 representative release workload is `ui-book-detail-regression-v1`, which opens a complete book
 fixture with normalized contributors, series membership, tags, and two assets. It retains raw
 samples and checks open-to-painted-detail p95, first-paint latency, peak RSS, and fixture
@@ -20,12 +22,14 @@ correctness. `ui-bootstrap-regression-v1` also guards the component gallery and 
   on the retained `gpui-base` state. This avoids a second source of truth in `lectern-ui`.
 - Pointer focus, keyboard movement and selection, clipboard operations, undo/redo, and IME behavior
   are supplied by the pinned `gpui-base` editing engine.
+- A pointer press outside a focused field clears focus during capture; a press on another field then
+  focuses that target normally.
 
 ## Presentation and accessibility
 
 The field frame follows Primer TextInput's medium control geometry: resolved control background,
 foreground, placeholder, border, disabled colors, medium height and inline padding, medium radius,
-and thin border. Focus uses the generated Primer focus color and width. `TextArea` deliberately
+and thin border. Focus uses the selected Lectern accent color and shared width. `TextArea` deliberately
 shares the same frame and adds the medium spacing token as block padding.
 
 Entered text, placeholder text, selection, and caret colors are installed into the retained editor

@@ -20,8 +20,8 @@ use lectern_core::organisation::{
     BookEdit, BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, ContributorId,
     ContributorUsage, LibraryGeneration, NameKind, SavedSearch, SavedSearchId, SearchClause,
     SearchExpression, SearchParseError, SelectionSnapshot, SelectionTagUsage, SeriesId,
-    SeriesUsage, TagId, TagReference, TagUsage, TextMatch, VocabularyMutationResult, identity_key,
-    normalize_name,
+    SeriesIndex, SeriesUsage, TagColor, TagId, TagReference, TagUsage, TextMatch,
+    VocabularyMutationResult, identity_key, normalize_name,
 };
 use lectern_core::{
     AssetHealth, AssetHealthReport, AssetId, AssetStorage, BackupReport, Book, BookAsset,
@@ -38,7 +38,7 @@ use thiserror::Error;
 #[cfg(not(any(unix, windows)))]
 compile_error!("Lectern's lossless path codec currently supports Unix and Windows targets");
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 8;
 const BACKUP_PAGES_PER_STEP: i32 = 2_048;
 static NEXT_BACKUP_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -811,7 +811,7 @@ impl LibraryDatabase {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         prepare_selection(&transaction, selection, self.logical_generation.get())?;
         let mut statement = transaction.prepare_cached(
-            "SELECT t.id, t.name, \
+            "SELECT t.id, t.name, t.color, \
                     (SELECT count(*) FROM book_tags all_tags WHERE all_tags.tag_id = t.id), \
                     (SELECT count(*) FROM saved_search_included_tags si \
                      WHERE si.tag_id = t.id) + \
@@ -829,12 +829,21 @@ impl LibraryDatabase {
              ORDER BY t.identity_key, t.id LIMIT ?1 OFFSET ?2",
         )?;
         let rows = statement.query_map(params![i64::from(limit.min(100)), offset], |row| {
-            let books = row.get::<_, i64>(2)?;
-            let saved = row.get::<_, i64>(3)?;
-            let selected = row.get::<_, i64>(4)?;
+            let color_value = row.get::<_, String>(2)?;
+            let color = TagColor::parse(&color_value).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    format!("invalid tag color {color_value:?}").into(),
+                )
+            })?;
+            let books = row.get::<_, i64>(3)?;
+            let saved = row.get::<_, i64>(4)?;
+            let selected = row.get::<_, i64>(5)?;
             Ok((
                 TagId::new(row.get(0)?),
                 row.get::<_, String>(1)?,
+                color,
                 books,
                 saved,
                 selected,
@@ -842,10 +851,10 @@ impl LibraryDatabase {
         })?;
         let mut result = Vec::new();
         for row in rows {
-            let (id, name, books, saved, selected) = row?;
+            let (id, name, color, books, saved, selected) = row?;
             result.push(SelectionTagUsage {
                 usage: TagUsage {
-                    tag: lectern_core::organisation::Tag { id, name },
+                    tag: lectern_core::organisation::Tag { id, name, color },
                     books: checked_count(books)?,
                     saved_searches: checked_count(saved)?,
                 },
@@ -1167,6 +1176,20 @@ impl LibraryDatabase {
         limit: u32,
     ) -> Result<Vec<SeriesUsage>> {
         organisation::autocomplete_series(&self.connection, prefix, selected, limit)
+    }
+
+    /// Reports whether an exact series number is unused by every other book in the series.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the indexed lookup cannot be completed.
+    pub fn series_index_is_available(
+        &self,
+        series: SeriesId,
+        index: SeriesIndex,
+        excluding_book: BookId,
+    ) -> Result<bool> {
+        organisation::series_index_is_available(&self.connection, series, index, excluding_book)
     }
 
     /// Returns at most fifty tag identity-prefix matches with selected values first.
@@ -2231,7 +2254,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
     let observed = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match observed {
         SCHEMA_VERSION => return Ok(()),
-        0..=5 => {}
+        0..=7 => {}
         unsupported => return Err(StorageError::UnsupportedSchema(unsupported)),
     }
 
@@ -2257,6 +2280,8 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
         0 => {
             transaction.execute_batch(SCHEMA)?;
             organisation::migrate_v5_to_v6(&transaction)?;
+            organisation::migrate_v6_to_v7(&transaction)?;
+            organisation::migrate_v7_to_v8(&transaction)?;
             true
         }
         1 | 2 => {
@@ -2264,21 +2289,38 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             transaction.execute_batch(MIGRATE_3_TO_4)?;
             transaction.execute_batch(MIGRATE_4_TO_5)?;
             organisation::migrate_v5_to_v6(&transaction)?;
+            organisation::migrate_v6_to_v7(&transaction)?;
+            organisation::migrate_v7_to_v8(&transaction)?;
             true
         }
         3 => {
             transaction.execute_batch(MIGRATE_3_TO_4)?;
             transaction.execute_batch(MIGRATE_4_TO_5)?;
             organisation::migrate_v5_to_v6(&transaction)?;
+            organisation::migrate_v6_to_v7(&transaction)?;
+            organisation::migrate_v7_to_v8(&transaction)?;
             true
         }
         4 => {
             transaction.execute_batch(MIGRATE_4_TO_5)?;
             organisation::migrate_v5_to_v6(&transaction)?;
+            organisation::migrate_v6_to_v7(&transaction)?;
+            organisation::migrate_v7_to_v8(&transaction)?;
             true
         }
         5 => {
             organisation::migrate_v5_to_v6(&transaction)?;
+            organisation::migrate_v6_to_v7(&transaction)?;
+            organisation::migrate_v7_to_v8(&transaction)?;
+            true
+        }
+        6 => {
+            organisation::migrate_v6_to_v7(&transaction)?;
+            organisation::migrate_v7_to_v8(&transaction)?;
+            true
+        }
+        7 => {
+            organisation::migrate_v7_to_v8(&transaction)?;
             true
         }
         SCHEMA_VERSION => false,
@@ -2873,27 +2915,34 @@ fn resolve_bulk_tag(
                 )))
             }
         }
-        TagReference::New(name) => {
-            let name = normalize_name(NameKind::Tag, name)
-                .map_err(|error| StorageError::InvalidCuration(error.to_string()))?;
-            let key = identity_key(&name);
-            if let Some(id) = transaction
-                .query_row(
-                    "SELECT id FROM tags WHERE identity_key = ?1",
-                    [&key],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?
-            {
-                return Ok((TagId::new(id), false));
-            }
-            transaction.execute(
-                "INSERT INTO tags(name, identity_key) VALUES (?1, ?2)",
-                params![name, key],
-            )?;
-            Ok((TagId::new(transaction.last_insert_rowid()), true))
-        }
+        TagReference::New(name) => resolve_new_bulk_tag(transaction, name, TagColor::default()),
+        TagReference::NewColored { name, color } => resolve_new_bulk_tag(transaction, name, *color),
     }
+}
+
+fn resolve_new_bulk_tag(
+    transaction: &Transaction<'_>,
+    name: &str,
+    color: TagColor,
+) -> Result<(TagId, bool)> {
+    let name = normalize_name(NameKind::Tag, name)
+        .map_err(|error| StorageError::InvalidCuration(error.to_string()))?;
+    let key = identity_key(&name);
+    if let Some(id) = transaction
+        .query_row(
+            "SELECT id FROM tags WHERE identity_key = ?1",
+            [&key],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        return Ok((TagId::new(id), false));
+    }
+    transaction.execute(
+        "INSERT INTO tags(name, identity_key, color) VALUES (?1, ?2, ?3)",
+        params![name, key, color.as_str()],
+    )?;
+    Ok((TagId::new(transaction.last_insert_rowid()), true))
 }
 
 fn rebuild_selected_tag_projections(transaction: &Transaction<'_>) -> Result<()> {
@@ -5021,6 +5070,60 @@ END;
                 .map(|index| index.to_string())
                 .as_deref(),
             Some("1.25")
+        );
+    }
+
+    #[test]
+    fn series_book_numbers_are_unique_with_self_excluding_availability_checks() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let ids = database
+            .import_books(&[
+                record("/books/earthsea-one.epub", "First", "Author"),
+                record("/books/earthsea-two.epub", "Second", "Author"),
+            ])
+            .expect("import books");
+        database
+            .save_book_edit(&earthsea_edit(ids[0]))
+            .expect("save first series member");
+        let series = database
+            .get_book(ids[0])
+            .expect("load first book")
+            .expect("first book exists")
+            .series_membership
+            .expect("first book has series")
+            .series
+            .id;
+        let index = "1.25".parse::<SeriesIndex>().expect("valid series index");
+
+        assert!(
+            !database
+                .series_index_is_available(series, index, ids[1])
+                .expect("check conflicting number")
+        );
+        let mut second = earthsea_edit(ids[1]);
+        second.title = "The Tombs of Atuan".into();
+        second.series = Some(SeriesMembershipEdit {
+            series: SeriesReference::Existing(series),
+            index: Some(index),
+        });
+        assert!(matches!(
+            database.save_book_edit(&second),
+            Err(StorageError::InvalidCuration(message))
+                if message.contains("book number 1.25 is already used")
+        ));
+
+        let second_index = "2".parse::<SeriesIndex>().expect("valid second index");
+        second.series = Some(SeriesMembershipEdit {
+            series: SeriesReference::Existing(series),
+            index: Some(second_index),
+        });
+        database
+            .save_book_edit(&second)
+            .expect("save distinct series number");
+        assert!(
+            database
+                .series_index_is_available(series, second_index, ids[1])
+                .expect("exclude current book")
         );
     }
 

@@ -28,10 +28,12 @@ component does not hide application state in an internal loading flag.
 
 Neutral and Danger colors, geometry, typography, and focus-visible values come from the generated
 Primer token allowlist. Danger is reserved for confirmed destructive actions and retains semantic
-red treatment. The Primary variant uses the explicitly named Lectern Mauve state palette defined by
-the [visual foundations](visual-foundations.md), replacing Primer's GitHub-green primary treatment.
-Components select immutable light or dark theme data without branching on a theme name. The upload
-glyph is the pinned Tabler outline SVG and is decorative; the Button label owns the accessible name.
+red treatment. The Primary variant defaults to the explicitly named Lectern Mauve state palette
+defined by the [visual foundations](visual-foundations.md), replacing Primer's GitHub-green primary
+treatment. When the user chooses another accent, the complete named state palette changes with it;
+components never derive hover, active, disabled, selection, or focus colors locally. Components
+select immutable light or dark theme data without branching on a theme name. The upload glyph is the
+pinned Tabler outline SVG and is decorative; the Button label owns the accessible name.
 
 The root exposes the Button role, label, and click action. Disabled controls remove their click
 action. The pinned GPUI stateful-element API does not currently expose AccessKit's disabled flag, so
