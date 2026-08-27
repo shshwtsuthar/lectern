@@ -125,6 +125,11 @@ impl RenderOnce for Button {
                 rems(crate::generated::primitive_metadata::CONTROL_LARGE_GAP),
             ),
         };
+        let icon_color = if self.disabled {
+            colors.disabled_icon
+        } else {
+            colors.icon
+        };
         let disabled = self.disabled;
         let on_click = self.on_click;
 
@@ -175,7 +180,9 @@ impl RenderOnce for Button {
                 button.child(
                     svg()
                         .path(icon.path())
-                        .size(rems(crate::generated::primitive_metadata::ICON_SIZE_SMALL)),
+                        .size(rems(crate::generated::primitive_metadata::ICON_SIZE_SMALL))
+                        // GPUI SVGs do not inherit the parent button's text color.
+                        .text_color(icon_color),
                 )
             })
             .child(self.label)

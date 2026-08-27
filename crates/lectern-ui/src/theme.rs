@@ -89,6 +89,10 @@ pub struct ButtonColors {
     pub active_foreground: Hsla,
     /// Disabled label color.
     pub disabled_foreground: Hsla,
+    /// Rest icon color.
+    pub icon: Hsla,
+    /// Disabled icon color.
+    pub disabled_icon: Hsla,
 }
 
 /// Button presentation shared across variants.
@@ -263,6 +267,8 @@ impl PrimerTheme {
                     hover_foreground: default_foreground,
                     active_foreground: default_foreground,
                     disabled_foreground: color(choose!(BUTTON_DEFAULT_FG_DISABLED)),
+                    icon: default_foreground,
+                    disabled_icon: color(choose!(BUTTON_DEFAULT_FG_DISABLED)),
                 },
                 primary: ButtonColors {
                     background: color(primary.background),
@@ -277,6 +283,8 @@ impl PrimerTheme {
                     hover_foreground: color(primary.foreground),
                     active_foreground: color(primary.foreground),
                     disabled_foreground: color(primary.disabled_foreground),
+                    icon: color(primary.icon),
+                    disabled_icon: color(primary.disabled_icon),
                 },
                 danger: ButtonColors {
                     background: color(choose!(BUTTON_DANGER_BG_REST)),
@@ -291,6 +299,8 @@ impl PrimerTheme {
                     hover_foreground: color(choose!(BUTTON_DANGER_FG_HOVER)),
                     active_foreground: color(choose!(BUTTON_DANGER_FG_ACTIVE)),
                     disabled_foreground: color(choose!(BUTTON_DANGER_FG_DISABLED)),
+                    icon: color(choose!(BUTTON_DANGER_FG_REST)),
+                    disabled_icon: color(choose!(BUTTON_DANGER_FG_DISABLED)),
                 },
                 radius: rems(common::BORDER_RADIUS_MEDIUM),
                 border_width: rems(common::BORDER_WIDTH_THIN),
@@ -349,6 +359,22 @@ mod tests {
         assert_eq!(
             dark.button.primary.background,
             rgba(DARK_PRIMARY_BUTTON.background).into()
+        );
+        assert_eq!(
+            light.button.primary.icon,
+            rgba(LIGHT_PRIMARY_BUTTON.icon).into()
+        );
+        assert_eq!(
+            dark.button.primary.icon,
+            rgba(DARK_PRIMARY_BUTTON.icon).into()
+        );
+        assert_eq!(
+            light.button.primary.disabled_icon,
+            rgba(LIGHT_PRIMARY_BUTTON.disabled_icon).into()
+        );
+        assert_eq!(
+            dark.button.primary.disabled_icon,
+            rgba(DARK_PRIMARY_BUTTON.disabled_icon).into()
         );
     }
 }
