@@ -6,6 +6,17 @@
 pub(crate) const BG_COLOR_DEFAULT: u32 = 0xffff_ffff;
 pub(crate) const BG_COLOR_MUTED: u32 = 0xf6f8_faff;
 pub(crate) const BORDER_COLOR_MUTED: u32 = 0xd1d9_e0b3;
+pub(crate) const BUTTON_DANGER_BG_ACTIVE: u32 = 0xa40e_26ff;
+pub(crate) const BUTTON_DANGER_BG_DISABLED: u32 = 0xeff2_f5ff;
+pub(crate) const BUTTON_DANGER_BG_HOVER: u32 = 0xcf22_2eff;
+pub(crate) const BUTTON_DANGER_BG_REST: u32 = 0xf6f8_faff;
+pub(crate) const BUTTON_DANGER_BORDER_ACTIVE: u32 = 0x1f23_2826;
+pub(crate) const BUTTON_DANGER_BORDER_HOVER: u32 = 0x1f23_2826;
+pub(crate) const BUTTON_DANGER_BORDER_REST: u32 = 0xd1d9_e0ff;
+pub(crate) const BUTTON_DANGER_FG_ACTIVE: u32 = 0xffff_ffff;
+pub(crate) const BUTTON_DANGER_FG_DISABLED: u32 = 0xd124_2f80;
+pub(crate) const BUTTON_DANGER_FG_HOVER: u32 = 0xffff_ffff;
+pub(crate) const BUTTON_DANGER_FG_REST: u32 = 0xd124_2fff;
 pub(crate) const BUTTON_DEFAULT_BG_ACTIVE: u32 = 0xe6ea_efff;
 pub(crate) const BUTTON_DEFAULT_BG_DISABLED: u32 = 0xeff2_f5ff;
 pub(crate) const BUTTON_DEFAULT_BG_HOVER: u32 = 0xeff2_f5ff;

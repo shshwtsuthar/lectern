@@ -59,12 +59,12 @@ pub struct ButtonColors {
     pub disabled_border: Hsla,
     /// Rest label color.
     pub foreground: Hsla,
+    /// Hover label color.
+    pub hover_foreground: Hsla,
+    /// Active label color.
+    pub active_foreground: Hsla,
     /// Disabled label color.
     pub disabled_foreground: Hsla,
-    /// Rest icon color.
-    pub icon: Hsla,
-    /// Disabled icon color.
-    pub disabled_icon: Hsla,
 }
 
 /// Button presentation shared across variants.
@@ -74,6 +74,8 @@ pub struct ButtonTheme {
     pub default: ButtonColors,
     /// Primary Button colors.
     pub primary: ButtonColors,
+    /// Destructive Button colors.
+    pub danger: ButtonColors,
     /// Corner radius.
     pub radius: Rems,
     /// Border width.
@@ -212,9 +214,9 @@ impl PrimerTheme {
                     active_border: color(choose!(BUTTON_DEFAULT_BORDER_ACTIVE)),
                     disabled_border: color(choose!(BUTTON_DEFAULT_BORDER_DISABLED)),
                     foreground: default_foreground,
+                    hover_foreground: default_foreground,
+                    active_foreground: default_foreground,
                     disabled_foreground: color(choose!(BUTTON_DEFAULT_FG_DISABLED)),
-                    icon: default_foreground,
-                    disabled_icon: color(choose!(BUTTON_DEFAULT_FG_DISABLED)),
                 },
                 primary: ButtonColors {
                     background: color(primary.background),
@@ -226,9 +228,23 @@ impl PrimerTheme {
                     active_border: color(primary.active_border),
                     disabled_border: color(primary.disabled_border),
                     foreground: color(primary.foreground),
+                    hover_foreground: color(primary.foreground),
+                    active_foreground: color(primary.foreground),
                     disabled_foreground: color(primary.disabled_foreground),
-                    icon: color(primary.icon),
-                    disabled_icon: color(primary.disabled_icon),
+                },
+                danger: ButtonColors {
+                    background: color(choose!(BUTTON_DANGER_BG_REST)),
+                    hover_background: color(choose!(BUTTON_DANGER_BG_HOVER)),
+                    active_background: color(choose!(BUTTON_DANGER_BG_ACTIVE)),
+                    disabled_background: color(choose!(BUTTON_DANGER_BG_DISABLED)),
+                    border: color(choose!(BUTTON_DANGER_BORDER_REST)),
+                    hover_border: color(choose!(BUTTON_DANGER_BORDER_HOVER)),
+                    active_border: color(choose!(BUTTON_DANGER_BORDER_ACTIVE)),
+                    disabled_border: color(choose!(BUTTON_DEFAULT_BORDER_DISABLED)),
+                    foreground: color(choose!(BUTTON_DANGER_FG_REST)),
+                    hover_foreground: color(choose!(BUTTON_DANGER_FG_HOVER)),
+                    active_foreground: color(choose!(BUTTON_DANGER_FG_ACTIVE)),
+                    disabled_foreground: color(choose!(BUTTON_DANGER_FG_DISABLED)),
                 },
                 radius: rems(common::BORDER_RADIUS_MEDIUM),
                 border_width: rems(common::BORDER_WIDTH_THIN),

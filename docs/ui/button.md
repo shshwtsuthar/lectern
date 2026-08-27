@@ -2,17 +2,18 @@
 
 ## Journey and workload
 
-The first call site is the primary **Add books** action in an empty library. Its representative
-release workload is `ui-bootstrap-regression-v1`: a fresh GPUI process paints the exact empty state,
-then the production action transition changes the Button to the disabled **Adding books…** state.
-The gate retains 40 measured samples after 5 warmups and checks initial-render and
-click-to-painted-busy-state p95 plus peak RSS.
+The first call sites are the primary **Add books** action and the destructive **Remove from
+library** action for a resolved book selection. Their representative release workloads are
+`ui-bootstrap-regression-v1` and `ui-selection-regression-v1`. The bootstrap gate paints the exact
+empty state and the Add-books busy transition; the selection gate paints a populated grid,
+selection context, and destructive confirmation. Both retain raw release-mode samples and check
+action-to-painted-state p95 plus peak RSS.
 
 ## Supported API
 
 - `Button::new(id, label)` requires a stable GPUI identity and a text label. The same text supplies
   the accessible name.
-- `ButtonVariant` supports `Default` and `Primary`.
+- `ButtonVariant` supports `Default`, `Primary`, and `Danger`.
 - `ButtonSize` supports `Small`, `Medium`, and `Large`.
 - A Button may have one decorative leading `TablerIcon`.
 - `disabled` is application-controlled. A disabled Button has no activation action and does not
@@ -25,9 +26,10 @@ component does not hide application state in an internal loading flag.
 
 ## Presentation and accessibility
 
-Neutral colors, geometry, typography, and focus-visible values come from the generated Primer token
-allowlist. The Primary variant uses the explicitly named Lectern Mauve state palette defined by the
-[visual foundations](visual-foundations.md), replacing Primer's GitHub-green primary treatment.
+Neutral and Danger colors, geometry, typography, and focus-visible values come from the generated
+Primer token allowlist. Danger is reserved for confirmed destructive actions and retains semantic
+red treatment. The Primary variant uses the explicitly named Lectern Mauve state palette defined by
+the [visual foundations](visual-foundations.md), replacing Primer's GitHub-green primary treatment.
 Components select immutable light or dark theme data without branching on a theme name. The upload
 glyph is the pinned Tabler outline SVG and is decorative; the Button label owns the accessible name.
 
@@ -42,10 +44,10 @@ future native outline primitive.
 
 ## Deliberate omissions
 
-Danger, invisible, link, icon-only, trailing visual, counter, selected, and component-owned loading
-APIs are not part of this first slice. They require a committed Lectern journey, their additional
-generated tokens, gallery coverage, interaction/accessibility tests, and release performance
-evidence before being added.
+Invisible, link, icon-only, trailing visual, counter, selected, and component-owned loading APIs are
+not part of this slice. They require a committed Lectern journey, their additional generated tokens,
+gallery coverage, interaction/accessibility tests, and release performance evidence before being
+added.
 
 ## Pinned references
 

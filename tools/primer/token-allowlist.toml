@@ -113,6 +113,83 @@ kind = "color"
 scope = "theme"
 
 [[tokens]]
+name = "button-danger-bgColor-rest"
+rust_name = "BUTTON_DANGER_BG_REST"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-danger-bgColor-hover"
+rust_name = "BUTTON_DANGER_BG_HOVER"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-danger-bgColor-active"
+rust_name = "BUTTON_DANGER_BG_ACTIVE"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-danger-bgColor-disabled"
+rust_name = "BUTTON_DANGER_BG_DISABLED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-danger-borderColor-rest"
+rust_name = "BUTTON_DANGER_BORDER_REST"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-danger-borderColor-hover"
+rust_name = "BUTTON_DANGER_BORDER_HOVER"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-danger-borderColor-active"
+rust_name = "BUTTON_DANGER_BORDER_ACTIVE"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-danger-fgColor-rest"
+rust_name = "BUTTON_DANGER_FG_REST"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-danger-fgColor-hover"
+rust_name = "BUTTON_DANGER_FG_HOVER"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-danger-fgColor-active"
+rust_name = "BUTTON_DANGER_FG_ACTIVE"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
+name = "button-danger-fgColor-disabled"
+rust_name = "BUTTON_DANGER_FG_DISABLED"
+source = "functional/themes"
+kind = "color"
+scope = "theme"
+
+[[tokens]]
 name = "borderRadius-medium"
 rust_name = "BORDER_RADIUS_MEDIUM"
 source = "functional/size/radius.json"

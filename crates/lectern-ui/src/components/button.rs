@@ -19,6 +19,8 @@ pub enum ButtonVariant {
     Default,
     /// The primary action in a view.
     Primary,
+    /// A destructive action requiring deliberate confirmation.
+    Danger,
 }
 
 /// Primer control sizes supported by Lectern's first Button port.
@@ -104,6 +106,7 @@ impl RenderOnce for Button {
         let colors = match self.variant {
             ButtonVariant::Default => theme.button.default,
             ButtonVariant::Primary => theme.button.primary,
+            ButtonVariant::Danger => theme.button.danger,
         };
         let (height, padding, gap) = match self.size {
             ButtonSize::Small => (
@@ -121,11 +124,6 @@ impl RenderOnce for Button {
                 rems(crate::generated::primitive_metadata::CONTROL_LARGE_PADDING_INLINE),
                 rems(crate::generated::primitive_metadata::CONTROL_LARGE_GAP),
             ),
-        };
-        let icon_color = if self.disabled {
-            colors.disabled_icon
-        } else {
-            colors.icon
         };
         let disabled = self.disabled;
         let on_click = self.on_click;
@@ -151,11 +149,13 @@ impl RenderOnce for Button {
                         style
                             .bg(colors.hover_background)
                             .border_color(colors.hover_border)
+                            .text_color(colors.hover_foreground)
                     })
                     .active(move |style| {
                         style
                             .bg(colors.active_background)
                             .border_color(colors.active_border)
+                            .text_color(colors.active_foreground)
                     })
             })
             .focus_visible(move |style| {
@@ -175,8 +175,7 @@ impl RenderOnce for Button {
                 button.child(
                     svg()
                         .path(icon.path())
-                        .size(rems(crate::generated::primitive_metadata::ICON_SIZE_SMALL))
-                        .text_color(icon_color),
+                        .size(rems(crate::generated::primitive_metadata::ICON_SIZE_SMALL)),
                 )
             })
             .child(self.label)

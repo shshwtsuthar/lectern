@@ -65,6 +65,14 @@ impl Render for ComponentGallery {
                 theme.spacing.medium,
             ))
             .child(row(
+                "Danger",
+                ButtonVariant::Danger,
+                false,
+                false,
+                theme.spacing.small,
+                theme.spacing.medium,
+            ))
+            .child(row(
                 "With icon",
                 ButtonVariant::Primary,
                 true,
@@ -74,7 +82,7 @@ impl Render for ComponentGallery {
             ))
             .child(row(
                 "Disabled",
-                ButtonVariant::Primary,
+                ButtonVariant::Danger,
                 true,
                 true,
                 theme.spacing.small,
