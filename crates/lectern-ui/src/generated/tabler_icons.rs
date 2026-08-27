@@ -10,6 +10,8 @@ pub enum TablerIcon {
     ChevronDown,
     /// The `chevron-up` Tabler icon.
     ChevronUp,
+    /// The `device-tablet` Tabler icon.
+    DeviceTablet,
     /// The `eye` Tabler icon.
     Eye,
     /// The `palette` Tabler icon.
@@ -25,6 +27,7 @@ impl TablerIcon {
         match self {
             Self::ChevronDown => "tabler/chevron-down.svg",
             Self::ChevronUp => "tabler/chevron-up.svg",
+            Self::DeviceTablet => "tabler/device-tablet.svg",
             Self::Eye => "tabler/eye.svg",
             Self::Palette => "tabler/palette.svg",
             Self::Upload => "tabler/upload.svg",

@@ -429,6 +429,10 @@ name = "chevron-up"
 rust_name = "ChevronUp"
 
 [[icons]]
+name = "device-tablet"
+rust_name = "DeviceTablet"
+
+[[icons]]
 name = "eye"
 rust_name = "Eye"
 

@@ -4,6 +4,7 @@ use gpui::{AssetSource, Result, SharedString};
 
 const CHEVRON_DOWN_ICON: &[u8] = include_bytes!("../assets/tabler/chevron-down.svg");
 const CHEVRON_UP_ICON: &[u8] = include_bytes!("../assets/tabler/chevron-up.svg");
+const DEVICE_TABLET_ICON: &[u8] = include_bytes!("../assets/tabler/device-tablet.svg");
 const EYE_ICON: &[u8] = include_bytes!("../assets/tabler/eye.svg");
 const PALETTE_ICON: &[u8] = include_bytes!("../assets/tabler/palette.svg");
 const UPLOAD_ICON: &[u8] = include_bytes!("../assets/tabler/upload.svg");
@@ -18,6 +19,7 @@ impl AssetSource for LecternAssets {
         Ok(match path {
             "tabler/chevron-down.svg" => Some(Cow::Borrowed(CHEVRON_DOWN_ICON)),
             "tabler/chevron-up.svg" => Some(Cow::Borrowed(CHEVRON_UP_ICON)),
+            "tabler/device-tablet.svg" => Some(Cow::Borrowed(DEVICE_TABLET_ICON)),
             "tabler/eye.svg" => Some(Cow::Borrowed(EYE_ICON)),
             "tabler/palette.svg" => Some(Cow::Borrowed(PALETTE_ICON)),
             "tabler/upload.svg" => Some(Cow::Borrowed(UPLOAD_ICON)),
@@ -31,6 +33,7 @@ impl AssetSource for LecternAssets {
             "tabler" => vec![
                 SharedString::new_static("chevron-down.svg"),
                 SharedString::new_static("chevron-up.svg"),
+                SharedString::new_static("device-tablet.svg"),
                 SharedString::new_static("eye.svg"),
                 SharedString::new_static("palette.svg"),
                 SharedString::new_static("upload.svg"),
@@ -57,6 +60,7 @@ mod tests {
     #[test]
     fn exposes_only_allowlisted_assets() {
         let assets = LecternAssets;
+        assert!(assets.load("tabler/device-tablet.svg").unwrap().is_some());
         assert!(assets.load("tabler/eye.svg").unwrap().is_some());
         assert!(assets.load("tabler/upload.svg").unwrap().is_some());
         assert!(assets.load("tabler/brand-github.svg").unwrap().is_none());
