@@ -23,6 +23,7 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 isolang = { version = "2.4.0", default-features = false, features = ["english_names", "list_languages"] }
 lectern-import = { path = "crates/lectern-import", version = "0.1.0" }
 lectern-core = { path = "crates/lectern-core", version = "0.1.0" }
+lectern-device = { path = "crates/lectern-device", version = "0.1.0" }
 lectern-service = { path = "crates/lectern-service", version = "0.1.0" }
 lectern-storage = { path = "crates/lectern-storage", version = "0.1.0" }
 lectern-ui = { path = "crates/lectern-ui", version = "0.1.0" }
@@ -35,9 +36,11 @@ rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.10.9"
+sysinfo = "=0.31.4"
 tar = "0.4.44"
 tempfile = "3.21.0"
 thiserror = "2.0"
+tracing = "0.1.44"
 toml = "0.9.5"
 ttf-parser = "0.25.1"
 unicode-casefold = "0.2.0"

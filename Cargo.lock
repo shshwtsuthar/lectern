@@ -3881,6 +3881,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lectern-device"
+version = "0.1.0"
+dependencies = [
+ "lectern-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
 name = "lectern-import"
 version = "0.1.0"
 dependencies = [

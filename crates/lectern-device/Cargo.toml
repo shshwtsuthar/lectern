@@ -1,0 +1,23 @@
+[package]
+name = "lectern-device"
+description = "Removable ebook-device integration for Lectern"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lectern-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sysinfo.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

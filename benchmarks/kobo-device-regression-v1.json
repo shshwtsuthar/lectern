@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-device-regression-budget",
+  "workload": {
+    "books": 120,
+    "source_bytes_per_book": 1048576,
+    "candidate_volumes": 32,
+    "warmup_iterations": 1,
+    "measured_iterations": 10
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 5.0
+  },
+  "budgets": {
+    "reconciliation": {
+      "max_p95_ms": 15
+    },
+    "batch_transfer": {
+      "max_p95_ms": 5000,
+      "min_p05_throughput_mib_per_second": 50,
+      "max_peak_rss_delta_bytes": 33554432
+    }
+  }
+}
