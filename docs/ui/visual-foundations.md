@@ -94,8 +94,9 @@ main top bar. Render that wordmark at Medium 500 through explicitly named typogr
 Do not use Newsreader as a general heading face; its literary character stays distinctive when the
 rest of the interface remains Karla. The application embeds a wordmark-only subset of the face and
 its OFL license so the wordmark never depends on a workstation font install or parses unused glyphs
-at startup. Give the wordmark the large horizontal inset
-used by other application bars, not the smaller vertical inset.
+at startup. Keep the lowercase `m` glyph when regenerating the subset: GPUI's Linux font loader uses
+it to validate a face before making that family available. Give the wordmark the large horizontal
+inset used by other application bars, not the smaller vertical inset.
 
 Library-card metadata is centered beneath its cover. Use the small spacing token between the cover
 and title. Title and author use the shared compact metadata line-height with no additional margin,

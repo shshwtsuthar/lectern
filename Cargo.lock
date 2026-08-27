@@ -3925,6 +3925,7 @@ dependencies = [
  "gpui",
  "gpui-base",
  "gpui_platform",
+ "ttf-parser",
 ]
 
 [[package]]

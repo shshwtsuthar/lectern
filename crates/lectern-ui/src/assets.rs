@@ -61,4 +61,20 @@ mod tests {
         assert!(assets.load("tabler/upload.svg").unwrap().is_some());
         assert!(assets.load("tabler/brand-github.svg").unwrap().is_none());
     }
+
+    #[test]
+    fn bundled_wordmark_font_contains_gpui_loader_glyph() {
+        let face = ttf_parser::Face::parse(NEWSREADER_MEDIUM, 0).unwrap();
+        assert!(face.names().into_iter().any(|name| {
+            name.name_id == ttf_parser::name_id::TYPOGRAPHIC_FAMILY
+                && name.to_string().as_deref() == Some("Newsreader 14pt")
+        }));
+        assert_eq!(face.weight().to_number(), 500);
+        for character in "Lecternm".chars() {
+            assert!(
+                face.glyph_index(character).is_some(),
+                "Newsreader subset must contain {character:?}"
+            );
+        }
+    }
 }
