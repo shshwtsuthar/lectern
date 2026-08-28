@@ -3404,11 +3404,15 @@ dependencies = [
  "gpui_platform",
  "isolang",
  "lectern-core",
+ "lectern-device",
  "lectern-service",
  "lectern-ui",
  "rfd",
  "serde",
  "serde_json",
+ "tempfile",
+ "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]

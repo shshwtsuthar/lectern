@@ -475,7 +475,7 @@ fn run_migration(options: &Options) -> Result<(), String> {
             .as_millis(),
         database_path: options.database.display().to_string(),
         source_schema_version: 5,
-        final_schema_version: 9,
+        final_schema_version: 10,
         library_books: options.books,
         warmup_iterations: options.warmup,
         measured_iterations: options.iterations,
@@ -525,6 +525,8 @@ fn prepare_version_seven_template(
             "DROP INDEX series_memberships_series_number_uidx; \
              UPDATE series_memberships SET series_index = 1000000; \
              UPDATE books SET series_index = 1000000 WHERE series IS NOT NULL; \
+             DROP TABLE book_virtual_libraries; \
+             DROP TABLE virtual_libraries; \
              DROP TABLE book_metadata; \
              PRAGMA user_version = 7;",
         )
@@ -654,8 +656,8 @@ fn validate_migrated_candidate(path: &Path, options: &Options) -> Result<(), Str
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(display_error)?;
-    if version != 9 {
-        return Err(format!("candidate schema is {version}, expected 9"));
+    if version != 10 {
+        return Err(format!("candidate schema is {version}, expected 10"));
     }
     expect_count(&connection, "books", options.books)?;
     expect_count(&connection, "book_assets", options.books)?;
@@ -668,6 +670,8 @@ fn validate_migrated_candidate(path: &Path, options: &Options) -> Result<(), Str
     )?;
     expect_count(&connection, "tags", 0)?;
     expect_count(&connection, "saved_searches", 0)?;
+    expect_count(&connection, "virtual_libraries", 0)?;
+    expect_count(&connection, "book_virtual_libraries", 0)?;
     let invalid_metadata_defaults: i64 = connection
         .query_row(
             "SELECT count(*) FROM books b LEFT JOIN book_metadata m ON m.book_id = b.id \

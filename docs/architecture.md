@@ -6,11 +6,12 @@ storage, and import layers.
 ## Dependency direction
 
 ```text
-lectern-desktop ──┐
-                  ├──> lectern-service ──┬──> lectern-core
-lectern-cli ──────┘                      ├──> lectern-import ──┬──> lectern-core
-                                         │                    └──> lectern-storage
-                                         └──> lectern-storage ───> lectern-core
+lectern-desktop ──┬──> lectern-service ──┬──> lectern-core
+                  │                      ├──> lectern-import ──┬──> lectern-core
+                  │                      │                    └──> lectern-storage
+                  │                      └──> lectern-storage ───> lectern-core
+                  └──> lectern-device ──────> lectern-core
+lectern-cli ─────────> lectern-service
 ```
 
 `lectern-core` owns domain language, use cases, and the interfaces those use cases need. It must not
@@ -37,6 +38,8 @@ database path.
 - `lectern-storage` owns schema migration, transactional writes, FTS5 queries, and cover blobs.
 - `lectern-import` owns EPUB/PDF discovery, bounded parsing and cover rendering, and batched
   ingestion.
+- `lectern-device` owns generic connected-reader state, Kobo capability detection, transfer
+  planning and history, safe device-file operations, and isolated operating-system storage APIs.
 - `lectern-desktop` owns native presentation, worker coordination, and platform dialogs.
 - `lectern-cli` owns command parsing and human-readable automation/diagnostic output.
 
@@ -60,6 +63,14 @@ relinking validates publication structure without regenerating thumbnails. Expli
 attachment validates the selected publication before atomically adding a referenced asset, leaving
 book metadata, covers, and existing assets untouched. The UI retains at most 256 cover textures and
 requests repainting only when background work completes or interaction requires it.
+
+Removable readers are reconciled on a lightweight two-second background cadence without touching
+ordinary filesystem trees. Only removable-looking mounts receive the `.kobo` capability check.
+Each detected reader owns an operation lock, so transfer, listing, removal, refresh, and eject do
+not race on that reader; identities and sessions remain per device. Transfers resolve assets in a
+background task, use one bounded streaming buffer, publish through a synchronized temporary file,
+and record a non-authoritative local correlation only after publication. Kobo firmware files and
+`KoboReader.sqlite` are never changed.
 
 SQLite runs in WAL mode for the persistent library. FTS5 triggers keep search data consistent with
 imports and metadata edits. Imports never extract archive members to disk, reject unsafe archive

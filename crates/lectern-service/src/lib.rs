@@ -14,7 +14,8 @@ use lectern_core::{
     organisation::{
         BookEdit, BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, ContributorId,
         ContributorUsage, SavedSearch, SavedSearchId, SelectionSnapshot, SelectionTagUsage,
-        SeriesId, SeriesIndex, SeriesUsage, TagId, TagUsage, VocabularyMutationResult,
+        SeriesId, SeriesIndex, SeriesUsage, TagId, TagUsage, VirtualLibrary, VirtualLibraryIcon,
+        VirtualLibraryId, VirtualLibraryMembershipResult, VocabularyMutationResult,
     },
 };
 use lectern_import::{import_paths_into, validate_publication};
@@ -180,6 +181,40 @@ impl LibraryService for SqliteLibraryService {
         limit: u32,
     ) -> Result<Vec<TagUsage>, Self::Error> {
         Ok(self.database.autocomplete_tags(prefix, selected, limit)?)
+    }
+
+    fn create_virtual_library(
+        &mut self,
+        name: &str,
+        description: Option<&str>,
+        icon: VirtualLibraryIcon,
+        book: Option<BookId>,
+    ) -> Result<VirtualLibrary, Self::Error> {
+        Ok(self
+            .database
+            .create_virtual_library(name, description, icon, book)?)
+    }
+
+    fn autocomplete_virtual_libraries(
+        &mut self,
+        prefix: &str,
+        selected: &[VirtualLibraryId],
+        limit: u32,
+    ) -> Result<Vec<VirtualLibrary>, Self::Error> {
+        Ok(self
+            .database
+            .autocomplete_virtual_libraries(prefix, selected, limit)?)
+    }
+
+    fn set_book_virtual_library_membership(
+        &mut self,
+        book: BookId,
+        library: VirtualLibraryId,
+        included: bool,
+    ) -> Result<VirtualLibraryMembershipResult, Self::Error> {
+        Ok(self
+            .database
+            .set_book_virtual_library_membership(book, library, included)?)
     }
 
     fn search_contributors(

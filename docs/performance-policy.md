@@ -71,6 +71,8 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/bulk-remove-regression-v2.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/saved-searches-regression-v2.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/virtual-libraries-regression-v1.json
 ```
 
 GPUI bootstrap, theme, component, asset, and empty-library rendering changes require the native
@@ -118,11 +120,24 @@ populated first paint, book-selection-to-painted-sidebar p95, and peak RSS.
 The normalized organisation v2 fixture replaces the historical duplicate series-number
 distribution with deterministic unique exact numbers at the same 50,000-book, 2,500-series scale.
 Its query suite includes the indexed conflict/self-exclusion check used by the Book number input.
-The version-five-to-current migration suite reaches schema version 9 and measures installation of
+The version-five-to-current migration suite reaches schema version 10 and measures installation of
 the partial unique index plus the canonical publication-date and half-star-rating detail table;
 unit migration coverage separately supplies deliberate version-seven duplicates, verifies the
 deterministic repair, and covers version-eight metadata defaults. Keeping these detail-only values
 outside the hot `books` rows preserves the compact indexed projection used by grid and search scans.
+
+GPUI virtual-library creation and single-book membership controls require the native
+virtual-library suite:
+
+```sh
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/ui-virtual-library-regression-v1.json
+```
+
+It retains 40 measured fresh-process samples after 5 warmups for the 50,000-book projection. It
+verifies the complete name, description, and icon dialog plus a book-detail picker with three
+memberships and fifty bounded suggestions while gating both interaction-to-painted-state p95s and
+peak RSS.
 
 The export suite is also mandatory for changes to copy buffers, publication, overwrite behavior,
 export scheduling, or export progress. Import, startup, scrolling, rendering, or memory changes

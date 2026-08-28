@@ -676,6 +676,8 @@ pub struct Book {
     pub series_membership: Option<organisation::SeriesMembership>,
     /// Authoritative normalized tags in display-name order.
     pub tags: Vec<organisation::Tag>,
+    /// Virtual libraries containing this canonical book, in display-name order.
+    pub virtual_libraries: Vec<organisation::VirtualLibrary>,
     /// Optional publisher.
     pub publisher: Option<String>,
     /// Optional calendar publication date.
@@ -871,6 +873,31 @@ pub trait LibraryService {
         selected: &[organisation::TagId],
         limit: u32,
     ) -> Result<Vec<organisation::TagUsage>, Self::Error>;
+
+    /// Creates a virtual library, optionally assigning one book in the same transaction.
+    fn create_virtual_library(
+        &mut self,
+        name: &str,
+        description: Option<&str>,
+        icon: organisation::VirtualLibraryIcon,
+        book: Option<BookId>,
+    ) -> Result<organisation::VirtualLibrary, Self::Error>;
+
+    /// Returns bounded virtual-library suggestions, prioritizing selected values.
+    fn autocomplete_virtual_libraries(
+        &mut self,
+        prefix: &str,
+        selected: &[organisation::VirtualLibraryId],
+        limit: u32,
+    ) -> Result<Vec<organisation::VirtualLibrary>, Self::Error>;
+
+    /// Adds or removes one canonical book from a virtual library atomically.
+    fn set_book_virtual_library_membership(
+        &mut self,
+        book: BookId,
+        library: organisation::VirtualLibraryId,
+        included: bool,
+    ) -> Result<organisation::VirtualLibraryMembershipResult, Self::Error>;
 
     /// Returns one bounded contributor vocabulary page with global usage counts.
     fn search_contributors(

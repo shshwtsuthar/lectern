@@ -20,8 +20,9 @@ use lectern_core::organisation::{
     BookEdit, BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, ContributorId,
     ContributorUsage, LibraryGeneration, NameKind, SavedSearch, SavedSearchId, SearchClause,
     SearchExpression, SearchParseError, SelectionSnapshot, SelectionTagUsage, SeriesId,
-    SeriesIndex, SeriesUsage, TagColor, TagId, TagReference, TagUsage, TextMatch,
-    VocabularyMutationResult, identity_key, normalize_name,
+    SeriesIndex, SeriesUsage, TagColor, TagId, TagReference, TagUsage, TextMatch, VirtualLibrary,
+    VirtualLibraryIcon, VirtualLibraryId, VirtualLibraryMembershipResult, VocabularyMutationResult,
+    identity_key, normalize_name,
 };
 use lectern_core::{
     AssetHealth, AssetHealthReport, AssetId, AssetStorage, BackupReport, Book, BookAsset,
@@ -38,7 +39,7 @@ use thiserror::Error;
 #[cfg(not(any(unix, windows)))]
 compile_error!("Lectern's lossless path codec currently supports Unix and Windows targets");
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const BACKUP_PAGES_PER_STEP: i32 = 2_048;
 static NEXT_BACKUP_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -991,6 +992,11 @@ impl LibraryDatabase {
             [],
         )?;
         transaction.execute(
+            "DELETE FROM book_virtual_libraries \
+             WHERE book_id IN (SELECT book_id FROM temp.lectern_selected_books)",
+            [],
+        )?;
+        transaction.execute(
             "DELETE FROM book_tags \
              WHERE book_id IN (SELECT book_id FROM temp.lectern_selected_books)",
             [],
@@ -1074,6 +1080,7 @@ impl LibraryDatabase {
                     contributors: Vec::new(),
                     series_membership: None,
                     tags: Vec::new(),
+                    virtual_libraries: Vec::new(),
                     publisher: row.get(4)?,
                     publication_date,
                     language: row.get(6)?,
@@ -1109,6 +1116,8 @@ impl LibraryDatabase {
             book.contributors = contributors;
             book.series_membership = series;
             book.tags = tags;
+            book.virtual_libraries =
+                organisation::load_book_virtual_libraries(&self.connection, book.id)?;
         }
 
         Ok(book)
@@ -1230,6 +1239,70 @@ impl LibraryDatabase {
         limit: u32,
     ) -> Result<Vec<TagUsage>> {
         organisation::autocomplete_tags(&self.connection, prefix, selected, limit)
+    }
+
+    /// Creates one virtual library and optionally assigns a book in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the normalized name already exists, input is invalid, the optional
+    /// book is absent, or the transaction cannot commit.
+    pub fn create_virtual_library(
+        &mut self,
+        name: &str,
+        description: Option<&str>,
+        icon: VirtualLibraryIcon,
+        book: Option<BookId>,
+    ) -> Result<VirtualLibrary> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let library =
+            organisation::create_virtual_library(&transaction, name, description, icon, book)?;
+        transaction.commit()?;
+        self.bump_generation();
+        Ok(library)
+    }
+
+    /// Returns at most fifty virtual-library identity-prefix matches with selected values first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prefix is invalid or the bounded indexed query fails.
+    pub fn autocomplete_virtual_libraries(
+        &self,
+        prefix: &str,
+        selected: &[VirtualLibraryId],
+        limit: u32,
+    ) -> Result<Vec<VirtualLibrary>> {
+        organisation::autocomplete_virtual_libraries(&self.connection, prefix, selected, limit)
+    }
+
+    /// Adds or removes one canonical book from a virtual library atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either identity is absent or the transaction cannot commit.
+    pub fn set_book_virtual_library_membership(
+        &mut self,
+        book: BookId,
+        library: VirtualLibraryId,
+        included: bool,
+    ) -> Result<VirtualLibraryMembershipResult> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = organisation::set_book_virtual_library_membership(
+            &transaction,
+            book,
+            library,
+            included,
+        )?;
+        transaction.commit()?;
+        if result.changed {
+            self.bump_generation();
+        }
+        Ok(result)
     }
 
     /// Returns at most one hundred normalized-name contributor rows for vocabulary management.
@@ -2278,8 +2351,8 @@ fn configure_persistent_database(connection: &Connection) -> Result<()> {
 fn initialize_schema(connection: &mut Connection) -> Result<()> {
     let observed = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match observed {
-        SCHEMA_VERSION => return Ok(()),
-        0..=8 => {}
+        SCHEMA_VERSION if current_schema_complete(connection)? => return Ok(()),
+        SCHEMA_VERSION | 0..=9 => {}
         unsupported => return Err(StorageError::UnsupportedSchema(unsupported)),
     }
 
@@ -2308,6 +2381,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         1 | 2 => {
@@ -2318,6 +2392,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         3 => {
@@ -2327,6 +2402,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         4 => {
@@ -2335,6 +2411,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         5 => {
@@ -2342,24 +2419,35 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         6 => {
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         7 => {
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         8 => {
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
-        SCHEMA_VERSION => false,
+        9 => {
+            if !book_metadata_table_exists(&transaction)? {
+                transaction.execute_batch(MIGRATE_8_TO_9)?;
+            }
+            organisation::migrate_v9_to_v10(&transaction)?;
+            true
+        }
+        SCHEMA_VERSION => repair_current_schema(&transaction)?,
         unsupported => return Err(StorageError::UnsupportedSchema(unsupported)),
     };
 
@@ -2371,7 +2459,57 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn book_metadata_table_exists(connection: &Connection) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'book_metadata' \
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::from)
+}
+
+fn virtual_library_tables_exist(connection: &Connection) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT count(*) = 2 FROM sqlite_schema \
+             WHERE type = 'table' AND name IN ('virtual_libraries', 'book_virtual_libraries')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::from)
+}
+
+fn current_schema_complete(connection: &Connection) -> Result<bool> {
+    Ok(book_metadata_table_exists(connection)? && virtual_library_tables_exist(connection)?)
+}
+
+fn repair_current_schema(transaction: &Transaction<'_>) -> Result<bool> {
+    let mut changed = false;
+    if !book_metadata_table_exists(transaction)? {
+        transaction.execute_batch(MIGRATE_8_TO_9)?;
+        changed = true;
+    }
+    if !virtual_library_tables_exist(transaction)? {
+        organisation::migrate_v9_to_v10(transaction)?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
 fn validate_schema(transaction: &Transaction<'_>) -> Result<()> {
+    if !book_metadata_table_exists(transaction)? {
+        return Err(StorageError::Integrity(
+            "schema migration left the book metadata table missing".into(),
+        ));
+    }
+    if !virtual_library_tables_exist(transaction)? {
+        return Err(StorageError::Integrity(
+            "schema migration left virtual-library tables missing".into(),
+        ));
+    }
     let mut foreign_keys = transaction.prepare("PRAGMA foreign_key_check")?;
     if foreign_keys.exists([])? {
         return Err(StorageError::Integrity(
@@ -3294,7 +3432,8 @@ mod tests {
             BookEdit, BookSelection, BulkTagEdit, ContributorCreditEdit, ContributorFacet,
             ContributorReference, ContributorRole, ExactFacets, ImportedContributorCredit,
             ImportedOrganisation, SavedSearchId, SearchExpression, SeriesIndex,
-            SeriesMembershipEdit, SeriesReference, TagId, TagReference, VocabularyMutationResult,
+            SeriesMembershipEdit, SeriesReference, TagId, TagReference, VirtualLibraryIcon,
+            VocabularyMutationResult,
         },
     };
     use rusqlite::{Connection, params};
@@ -3910,6 +4049,39 @@ END;
             configure_persistent_database(&memory),
             Err(StorageError::Integrity(message)) if message.contains("rollback journaling")
         ));
+    }
+
+    #[test]
+    fn repairs_version_nine_library_missing_book_metadata_table() {
+        let database_file = TestDatabase::new("repair-v9-metadata");
+        let book_id = {
+            let mut database = LibraryDatabase::open(database_file.path()).expect("create library");
+            let book_id = database
+                .import_books(&[record("/books/dune.epub", "Dune", "Frank Herbert")])
+                .expect("seed book")[0];
+            database
+                .connection
+                .execute("DROP TABLE book_metadata", [])
+                .expect("simulate incomplete version-nine migration");
+            assert_eq!(
+                database
+                    .connection
+                    .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                    .expect("read incomplete schema version"),
+                SCHEMA_VERSION
+            );
+            book_id
+        };
+
+        let repaired = LibraryDatabase::open(database_file.path()).expect("repair library");
+        let book = repaired
+            .get_book(book_id)
+            .expect("load repaired book")
+            .expect("repaired book exists");
+
+        assert_eq!(book.title, "Dune");
+        assert_eq!(book.publication_date, None);
+        assert_eq!(book.rating, BookRating::default());
     }
 
     #[test]
@@ -5360,6 +5532,90 @@ END;
     }
 
     #[test]
+    fn virtual_libraries_create_search_and_change_membership_atomically() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let books = database
+            .import_books(&[
+                record("/books/earthsea.epub", "Earthsea", "Ursula K. Le Guin"),
+                record("/books/tehanu.epub", "Tehanu", "Ursula K. Le Guin"),
+            ])
+            .expect("seed books");
+
+        let empty = database
+            .create_virtual_library(
+                "  Reference   Shelf  ",
+                Some("  Books to revisit.  "),
+                VirtualLibraryIcon::Bookmark,
+                None,
+            )
+            .expect("create empty virtual library");
+        assert_eq!(empty.name, "Reference Shelf");
+        assert_eq!(empty.description.as_deref(), Some("Books to revisit."));
+        assert_eq!(empty.books, 0);
+
+        let assigned = database
+            .create_virtual_library("Favorites", None, VirtualLibraryIcon::Heart, Some(books[0]))
+            .expect("create and assign virtual library");
+        assert_eq!(assigned.books, 1);
+        let loaded = database
+            .get_book(books[0])
+            .expect("load book")
+            .expect("book exists");
+        assert_eq!(loaded.virtual_libraries, vec![assigned.clone()]);
+
+        let suggestions = database
+            .autocomplete_virtual_libraries("", &[assigned.id], 50)
+            .expect("load virtual libraries");
+        assert_eq!(suggestions[0], assigned);
+        assert_eq!(suggestions[1], empty);
+
+        let added = database
+            .set_book_virtual_library_membership(books[1], assigned.id, true)
+            .expect("add second membership");
+        assert!(added.changed);
+        assert!(added.included);
+        assert_eq!(added.library.books, 2);
+        let unchanged = database
+            .set_book_virtual_library_membership(books[1], assigned.id, true)
+            .expect("repeat membership");
+        assert!(!unchanged.changed);
+        assert_eq!(unchanged.library.books, 2);
+
+        let removed = database
+            .set_book_virtual_library_membership(books[0], assigned.id, false)
+            .expect("remove membership");
+        assert!(removed.changed);
+        assert_eq!(removed.library.books, 1);
+        assert!(
+            database
+                .get_book(books[0])
+                .unwrap()
+                .unwrap()
+                .virtual_libraries
+                .is_empty()
+        );
+
+        let before = database
+            .autocomplete_virtual_libraries("", &[], 50)
+            .unwrap();
+        assert!(matches!(
+            database.create_virtual_library(
+                "reference shelf",
+                None,
+                VirtualLibraryIcon::Books,
+                None,
+            ),
+            Err(StorageError::InvalidCuration(_))
+        ));
+        assert_eq!(
+            database
+                .autocomplete_virtual_libraries("", &[], 50)
+                .unwrap(),
+            before
+        );
+    }
+
+    #[test]
     fn vocabulary_manager_searches_indexed_pages_without_rendering_over_one_hundred_rows() {
         let database = LibraryDatabase::open_in_memory().expect("open library");
         for index in 0..125 {
@@ -6358,6 +6614,7 @@ END;
             contributors: Vec::new(),
             series_membership: None,
             tags: Vec::new(),
+            virtual_libraries: Vec::new(),
             publisher: None,
             publication_date: None,
             language: None,

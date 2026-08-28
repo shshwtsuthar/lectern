@@ -42,6 +42,10 @@ stable_id!(
 stable_id!(SeriesId, "Stable identifier for one normalized series.");
 stable_id!(TagId, "Stable identifier for one normalized tag.");
 stable_id!(
+    VirtualLibraryId,
+    "Stable identifier for one user-created virtual library."
+);
+stable_id!(
     SavedSearchId,
     "Stable identifier for one saved library projection."
 );
@@ -57,6 +61,8 @@ pub enum NameKind {
     Tag,
     /// Saved-search display name.
     SavedSearch,
+    /// Virtual-library display name.
+    VirtualLibrary,
 }
 
 impl NameKind {
@@ -66,7 +72,7 @@ impl NameKind {
         match self {
             Self::Contributor | Self::Series => 256,
             Self::Tag => 64,
-            Self::SavedSearch => 80,
+            Self::SavedSearch | Self::VirtualLibrary => 80,
         }
     }
 }
@@ -78,6 +84,7 @@ impl fmt::Display for NameKind {
             Self::Series => "series name",
             Self::Tag => "tag name",
             Self::SavedSearch => "saved-search name",
+            Self::VirtualLibrary => "virtual-library name",
         })
     }
 }
@@ -335,6 +342,115 @@ pub struct Tag {
     pub name: String,
     /// User-selected presentation color.
     pub color: TagColor,
+}
+
+/// One user-created library projection backed by explicit book membership.One user-created library projection backed by explicit book membership.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VirtualLibrary {
+    /// Stable virtual-library identifier.
+    pub id: VirtualLibraryId,
+    /// Display-ready unique library name.
+    pub name: String,
+    /// Optional user-authored description.
+    pub description: Option<String>,
+    /// User-selected built-in cover icon.
+    pub icon: VirtualLibraryIcon,
+    /// Number of canonical books currently assigned to the virtual library.
+    pub books: u64,
+}
+
+/// Built-in cover icons available to virtual libraries.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum VirtualLibraryIcon {
+    /// A compact stack of books.
+    #[default]
+    Books,
+    /// A bookmark for reading lists.
+    Bookmark,
+    /// A star for favorites and highlights.
+    Star,
+    /// A heart for personal collections.
+    Heart,
+    /// A mortarboard for study collections.
+    Academic,
+    /// A globe for place or language collections.
+    World,
+}
+
+impl VirtualLibraryIcon {
+    /// Every selectable icon in presentation order.
+    pub const ALL: [Self; 6] = [
+        Self::Books,
+        Self::Bookmark,
+        Self::Star,
+        Self::Heart,
+        Self::Academic,
+        Self::World,
+    ];
+
+    /// Returns the stable lowercase storage value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Books => "books",
+            Self::Bookmark => "bookmark",
+            Self::Star => "star",
+            Self::Heart => "heart",
+            Self::Academic => "academic",
+            Self::World => "world",
+        }
+    }
+
+    /// Parses a stable lowercase storage value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "books" => Some(Self::Books),
+            "bookmark" => Some(Self::Bookmark),
+            "star" => Some(Self::Star),
+            "heart" => Some(Self::Heart),
+            "academic" => Some(Self::Academic),
+            "world" => Some(Self::World),
+            _ => None,
+        }
+    }
+
+    /// Returns the compact glyph used by the native UI.
+    #[must_use]
+    pub const fn glyph(self) -> &'static str {
+        match self {
+            Self::Books => "▥",
+            Self::Bookmark => "◆",
+            Self::Star => "★",
+            Self::Heart => "♥",
+            Self::Academic => "▲",
+            Self::World => "◎",
+        }
+    }
+}
+
+impl fmt::Display for VirtualLibraryIcon {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Books => "Books",
+            Self::Bookmark => "Bookmark",
+            Self::Star => "Star",
+            Self::Heart => "Heart",
+            Self::Academic => "Academic",
+            Self::World => "World",
+        })
+    }
+}
+
+/// Exact outcome of changing one book's virtual-library membership.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VirtualLibraryMembershipResult {
+    /// Refreshed virtual-library metadata and derived book count.
+    pub library: VirtualLibrary,
+    /// Final membership state requested by the caller.
+    pub included: bool,
+    /// Whether the durable relationship changed.
+    pub changed: bool,
 }
 
 /// Restrained, named colors available to library tags.
@@ -1440,6 +1556,19 @@ mod tests {
             normalize_name(NameKind::Tag, &"x".repeat(65)),
             Err(NameValidationError::TooLong { maximum: 64, .. })
         ));
+        assert!(normalize_name(NameKind::VirtualLibrary, &"x".repeat(80)).is_ok());
+        assert!(matches!(
+            normalize_name(NameKind::VirtualLibrary, &"x".repeat(81)),
+            Err(NameValidationError::TooLong { maximum: 80, .. })
+        ));
+    }
+
+    #[test]
+    fn virtual_library_icons_round_trip_storage_values() {
+        for icon in super::VirtualLibraryIcon::ALL {
+            assert_eq!(super::VirtualLibraryIcon::parse(icon.as_str()), Some(icon));
+            assert!(!icon.glyph().is_empty());
+        }
     }
 
     #[test]

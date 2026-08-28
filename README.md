@@ -24,14 +24,17 @@ immediately searchable, renders a cover grid, and edits their metadata.
 - Attach a missing EPUB or PDF format to an existing book after validating the selected file,
   without changing its metadata, cover, or existing file assets.
 - Remove a book from the library without deleting any of its EPUB or PDF files.
+- Automatically detect mounted Kobo e-ink readers, show storage, send selected EPUB/PDF books with
+  asynchronous batch progress, reconcile Lectern-managed device copies, remove those copies, and
+  request a real operating-system eject.
 - Rescan referenced book files, filter missing or unreadable assets, and safely relink a missing
   EPUB or PDF without losing its logical-book metadata, cover, or asset identity.
 - Run library diagnostics and create a consistent, validated SQLite backup from the command line,
   including while the live library has committed data in its WAL.
 
-Device export, filesystem export, and Calibre-library import are not implemented yet.
-Password-protected PDFs also require a future password prompt. These remain product work rather
-than hidden placeholders in this release.
+General filesystem export, non-Kobo device support, and Calibre-library import are not implemented
+yet. Password-protected PDFs also require a future password prompt. These remain product work
+rather than hidden placeholders in this release.
 
 The next file-management tranche adds detach, open, reveal, deliberate replacement, and
 single-asset export without adding another parser or deleting externally referenced files. Its
@@ -96,6 +99,7 @@ edit their tags, manage exact filters, or reuse a saved search.
 crates/
 ├── lectern-core/     # Domain language and workflow contract
 ├── lectern-service/  # Application policy and workflow orchestration
+├── lectern-device/   # Generic removable-reader and Kobo mass-storage adapter
 ├── lectern-desktop/  # Native application
 ├── lectern-ui/       # Generated Primer tokens and native GPUI components
 ├── lectern-import/   # EPUB and PDF discovery and ingestion

@@ -5,6 +5,7 @@
     reason = "shared editor state retains workflow helpers for incremental GPUI interactions"
 )]
 mod curation;
+mod device;
 
 pub mod export;
 pub mod gpui_app;

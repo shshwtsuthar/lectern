@@ -9,7 +9,8 @@ use lectern_core::{
         ContributorReference, ContributorRole, ContributorUsage, ImportedContributorCredit,
         ImportedOrganisation, NameKind, SavedSearch, SavedSearchId, Series, SeriesId, SeriesIndex,
         SeriesMembership, SeriesMembershipEdit, SeriesReference, SeriesUsage, Tag, TagColor, TagId,
-        TagReference, TagUsage, VocabularyMutationResult, identity_key, normalize_name,
+        TagReference, TagUsage, VirtualLibrary, VirtualLibraryIcon, VirtualLibraryId,
+        VirtualLibraryMembershipResult, VocabularyMutationResult, identity_key, normalize_name,
     },
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -324,6 +325,32 @@ pub(super) fn migrate_v7_to_v8(transaction: &Transaction<'_>) -> Result<()> {
          ); \
          CREATE UNIQUE INDEX series_memberships_series_number_uidx \
              ON series_memberships(series_id, series_index) WHERE series_index IS NOT NULL;",
+    )?;
+    Ok(())
+}
+
+/// Adds user-created virtual libraries and indexed many-to-many book membership in schema 10.
+pub(super) fn migrate_v9_to_v10(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE virtual_libraries ( \
+             id           INTEGER PRIMARY KEY, \
+             name         TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 80), \
+             identity_key TEXT NOT NULL UNIQUE CHECK (length(identity_key) > 0), \
+             description  TEXT CHECK (description IS NULL OR length(description) <= 2000), \
+             icon         TEXT NOT NULL DEFAULT 'books' \
+                          CHECK (icon IN ('books', 'bookmark', 'star', 'heart', 'academic', 'world')), \
+             created_at   INTEGER NOT NULL DEFAULT (unixepoch()), \
+             modified_at  INTEGER NOT NULL DEFAULT (unixepoch()) \
+         ) STRICT; \
+         CREATE INDEX virtual_libraries_name_idx ON virtual_libraries(identity_key, id); \
+         CREATE TABLE book_virtual_libraries ( \
+             book_id            INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE, \
+             virtual_library_id INTEGER NOT NULL REFERENCES virtual_libraries(id) ON DELETE CASCADE, \
+             added_at           INTEGER NOT NULL DEFAULT (unixepoch()), \
+             PRIMARY KEY (book_id, virtual_library_id) \
+         ) STRICT; \
+         CREATE INDEX book_virtual_libraries_library_book_idx \
+             ON book_virtual_libraries(virtual_library_id, book_id);",
     )?;
     Ok(())
 }
@@ -1090,6 +1117,232 @@ pub(super) fn autocomplete_tags(
         }
     }
     Ok(results)
+}
+
+/// Creates one normalized virtual library and optionally assigns a book atomically.
+pub(super) fn create_virtual_library(
+    transaction: &Transaction<'_>,
+    name: &str,
+    description: Option<&str>,
+    icon: VirtualLibraryIcon,
+    book: Option<BookId>,
+) -> Result<VirtualLibrary> {
+    let name = normalize_user_name(NameKind::VirtualLibrary, name)?;
+    let key = identity_key(&name);
+    let description = validate_virtual_library_description(description)?;
+    if transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM virtual_libraries WHERE identity_key = ?1)",
+        [&key],
+        |row| row.get::<_, bool>(0),
+    )? {
+        return Err(StorageError::InvalidCuration(format!(
+            "virtual library {name:?} already exists"
+        )));
+    }
+    if let Some(book) = book {
+        ensure_book_exists(transaction, book)?;
+    }
+    transaction.execute(
+        "INSERT INTO virtual_libraries(name, identity_key, description, icon) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![name, key, description, icon.as_str()],
+    )?;
+    let id = VirtualLibraryId::new(transaction.last_insert_rowid());
+    if let Some(book) = book {
+        transaction.execute(
+            "INSERT INTO book_virtual_libraries(book_id, virtual_library_id) VALUES (?1, ?2)",
+            params![book.value(), id.value()],
+        )?;
+    }
+    Ok(VirtualLibrary {
+        id,
+        name,
+        description,
+        icon,
+        books: u64::from(book.is_some()),
+    })
+}
+
+/// Returns selected virtual libraries first, followed by bounded normalized-name matches.
+pub(super) fn autocomplete_virtual_libraries(
+    connection: &Connection,
+    prefix: &str,
+    selected: &[VirtualLibraryId],
+    limit: u32,
+) -> Result<Vec<VirtualLibrary>> {
+    let limit = usize::try_from(limit.min(50)).expect("limit is at most fifty");
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut results = Vec::with_capacity(limit);
+    let mut seen = HashSet::with_capacity(selected.len());
+    let mut selected_statement = connection.prepare_cached(
+        "SELECT v.name, v.description, v.icon, count(bv.book_id) \
+         FROM virtual_libraries v \
+         LEFT JOIN book_virtual_libraries bv ON bv.virtual_library_id = v.id \
+         WHERE v.id = ?1 GROUP BY v.id",
+    )?;
+    for id in selected.iter().copied().take(limit) {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(library) = selected_statement
+            .query_row([id.value()], |row| virtual_library_row(id, row, 0))
+            .optional()?
+        {
+            results.push(library);
+        }
+    }
+    if results.len() == limit {
+        return Ok(results);
+    }
+
+    let (lower, upper) = prefix_bounds(NameKind::VirtualLibrary, prefix)?;
+    let candidate_limit = i64::try_from(limit + seen.len()).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare_cached(
+        "SELECT v.id, v.name, v.description, v.icon, count(bv.book_id) \
+         FROM virtual_libraries v \
+         LEFT JOIN book_virtual_libraries bv ON bv.virtual_library_id = v.id \
+         WHERE v.identity_key >= ?1 AND v.identity_key < ?2 \
+         GROUP BY v.id ORDER BY v.identity_key, v.id LIMIT ?3",
+    )?;
+    let rows = statement.query_map(params![lower, upper, candidate_limit], |row| {
+        let id = VirtualLibraryId::new(row.get(0)?);
+        virtual_library_row(id, row, 1)
+    })?;
+    for row in rows {
+        let library = row?;
+        if seen.insert(library.id) {
+            results.push(library);
+            if results.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// Loads the virtual libraries containing one canonical book.
+pub(super) fn load_book_virtual_libraries(
+    connection: &Connection,
+    book: BookId,
+) -> Result<Vec<VirtualLibrary>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT v.id, v.name, v.description, v.icon, ( \
+             SELECT count(*) FROM book_virtual_libraries all_members \
+             WHERE all_members.virtual_library_id = v.id \
+         ) FROM book_virtual_libraries member \
+         JOIN virtual_libraries v ON v.id = member.virtual_library_id \
+         WHERE member.book_id = ?1 ORDER BY v.identity_key, v.id",
+    )?;
+    let rows = statement.query_map([book.value()], |row| {
+        let id = VirtualLibraryId::new(row.get(0)?);
+        virtual_library_row(id, row, 1)
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Sets one book membership and returns refreshed derived library metadata.
+pub(super) fn set_book_virtual_library_membership(
+    transaction: &Transaction<'_>,
+    book: BookId,
+    library: VirtualLibraryId,
+    included: bool,
+) -> Result<VirtualLibraryMembershipResult> {
+    ensure_book_exists(transaction, book)?;
+    let exists = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM virtual_libraries WHERE id = ?1)",
+        [library.value()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        return Err(StorageError::InvalidCuration(format!(
+            "virtual library {library} does not exist"
+        )));
+    }
+    let changed = if included {
+        transaction.execute(
+            "INSERT OR IGNORE INTO book_virtual_libraries(book_id, virtual_library_id) \
+             VALUES (?1, ?2)",
+            params![book.value(), library.value()],
+        )? > 0
+    } else {
+        transaction.execute(
+            "DELETE FROM book_virtual_libraries WHERE book_id = ?1 AND virtual_library_id = ?2",
+            params![book.value(), library.value()],
+        )? > 0
+    };
+    let library = transaction.query_row(
+        "SELECT v.name, v.description, v.icon, count(bv.book_id) \
+         FROM virtual_libraries v \
+         LEFT JOIN book_virtual_libraries bv ON bv.virtual_library_id = v.id \
+         WHERE v.id = ?1 GROUP BY v.id",
+        [library.value()],
+        |row| virtual_library_row(library, row, 0),
+    )?;
+    Ok(VirtualLibraryMembershipResult {
+        library,
+        included,
+        changed,
+    })
+}
+
+fn virtual_library_row(
+    id: VirtualLibraryId,
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<VirtualLibrary> {
+    let icon_value = row.get::<_, String>(offset + 2)?;
+    let icon = VirtualLibraryIcon::parse(&icon_value).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            offset + 2,
+            rusqlite::types::Type::Text,
+            format!("invalid virtual-library icon {icon_value:?}").into(),
+        )
+    })?;
+    let books = row.get::<_, i64>(offset + 3)?;
+    Ok(VirtualLibrary {
+        id,
+        name: row.get(offset)?,
+        description: row.get(offset + 1)?,
+        icon,
+        books: u64::try_from(books)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(offset + 3, books))?,
+    })
+}
+
+fn ensure_book_exists(transaction: &Transaction<'_>, book: BookId) -> Result<()> {
+    if transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM books WHERE id = ?1)",
+        [book.value()],
+        |row| row.get::<_, bool>(0),
+    )? {
+        Ok(())
+    } else {
+        Err(StorageError::BookNotFound(book))
+    }
+}
+
+fn validate_virtual_library_description(description: Option<&str>) -> Result<Option<String>> {
+    let Some(description) = description.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if let Some((index, _)) = description
+        .chars()
+        .enumerate()
+        .find(|(_, character)| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(StorageError::InvalidCuration(format!(
+            "virtual-library description contains a control character at position {index}"
+        )));
+    }
+    let scalars = description.chars().count();
+    if scalars > 2_000 {
+        return Err(StorageError::InvalidCuration(format!(
+            "virtual-library description contains {scalars} Unicode scalar values; the maximum is 2000"
+        )));
+    }
+    Ok(Some(description.to_owned()))
 }
 
 /// Returns one bounded, normalized-name page for the contributor manager.

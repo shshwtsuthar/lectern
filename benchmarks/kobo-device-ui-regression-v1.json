@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-kobo-device-ui-regression-budget",
+  "workload": {
+    "query_mode": "kobo-device-ui",
+    "devices": 1,
+    "listed_books": 128,
+    "managed_books": 64,
+    "warmup_iterations": 5,
+    "measured_iterations": 40,
+    "scenarios": [
+      "initial_library_render",
+      "device_to_painted_state"
+    ],
+    "correctness": [
+      "generic_device_icon",
+      "storage_presented",
+      "bounded_device_listing",
+      "library_correlation_presented",
+      "remove_action_presented",
+      "eject_action_presented"
+    ]
+  },
+  "comparison": {
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 1.0
+  },
+  "budgets": {
+    "initial_library_render": {
+      "max_p95_ms": 500,
+      "max_peak_rss_bytes": 536870912
+    },
+    "device_to_painted_state": {
+      "max_p95_ms": 50,
+      "max_peak_rss_bytes": 536870912
+    }
+  }
+}

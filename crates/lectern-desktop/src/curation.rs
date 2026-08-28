@@ -399,6 +399,7 @@ mod tests {
                 name: "Fantasy".into(),
                 color: TagColor::Slate,
             }],
+            virtual_libraries: Vec::new(),
             publisher: Some("Parnassus".into()),
             publication_date: Some("1968-09".parse().unwrap()),
             language: Some("en".into()),

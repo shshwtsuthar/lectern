@@ -2,9 +2,15 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    env, fs,
+    env,
+    ffi::OsString,
+    fmt::Write as _,
+    fs,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -26,8 +32,14 @@ use lectern_core::{
         BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, Contributor,
         ContributorCredit, ContributorId, ContributorRole, LibraryGeneration, NameKind,
         SelectionSnapshot, SelectionTagUsage, Series, SeriesId, SeriesIndex, SeriesMembership,
-        SeriesUsage, Tag, TagColor, TagId, TagReference, TagUsage, identity_key, normalize_name,
+        SeriesUsage, Tag, TagColor, TagId, TagReference, TagUsage, VirtualLibrary,
+        VirtualLibraryIcon, VirtualLibraryId, identity_key, normalize_name,
     },
+};
+use lectern_device::{
+    DeviceBook, DeviceConnectionState, DeviceFormat, DeviceId, DeviceInfo, DeviceKind,
+    DeviceManager, DuplicatePolicy, FormatPriority, RemovalOutcome, TransferControl, TransferPlan,
+    TransferProgress, transfer_history_path,
 };
 use lectern_service::{LibraryServiceError, SqliteLibraryService, default_database_path};
 use lectern_ui::{
@@ -38,6 +50,7 @@ use lectern_ui::{
 use serde::{Deserialize, Serialize};
 
 use crate::curation::BookCurationDraft;
+use crate::device::load_transfer_books;
 
 const BENCHMARK_OUTPUT_ENV: &str = "LECTERN_GPUI_BENCHMARK_OUTPUT";
 const BENCHMARK_WORKLOAD_ENV: &str = "LECTERN_GPUI_BENCHMARK_WORKLOAD";
@@ -55,7 +68,12 @@ const BULK_TAG_PANEL_WIDTH_PX: f32 = 420.0;
 const BULK_TAG_PAGE_SIZE: u32 = 100;
 const BOOK_DETAIL_PANEL_WIDTH_PX: f32 = 420.0;
 const THEME_DIALOG_WIDTH_PX: f32 = 400.0;
+const VIRTUAL_LIBRARY_DIALOG_WIDTH_PX: f32 = 480.0;
+const DEVICE_DIALOG_WIDTH_PX: f32 = 640.0;
 const LIBRARY_PAGE_SIZE: u32 = 128;
+const DEVICE_VISIBLE_BOOK_LIMIT: usize = 128;
+const DEVICE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+const DEVICE_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 gpui::actions!(
     lectern_library,
@@ -91,6 +109,10 @@ fn install_keyboard_shortcuts(cx: &mut App) {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DismissTarget {
+    DeviceDuplicate,
+    DeviceTarget,
+    DeviceDialog,
+    VirtualLibraryDialog,
     ThemeDialog,
     BulkRemovalDialog,
     DetailRemovalConfirmation,
@@ -99,8 +121,16 @@ enum DismissTarget {
     Selection,
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag represents an independently dismissible UI surface"
+)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct DismissibleSurfaces {
+    device_duplicate: bool,
+    device_target: bool,
+    device_dialog: bool,
+    virtual_library_dialog: bool,
     theme_dialog: bool,
     bulk_removal_dialog: bool,
     detail_removal_confirmation: bool,
@@ -109,7 +139,15 @@ struct DismissibleSurfaces {
 }
 
 fn topmost_dismiss_target(surfaces: DismissibleSurfaces) -> DismissTarget {
-    if surfaces.theme_dialog {
+    if surfaces.device_duplicate {
+        DismissTarget::DeviceDuplicate
+    } else if surfaces.device_target {
+        DismissTarget::DeviceTarget
+    } else if surfaces.device_dialog {
+        DismissTarget::DeviceDialog
+    } else if surfaces.virtual_library_dialog {
+        DismissTarget::VirtualLibraryDialog
+    } else if surfaces.theme_dialog {
         DismissTarget::ThemeDialog
     } else if surfaces.bulk_removal_dialog {
         DismissTarget::BulkRemovalDialog
@@ -152,11 +190,24 @@ fn cycle_keyboard_focus(window: &mut Window, cx: &mut App, forward: bool) {
 /// Panics if GPUI cannot open the application window or benchmark output cannot be serialized and
 /// written.
 pub fn run(main_entry: Instant) {
+    use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
+    let log_filter = tracing_subscriber::filter::Targets::new()
+        .with_default(tracing_subscriber::filter::LevelFilter::WARN)
+        .with_target(
+            "lectern_device",
+            tracing_subscriber::filter::LevelFilter::INFO,
+        );
+    _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(log_filter)
+        .try_init();
     let benchmark = env::var_os(BENCHMARK_OUTPUT_ENV).map(|path| {
         let workload = match env::var(BENCHMARK_WORKLOAD_ENV).as_deref() {
             Ok("library-selection") => BenchmarkWorkload::LibrarySelection,
             Ok("book-detail") => BenchmarkWorkload::BookDetail,
+            Ok("virtual-library") => BenchmarkWorkload::VirtualLibrary,
             Ok("bulk-tags") => BenchmarkWorkload::BulkTags,
+            Ok("kobo-device") => BenchmarkWorkload::KoboDevice,
             Ok(workload) => panic!("unsupported GPUI benchmark workload {workload:?}"),
             Err(env::VarError::NotPresent) => BenchmarkWorkload::EmptyLibraryAddBooks,
             Err(error) => panic!("read GPUI benchmark workload: {error}"),
@@ -169,6 +220,8 @@ pub fn run(main_entry: Instant) {
             action_started: None,
             selection_painted: None,
             detail_painted: None,
+            virtual_library_dialog_painted: None,
+            virtual_library_menu_painted: None,
             bulk_tag_config: (workload == BenchmarkWorkload::BulkTags)
                 .then(BulkTagBenchmarkConfig::from_environment),
             bulk_tag_library_books: None,
@@ -179,6 +232,7 @@ pub fn run(main_entry: Instant) {
             bulk_tag_selection_samples_ns: Vec::new(),
             bulk_tag_completion_samples_ns: Vec::new(),
             bulk_tag_completion_started: None,
+            device_painted: None,
             confirmation_started: None,
         }
     });
@@ -237,8 +291,17 @@ struct LecternView {
     appearance: AppearanceSettings,
     appearance_dirty: bool,
     theme_dialog_open: bool,
+    virtual_library_dialog: Option<VirtualLibraryDialogState>,
     removing: bool,
     busy: bool,
+    device_manager: Option<DeviceManager>,
+    devices: Vec<DeviceInfo>,
+    device_dialog: Option<DeviceDialogState>,
+    device_target: Option<PendingDeviceTarget>,
+    device_duplicate_plan: Option<TransferPlan>,
+    device_resolving: bool,
+    device_ejecting: Option<DeviceId>,
+    active_device_transfer: Option<ActiveDeviceTransfer>,
     status: Option<SharedString>,
     initial_frame_scheduled: bool,
     benchmark: Option<BenchmarkRun>,
@@ -263,6 +326,15 @@ impl Default for AppearanceSettings {
 struct PersistedAppearance {
     mode: String,
     accent: String,
+}
+
+struct VirtualLibraryDialogState {
+    name: Entity<InputState>,
+    description: Entity<TextareaState>,
+    icon: VirtualLibraryIcon,
+    book: Option<BookId>,
+    saving: bool,
+    error: Option<SharedString>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -304,6 +376,29 @@ struct BulkTagEditor {
     error: Option<SharedString>,
 }
 
+struct DeviceDialogState {
+    device_id: DeviceId,
+    books: Vec<DeviceBook>,
+    loading: bool,
+    removing: Option<PathBuf>,
+    error: Option<SharedString>,
+}
+
+#[derive(Clone)]
+struct PendingDeviceTarget {
+    selection: BookSelection,
+    selected_books: u64,
+}
+
+struct ActiveDeviceTransfer {
+    device_id: DeviceId,
+    cancelled: Arc<AtomicBool>,
+    latest_progress: Arc<Mutex<Option<TransferProgress>>>,
+    progress: Option<TransferProgress>,
+    started: Instant,
+    cancelling: bool,
+}
+
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent editor menus and operations require independent flags"
@@ -334,6 +429,12 @@ struct BookDetailEditor {
     tag_suggestions: Vec<TagUsage>,
     tag_suggestion_generation: u64,
     tag_suggestions_loading: bool,
+    virtual_library_input: Option<Entity<InputState>>,
+    virtual_library_menu_open: bool,
+    virtual_library_suggestions: Vec<VirtualLibrary>,
+    virtual_library_suggestion_generation: u64,
+    virtual_library_suggestions_loading: bool,
+    virtual_library_busy: bool,
     role_picker: Option<u64>,
     dirty: bool,
     operation: DetailOperation,
@@ -359,6 +460,7 @@ enum DetailErrorSection {
     Series,
     Contributors,
     Tags,
+    VirtualLibraries,
     Library,
 }
 
@@ -419,6 +521,12 @@ impl BookDetailEditor {
             tag_suggestions: Vec::new(),
             tag_suggestion_generation: 0,
             tag_suggestions_loading: false,
+            virtual_library_input: None,
+            virtual_library_menu_open: false,
+            virtual_library_suggestions: Vec::new(),
+            virtual_library_suggestion_generation: 0,
+            virtual_library_suggestions_loading: false,
+            virtual_library_busy: false,
             role_picker: None,
             list_state: ListState::new(
                 detail_item_count(contributor_count),
@@ -504,6 +612,7 @@ impl BookDetailEditor {
             self.publisher.as_ref(),
             self.publication_date.as_ref(),
             self.tag_input.as_ref(),
+            self.virtual_library_input.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -584,6 +693,66 @@ fn bulk_tag_search_input(window: &mut Window, cx: &mut Context<LecternView>) -> 
         if matches!(event, InputEvent::Change) {
             let query = state.read(cx).value().to_string();
             this.request_bulk_tag_suggestions(query, cx);
+        }
+        cx.notify();
+    })
+    .detach();
+    state
+}
+
+fn virtual_library_search_input(
+    window: &mut Window,
+    cx: &mut Context<LecternView>,
+) -> Entity<InputState> {
+    let state =
+        cx.new(|cx| InputState::new(window, cx).placeholder("Add or find a virtual library…"));
+    cx.subscribe(&state, |this, state, event: &InputEvent, cx| {
+        if matches!(event, InputEvent::Change) {
+            let query = state.read(cx).value().to_string();
+            this.request_detail_virtual_library_suggestions(query, cx);
+        }
+        cx.notify();
+    })
+    .detach();
+    state
+}
+
+fn virtual_library_dialog_name_input(
+    initial_name: String,
+    window: &mut Window,
+    cx: &mut Context<LecternView>,
+) -> Entity<InputState> {
+    let state = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder("Library name")
+            .default_value(initial_name)
+    });
+    cx.subscribe(&state, |this, _, event: &InputEvent, cx| {
+        if matches!(event, InputEvent::Change)
+            && let Some(dialog) = &mut this.virtual_library_dialog
+        {
+            dialog.error = None;
+        }
+        cx.notify();
+    })
+    .detach();
+    state
+}
+
+fn virtual_library_dialog_description(
+    window: &mut Window,
+    cx: &mut Context<LecternView>,
+) -> Entity<TextareaState> {
+    let state = cx.new(|cx| {
+        TextareaState::new(window, cx)
+            .rows(5)
+            .placeholder("Describe what belongs in this library")
+    });
+    cx.subscribe(&state, |this, _, event: &InputEvent, cx| {
+        if matches!(event, InputEvent::Change)
+            && let Some(dialog) = &mut this.virtual_library_dialog
+        {
+            dialog.error = None;
         }
         cx.notify();
     })
@@ -685,9 +854,16 @@ impl LecternView {
         let populated_benchmark = benchmark.as_ref().is_some_and(|benchmark| {
             matches!(
                 benchmark.workload,
-                BenchmarkWorkload::LibrarySelection | BenchmarkWorkload::BookDetail
+                BenchmarkWorkload::LibrarySelection
+                    | BenchmarkWorkload::BookDetail
+                    | BenchmarkWorkload::VirtualLibrary
             )
         });
+        let device_manager = if benchmark.is_some() {
+            None
+        } else {
+            Some(DeviceManager::system(transfer_history_path(&database_path)))
+        };
         Self {
             database_path,
             library_state,
@@ -708,8 +884,17 @@ impl LecternView {
             appearance,
             appearance_dirty: false,
             theme_dialog_open: false,
+            virtual_library_dialog: None,
             removing: false,
             busy: false,
+            device_manager,
+            devices: Vec::new(),
+            device_dialog: None,
+            device_target: None,
+            device_duplicate_plan: None,
+            device_resolving: false,
+            device_ejecting: None,
+            active_device_transfer: None,
             status: None,
             initial_frame_scheduled: false,
             benchmark,
@@ -725,11 +910,78 @@ impl LecternView {
                     self.start_benchmark_selection(window, cx);
                 }
                 BenchmarkWorkload::BookDetail => self.start_benchmark_book_detail(window, cx),
+                BenchmarkWorkload::VirtualLibrary => {
+                    self.start_benchmark_virtual_library(window, cx);
+                }
                 BenchmarkWorkload::BulkTags => self.start_benchmark_bulk_tags(window, cx),
+                BenchmarkWorkload::KoboDevice => self.start_benchmark_kobo_device(window, cx),
             }
             return;
         }
+        self.start_device_watch(cx);
         self.load_library(window, cx);
+    }
+
+    fn start_device_watch(&self, cx: &mut Context<Self>) {
+        let Some(manager) = self.device_manager.clone() else {
+            return;
+        };
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let reconcile_manager = manager.clone();
+                let reconcile = executor.spawn(async move {
+                    reconcile_manager
+                        .reconcile()
+                        .map_err(|error| error.to_string())
+                });
+                let result = reconcile.await;
+                if this
+                    .update(cx, |this, cx| match result {
+                        Ok(reconciled) => {
+                            let changed = this.devices != reconciled.devices;
+                            if !reconciled.connected.is_empty() {
+                                let name = &reconciled.connected[0].name;
+                                this.status = Some(format!("{name} connected.").into());
+                            }
+                            if !reconciled.disconnected.is_empty() {
+                                if let Some(active) = &this.active_device_transfer
+                                    && reconciled.disconnected.contains(&active.device_id)
+                                {
+                                    active.cancelled.store(true, Ordering::Relaxed);
+                                }
+                                this.status = Some("Kobo disconnected.".into());
+                            }
+                            this.devices = reconciled.devices;
+                            if this.device_dialog.as_ref().is_some_and(|dialog| {
+                                !this
+                                    .devices
+                                    .iter()
+                                    .any(|device| device.id == dialog.device_id)
+                            }) {
+                                this.device_dialog = None;
+                            }
+                            if changed
+                                || !reconciled.connected.is_empty()
+                                || !reconciled.disconnected.is_empty()
+                            {
+                                cx.notify();
+                            }
+                        }
+                        Err(error) => {
+                            this.status =
+                                Some(format!("Could not refresh devices: {error}").into());
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                executor.timer(DEVICE_RECONCILE_INTERVAL).await;
+            }
+        })
+        .detach();
     }
 
     fn start_benchmark_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1038,6 +1290,133 @@ impl LecternView {
         cx.quit();
     }
 
+    fn start_benchmark_virtual_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.benchmark
+            .as_mut()
+            .expect("virtual-library benchmark state is present")
+            .action_started = Some(Instant::now());
+        self.open_virtual_library_dialog(String::new(), None, window, cx);
+        cx.on_next_frame(window, Self::benchmark_virtual_library_dialog_presented);
+    }
+
+    fn benchmark_virtual_library_dialog_presented(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let benchmark = self
+            .benchmark
+            .as_mut()
+            .expect("virtual-library benchmark state is present");
+        benchmark.virtual_library_dialog_painted = Some(
+            benchmark
+                .action_started
+                .expect("virtual-library dialog action started")
+                .elapsed(),
+        );
+        self.virtual_library_dialog = None;
+
+        let mut editor = BookDetailEditor::new(benchmark_book_detail(), window, cx);
+        editor.virtual_library_input = Some(virtual_library_search_input(window, cx));
+        editor.virtual_library_suggestions = benchmark_virtual_libraries(50, 100);
+        editor.virtual_library_menu_open = true;
+        editor
+            .list_state
+            .scroll_to_reveal_item(detail_virtual_libraries_item_index(
+                editor.contributors.len(),
+            ));
+        self.detail_editor = Some(editor);
+        let benchmark = self
+            .benchmark
+            .as_mut()
+            .expect("virtual-library benchmark state remains present");
+        benchmark.action_started = Some(Instant::now());
+        cx.notify();
+        cx.on_next_frame(window, Self::benchmark_virtual_library_menu_presented);
+    }
+
+    fn benchmark_virtual_library_menu_presented(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self
+            .detail_editor
+            .as_ref()
+            .expect("virtual-library benchmark has a detail editor");
+        let membership_count = editor.original.virtual_libraries.len();
+        let suggestion_count = editor.virtual_library_suggestions.len();
+        let mut benchmark = self
+            .benchmark
+            .take()
+            .expect("virtual-library benchmark state is present");
+        benchmark.virtual_library_menu_painted = Some(
+            benchmark
+                .action_started
+                .expect("virtual-library menu action started")
+                .elapsed(),
+        );
+        benchmark.finish_virtual_library(
+            self.library_total,
+            self.books.len(),
+            membership_count,
+            suggestion_count,
+        );
+        cx.quit();
+    }
+
+    fn start_benchmark_kobo_device(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let device = benchmark_kobo_device();
+        self.device_dialog = Some(DeviceDialogState {
+            device_id: device.id.clone(),
+            books: benchmark_kobo_books(),
+            loading: false,
+            removing: None,
+            error: None,
+        });
+        self.devices = vec![device];
+        self.benchmark
+            .as_mut()
+            .expect("Kobo benchmark state is present")
+            .action_started = Some(Instant::now());
+        cx.notify();
+        cx.on_next_frame(window, Self::benchmark_kobo_device_presented);
+    }
+
+    fn benchmark_kobo_device_presented(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let device = self
+            .devices
+            .first()
+            .expect("Kobo benchmark has a connected device");
+        let dialog = self
+            .device_dialog
+            .as_ref()
+            .expect("Kobo benchmark has a device dialog");
+        let managed_books = dialog
+            .books
+            .iter()
+            .filter(|book| book.managed_by_lectern)
+            .count();
+        let mut benchmark = self
+            .benchmark
+            .take()
+            .expect("Kobo benchmark state is present");
+        benchmark.device_painted = Some(
+            benchmark
+                .action_started
+                .expect("Kobo device action was started")
+                .elapsed(),
+        );
+        benchmark.finish_kobo_device(
+            device.name.clone(),
+            device.total_bytes,
+            device.free_bytes,
+            dialog.books.len(),
+            managed_books,
+        );
+        cx.quit();
+    }
+
     fn benchmark_confirmation_presented(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let benchmark = self
             .benchmark
@@ -1081,6 +1460,8 @@ impl LecternView {
     fn start_add_books(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy
             || self.removing
+            || self.device_resolving
+            || self.active_device_transfer.is_some()
             || self.selection_pending.is_some()
             || self.bulk_tags.is_some()
         {
@@ -1183,7 +1564,12 @@ impl LecternView {
     }
 
     fn begin_selection(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.removing || self.bulk_tags.is_some() {
+        if self.busy
+            || self.removing
+            || self.device_resolving
+            || self.active_device_transfer.is_some()
+            || self.bulk_tags.is_some()
+        {
             return;
         }
         self.selection.begin_explicit();
@@ -1217,6 +1603,146 @@ impl LecternView {
             })
             .detach();
         }
+        cx.notify();
+    }
+
+    fn open_virtual_library_dialog(
+        &mut self,
+        initial_name: String,
+        book: Option<BookId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.virtual_library_dialog.is_some() {
+            return;
+        }
+        let name = virtual_library_dialog_name_input(initial_name, window, cx);
+        let description = virtual_library_dialog_description(window, cx);
+        self.virtual_library_dialog = Some(VirtualLibraryDialogState {
+            name,
+            description,
+            icon: VirtualLibraryIcon::default(),
+            book,
+            saving: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn close_virtual_library_dialog(&mut self, cx: &mut Context<Self>) {
+        if self
+            .virtual_library_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.saving)
+        {
+            return;
+        }
+        self.virtual_library_dialog = None;
+        cx.notify();
+    }
+
+    fn set_virtual_library_icon(&mut self, icon: VirtualLibraryIcon, cx: &mut Context<Self>) {
+        let Some(dialog) = &mut self.virtual_library_dialog else {
+            return;
+        };
+        if dialog.saving {
+            return;
+        }
+        dialog.icon = icon;
+        dialog.error = None;
+        cx.notify();
+    }
+
+    fn create_virtual_library(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = &mut self.virtual_library_dialog else {
+            return;
+        };
+        if dialog.saving {
+            return;
+        }
+        let name = match normalize_name(
+            NameKind::VirtualLibrary,
+            dialog.name.read(cx).value().as_str(),
+        ) {
+            Ok(name) => name,
+            Err(error) => {
+                dialog.error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        let description = dialog.description.read(cx).value().to_string();
+        let icon = dialog.icon;
+        let book = dialog.book;
+        dialog.saving = true;
+        dialog.error = None;
+        dialog
+            .name
+            .update(cx, |state, cx| state.set_disabled(true, cx));
+        dialog
+            .description
+            .update(cx, |state, cx| state.set_disabled(true, cx));
+
+        let database_path = self.database_path.clone();
+        let create = cx.background_executor().spawn(async move {
+            let mut service =
+                SqliteLibraryService::open(&database_path).map_err(|error| error.to_string())?;
+            service
+                .create_virtual_library(&name, Some(&description), icon, book)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = create.await;
+            this.update(cx, |this, cx| match result {
+                Ok(library) => {
+                    if let Some(book) = book
+                        && let Some(editor) = &mut this.detail_editor
+                        && editor.original.id == book
+                    {
+                        if !editor
+                            .original
+                            .virtual_libraries
+                            .iter()
+                            .any(|selected| selected.id == library.id)
+                        {
+                            editor.original.virtual_libraries.push(library.clone());
+                            editor.original.virtual_libraries.sort_by(|left, right| {
+                                identity_key(&left.name)
+                                    .cmp(&identity_key(&right.name))
+                                    .then(left.id.cmp(&right.id))
+                            });
+                        }
+                        let item = detail_virtual_libraries_item_index(editor.contributors.len());
+                        editor.list_state.remeasure_items(item..item + 1);
+                    }
+                    this.status = Some(
+                        if book.is_some() {
+                            format!("Created “{}” and added this book.", library.name)
+                        } else {
+                            format!("Created virtual library “{}”.", library.name)
+                        }
+                        .into(),
+                    );
+                    this.virtual_library_dialog = None;
+                    cx.notify();
+                }
+                Err(error) => {
+                    if let Some(dialog) = &mut this.virtual_library_dialog {
+                        dialog.saving = false;
+                        dialog.error = Some(error.into());
+                        dialog
+                            .name
+                            .update(cx, |state, cx| state.set_disabled(false, cx));
+                        dialog
+                            .description
+                            .update(cx, |state, cx| state.set_disabled(false, cx));
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1255,6 +1781,8 @@ impl LecternView {
 
     fn clear_selection_action(&mut self, cx: &mut Context<Self>) {
         if self.removing
+            || self.device_resolving
+            || self.active_device_transfer.is_some()
             || self.bulk_tags.is_some()
             || (!self.selection.is_active() && self.selection_pending.is_none())
         {
@@ -1267,6 +1795,10 @@ impl LecternView {
 
     fn dismiss_active_surface(&mut self, cx: &mut Context<Self>) {
         let target = topmost_dismiss_target(DismissibleSurfaces {
+            device_duplicate: self.device_duplicate_plan.is_some(),
+            device_target: self.device_target.is_some(),
+            device_dialog: self.device_dialog.is_some(),
+            virtual_library_dialog: self.virtual_library_dialog.is_some(),
             theme_dialog: self.theme_dialog_open,
             bulk_removal_dialog: self.removal_confirmation.is_some(),
             detail_removal_confirmation: self
@@ -1277,6 +1809,10 @@ impl LecternView {
             book_detail: self.detail_editor.is_some() || self.detail_loading.is_some(),
         });
         match target {
+            DismissTarget::DeviceDuplicate => self.cancel_device_duplicate(cx),
+            DismissTarget::DeviceTarget => self.cancel_device_target(cx),
+            DismissTarget::DeviceDialog => self.close_device_dialog(cx),
+            DismissTarget::VirtualLibraryDialog => self.close_virtual_library_dialog(cx),
             DismissTarget::ThemeDialog => self.close_theme_dialog(cx),
             DismissTarget::BulkRemovalDialog => self.cancel_bulk_removal(cx),
             DismissTarget::DetailRemovalConfirmation => self.cancel_detail_removal(cx),
@@ -1289,6 +1825,8 @@ impl LecternView {
     fn toggle_book(&mut self, id: BookId, index: usize, cx: &mut Context<Self>) {
         if self.busy
             || self.removing
+            || self.device_resolving
+            || self.active_device_transfer.is_some()
             || self.selection_pending.is_some()
             || self.bulk_tags.is_some()
         {
@@ -1366,6 +1904,13 @@ impl LecternView {
     }
 
     fn close_book_detail(&mut self, cx: &mut Context<Self>) {
+        if self
+            .detail_editor
+            .as_ref()
+            .is_some_and(|editor| editor.virtual_library_busy)
+        {
+            return;
+        }
         self.detail_editor = None;
         self.detail_loading = None;
         self.status = None;
@@ -1373,6 +1918,13 @@ impl LecternView {
     }
 
     fn reset_book_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .detail_editor
+            .as_ref()
+            .is_some_and(|editor| editor.virtual_library_busy)
+        {
+            return;
+        }
         let Some(book) = self
             .detail_editor
             .as_ref()
@@ -1910,11 +2462,211 @@ impl LecternView {
         cx.notify();
     }
 
+    fn set_virtual_library_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        let query = {
+            let Some(editor) = &mut self.detail_editor else {
+                return;
+            };
+            editor.virtual_library_menu_open = open;
+            if !open {
+                cx.notify();
+                return;
+            }
+            editor
+                .virtual_library_input
+                .as_ref()
+                .map_or_else(String::new, |input| input.read(cx).value().to_string())
+        };
+        self.request_detail_virtual_library_suggestions(query, cx);
+    }
+
+    fn request_detail_virtual_library_suggestions(
+        &mut self,
+        query: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        if !editor.virtual_library_menu_open {
+            return;
+        }
+        editor.virtual_library_suggestion_generation =
+            editor.virtual_library_suggestion_generation.wrapping_add(1);
+        let generation = editor.virtual_library_suggestion_generation;
+        editor.virtual_library_suggestions_loading = true;
+        let selected = editor
+            .original
+            .virtual_libraries
+            .iter()
+            .map(|library| library.id)
+            .collect::<Vec<_>>();
+        let database_path = self.database_path.clone();
+        let load = cx.background_executor().spawn(async move {
+            let mut service =
+                SqliteLibraryService::open(&database_path).map_err(|error| error.to_string())?;
+            service
+                .autocomplete_virtual_libraries(query.trim(), &selected, 50)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                let Some(editor) = &mut this.detail_editor else {
+                    return;
+                };
+                if editor.virtual_library_suggestion_generation != generation {
+                    return;
+                }
+                editor.virtual_library_suggestions_loading = false;
+                match result {
+                    Ok(suggestions) => {
+                        editor.virtual_library_suggestions = suggestions;
+                        editor.error = None;
+                    }
+                    Err(error) => {
+                        editor.error = Some(error.into());
+                        editor.error_section = DetailErrorSection::VirtualLibraries;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn toggle_detail_virtual_library(&mut self, library: &VirtualLibrary, cx: &mut Context<Self>) {
+        let (book, included) = {
+            let Some(editor) = &mut self.detail_editor else {
+                return;
+            };
+            if editor.virtual_library_busy || editor.operation != DetailOperation::Idle {
+                return;
+            }
+            let included = !editor
+                .original
+                .virtual_libraries
+                .iter()
+                .any(|selected| selected.id == library.id);
+            editor.virtual_library_busy = true;
+            editor.error = None;
+            (editor.original.id, included)
+        };
+        let library_id = library.id;
+        let database_path = self.database_path.clone();
+        let update = cx.background_executor().spawn(async move {
+            let mut service =
+                SqliteLibraryService::open(&database_path).map_err(|error| error.to_string())?;
+            service
+                .set_book_virtual_library_membership(book, library_id, included)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = update.await;
+            this.update(cx, |this, cx| {
+                let Some(editor) = &mut this.detail_editor else {
+                    return;
+                };
+                if editor.original.id != book {
+                    return;
+                }
+                editor.virtual_library_busy = false;
+                match result {
+                    Ok(result) => {
+                        if result.included {
+                            if let Some(existing) = editor
+                                .original
+                                .virtual_libraries
+                                .iter_mut()
+                                .find(|selected| selected.id == result.library.id)
+                            {
+                                *existing = result.library.clone();
+                            } else {
+                                editor
+                                    .original
+                                    .virtual_libraries
+                                    .push(result.library.clone());
+                            }
+                        } else {
+                            editor
+                                .original
+                                .virtual_libraries
+                                .retain(|selected| selected.id != result.library.id);
+                        }
+                        editor.original.virtual_libraries.sort_by(|left, right| {
+                            identity_key(&left.name)
+                                .cmp(&identity_key(&right.name))
+                                .then(left.id.cmp(&right.id))
+                        });
+                        if let Some(suggestion) = editor
+                            .virtual_library_suggestions
+                            .iter_mut()
+                            .find(|suggestion| suggestion.id == result.library.id)
+                        {
+                            *suggestion = result.library.clone();
+                        }
+                        if result.changed {
+                            this.status = Some(
+                                if result.included {
+                                    format!("Added this book to “{}”.", result.library.name)
+                                } else {
+                                    format!("Removed this book from “{}”.", result.library.name)
+                                }
+                                .into(),
+                            );
+                        }
+                        editor.error = None;
+                    }
+                    Err(error) => {
+                        editor.error = Some(error.into());
+                        editor.error_section = DetailErrorSection::VirtualLibraries;
+                    }
+                }
+                let item = detail_virtual_libraries_item_index(editor.contributors.len());
+                editor.list_state.remeasure_items(item..item + 1);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn begin_detail_virtual_library_creation(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = match normalize_name(NameKind::VirtualLibrary, name) {
+            Ok(name) => name,
+            Err(error) => {
+                if let Some(editor) = &mut self.detail_editor {
+                    editor.error = Some(error.to_string().into());
+                    editor.error_section = DetailErrorSection::VirtualLibraries;
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let book = {
+            let Some(editor) = &mut self.detail_editor else {
+                return;
+            };
+            editor.virtual_library_menu_open = false;
+            editor.original.id
+        };
+        self.open_virtual_library_dialog(name, Some(book), window, cx);
+    }
+
     fn save_book_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = &self.detail_editor else {
             return;
         };
         if editor.operation != DetailOperation::Idle
+            || editor.virtual_library_busy
             || self.removing
             || !editor.dirty
             || matches!(
@@ -1941,6 +2693,9 @@ impl LecternView {
                     DetailErrorSection::Series => DETAIL_SERIES_ITEM,
                     DetailErrorSection::Contributors => DETAIL_CONTRIBUTOR_START_ITEM,
                     DetailErrorSection::Tags => detail_tags_item_index(editor.contributors.len()),
+                    DetailErrorSection::VirtualLibraries => {
+                        detail_virtual_libraries_item_index(editor.contributors.len())
+                    }
                     DetailErrorSection::Library => {
                         detail_library_item_index(editor.contributors.len())
                     }
@@ -2005,7 +2760,11 @@ impl LecternView {
         let Some(editor) = &mut self.detail_editor else {
             return;
         };
-        if editor.operation != DetailOperation::Idle || editor.dirty || self.removing {
+        if editor.operation != DetailOperation::Idle
+            || editor.virtual_library_busy
+            || editor.dirty
+            || self.removing
+        {
             return;
         }
         editor.operation = DetailOperation::Assets;
@@ -2094,6 +2853,7 @@ impl LecternView {
         if editor.original.assets.len() <= 1
             || editor.dirty
             || editor.operation != DetailOperation::Idle
+            || editor.virtual_library_busy
             || self.removing
         {
             return;
@@ -2146,7 +2906,8 @@ impl LecternView {
         let Some(editor) = &mut self.detail_editor else {
             return;
         };
-        if editor.operation != DetailOperation::Idle || self.removing {
+        if editor.operation != DetailOperation::Idle || editor.virtual_library_busy || self.removing
+        {
             return;
         }
         editor.remove_confirmation = true;
@@ -2172,7 +2933,10 @@ impl LecternView {
         let Some(editor) = &self.detail_editor else {
             return;
         };
-        if !editor.remove_confirmation || editor.operation != DetailOperation::Idle || self.removing
+        if !editor.remove_confirmation
+            || editor.operation != DetailOperation::Idle
+            || editor.virtual_library_busy
+            || self.removing
         {
             return;
         }
@@ -2224,6 +2988,8 @@ impl LecternView {
     fn select_range_to(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy
             || self.removing
+            || self.device_resolving
+            || self.active_device_transfer.is_some()
             || self.selection_pending.is_some()
             || self.bulk_tags.is_some()
         {
@@ -2279,6 +3045,8 @@ impl LecternView {
     fn select_all_matching(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy
             || self.removing
+            || self.device_resolving
+            || self.active_device_transfer.is_some()
             || self.library_total == 0
             || self.selection_pending.is_some()
             || self.selection.is_every_matching()
@@ -2328,6 +3096,8 @@ impl LecternView {
     fn request_bulk_tags(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy
             || self.removing
+            || self.device_resolving
+            || self.active_device_transfer.is_some()
             || self.selection_pending.is_some()
             || self.bulk_tags.is_some()
         {
@@ -2681,6 +3451,8 @@ impl LecternView {
     fn request_bulk_removal(&mut self, cx: &mut Context<Self>) {
         if self.busy
             || self.removing
+            || self.device_resolving
+            || self.active_device_transfer.is_some()
             || self.selection_pending.is_some()
             || self.bulk_tags.is_some()
         {
@@ -2711,6 +3483,8 @@ impl LecternView {
         };
         if self.busy
             || self.removing
+            || self.device_resolving
+            || self.active_device_transfer.is_some()
             || self.selection.selected_count() != confirmation.selected_books
             || self.selection.descriptor().as_ref() != Some(&confirmation.selection)
         {
@@ -2778,6 +3552,455 @@ impl LecternView {
         .detach();
     }
 
+    fn open_device_dialog(
+        &mut self,
+        device_id: DeviceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.device_dialog = Some(DeviceDialogState {
+            device_id,
+            books: Vec::new(),
+            loading: true,
+            removing: None,
+            error: None,
+        });
+        self.refresh_device_dialog(window, cx);
+    }
+
+    fn close_device_dialog(&mut self, cx: &mut Context<Self>) {
+        self.device_dialog = None;
+        cx.notify();
+    }
+
+    fn refresh_device_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(manager), Some(dialog)) =
+            (self.device_manager.clone(), self.device_dialog.as_mut())
+        else {
+            return;
+        };
+        if dialog.removing.is_some() || self.device_ejecting.as_ref() == Some(&dialog.device_id) {
+            return;
+        }
+        let device_id = dialog.device_id.clone();
+        let load_device_id = device_id.clone();
+        dialog.loading = true;
+        dialog.error = None;
+        cx.notify();
+        let load = cx.background_executor().spawn(async move {
+            let books = manager
+                .list_books(&load_device_id)
+                .map_err(|error| error.to_string())?;
+            let devices = manager
+                .connected_devices()
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((books, devices))
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                let Some(dialog) = this
+                    .device_dialog
+                    .as_mut()
+                    .filter(|dialog| dialog.device_id == device_id)
+                else {
+                    return;
+                };
+                dialog.loading = false;
+                match result {
+                    Ok((books, devices)) => {
+                        dialog.books = books;
+                        dialog.error = None;
+                        this.devices = devices;
+                    }
+                    Err(error) => {
+                        dialog.error = Some(error.clone().into());
+                        this.status = Some(format!("Could not refresh Kobo: {error}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn remove_device_book(
+        &mut self,
+        relative_path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(manager), Some(dialog)) =
+            (self.device_manager.clone(), self.device_dialog.as_mut())
+        else {
+            return;
+        };
+        if dialog.loading || dialog.removing.is_some() {
+            return;
+        }
+        let device_id = dialog.device_id.clone();
+        let remove_device_id = device_id.clone();
+        dialog.removing = Some(relative_path.clone());
+        dialog.error = None;
+        self.status = Some("Removing book from Kobo…".into());
+        cx.notify();
+        let remove = cx.background_executor().spawn(async move {
+            let outcome = manager
+                .remove_book(&remove_device_id, &relative_path)
+                .map_err(|error| error.to_string())?;
+            let books = manager
+                .list_books(&remove_device_id)
+                .map_err(|error| error.to_string())?;
+            let devices = manager
+                .connected_devices()
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((outcome, books, devices))
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = remove.await;
+            this.update(cx, |this, cx| {
+                let Some(dialog) = this
+                    .device_dialog
+                    .as_mut()
+                    .filter(|dialog| dialog.device_id == device_id)
+                else {
+                    return;
+                };
+                dialog.removing = None;
+                match result {
+                    Ok((outcome, books, devices)) => {
+                        dialog.books = books;
+                        this.devices = devices;
+                        this.status = Some(match outcome {
+                            RemovalOutcome::Removed => "Removed the device copy; the library book was kept.".into(),
+                            RemovalOutcome::AlreadyMissing => "The device copy was already missing; transfer history was reconciled.".into(),
+                        });
+                    }
+                    Err(error) => {
+                        dialog.error = Some(error.clone().into());
+                        this.status =
+                            Some(format!("Could not remove the device copy: {error}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn eject_device(&mut self, device_id: DeviceId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(manager) = self.device_manager.clone() else {
+            return;
+        };
+        if self.device_ejecting.is_some() {
+            return;
+        }
+        if self
+            .active_device_transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer.device_id == device_id)
+        {
+            self.status = Some("Cancel the active transfer before ejecting this Kobo.".into());
+            cx.notify();
+            return;
+        }
+        self.device_ejecting = Some(device_id.clone());
+        self.status = Some("Ejecting Kobo…".into());
+        cx.notify();
+        let eject = cx.background_executor().spawn(async move {
+            manager
+                .eject(&device_id)
+                .map_err(|error| error.to_string())?;
+            manager
+                .connected_devices()
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = eject.await;
+            this.update(cx, |this, cx| {
+                let ejected = this.device_ejecting.take();
+                match result {
+                    Ok(devices) => {
+                        this.devices = devices;
+                        if this
+                            .device_dialog
+                            .as_ref()
+                            .is_some_and(|dialog| Some(&dialog.device_id) == ejected.as_ref())
+                        {
+                            this.device_dialog = None;
+                        }
+                        this.status = Some("Kobo ejected. It is safe to disconnect.".into());
+                    }
+                    Err(error) => {
+                        if let Some(dialog) = &mut this.device_dialog {
+                            dialog.error = Some(error.clone().into());
+                        }
+                        this.status = Some(format!("Could not eject Kobo: {error}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn request_send_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.device_resolving
+            || self.active_device_transfer.is_some()
+            || self.bulk_tags.is_some()
+        {
+            return;
+        }
+        let Some(selection) = self.selection.descriptor() else {
+            return;
+        };
+        let selected_books = self.selection.selected_count();
+        if selected_books == 0 || self.devices.is_empty() {
+            return;
+        }
+        if self.devices.len() == 1 {
+            let device_id = self.devices[0].id.clone();
+            self.start_send_to_device(device_id, selection, window, cx);
+        } else {
+            self.device_target = Some(PendingDeviceTarget {
+                selection,
+                selected_books,
+            });
+            cx.notify();
+        }
+    }
+
+    fn start_send_to_device(
+        &mut self,
+        device_id: DeviceId,
+        selection: BookSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(manager) = self.device_manager.clone() else {
+            return;
+        };
+        self.device_target = None;
+        self.device_resolving = true;
+        self.status = Some("Preparing books for Kobo…".into());
+        cx.notify();
+        let database_path = self.database_path.clone();
+        let prepare = cx.background_executor().spawn(async move {
+            let books = load_transfer_books(&database_path, &selection)?;
+            manager
+                .plan_transfer(&device_id, &books, &FormatPriority::default())
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = prepare.await;
+            this.update_in(cx, |this, window, cx| {
+                this.device_resolving = false;
+                match result {
+                    Ok(plan) if plan.replacement_count() > 0 => {
+                        this.status = Some(
+                            format!(
+                                "{} previous Kobo {} can be replaced.",
+                                plan.replacement_count(),
+                                if plan.replacement_count() == 1 {
+                                    "copy"
+                                } else {
+                                    "copies"
+                                },
+                            )
+                            .into(),
+                        );
+                        this.device_duplicate_plan = Some(plan);
+                        cx.notify();
+                    }
+                    Ok(plan) => {
+                        this.start_prepared_transfer(plan, DuplicatePolicy::Skip, window, cx);
+                    }
+                    Err(error) => {
+                        this.status =
+                            Some(format!("Could not prepare Kobo transfer: {error}").into());
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn start_prepared_transfer(
+        &mut self,
+        plan: TransferPlan,
+        duplicate_policy: DuplicatePolicy,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(manager) = self.device_manager.clone() else {
+            return;
+        };
+        self.device_duplicate_plan = None;
+        let device_id = plan.device_id.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let transfer_cancelled = Arc::clone(&cancelled);
+        let latest_progress = Arc::new(Mutex::new(None));
+        let transfer_progress = Arc::clone(&latest_progress);
+        self.active_device_transfer = Some(ActiveDeviceTransfer {
+            device_id: device_id.clone(),
+            cancelled,
+            latest_progress: Arc::clone(&latest_progress),
+            progress: None,
+            started: Instant::now(),
+            cancelling: false,
+        });
+        self.status = Some("Starting Kobo transfer…".into());
+        cx.notify();
+        Self::pump_device_transfer_progress(device_id.clone(), latest_progress, cx);
+        let transfer = cx.background_executor().spawn(async move {
+            manager.transfer(&plan, duplicate_policy, |progress| {
+                if let Ok(mut latest) = transfer_progress.lock() {
+                    *latest = Some(progress);
+                }
+                if transfer_cancelled.load(Ordering::Relaxed) {
+                    TransferControl::Cancel
+                } else {
+                    TransferControl::Continue
+                }
+            })
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = transfer.await;
+            this.update_in(cx, |this, window, cx| {
+                this.active_device_transfer = None;
+                match result {
+                    Ok(outcome) => {
+                        let skipped = outcome
+                            .items
+                            .len()
+                            .saturating_sub(outcome.transferred_count());
+                        let mut status = format!(
+                            "Sent {} {} to Kobo",
+                            outcome.transferred_count(),
+                            pluralize_book(
+                                u64::try_from(outcome.transferred_count()).unwrap_or(u64::MAX)
+                            ),
+                        );
+                        if skipped > 0 {
+                            _ = write!(status, "; {skipped} already present or skipped");
+                        }
+                        if !outcome.failures.is_empty() {
+                            _ = write!(status, "; {} failed", outcome.failures.len());
+                        }
+                        if let Some(error) = outcome.history_error {
+                            _ = write!(status, ". Transfer history warning: {error}");
+                        } else {
+                            status.push('.');
+                        }
+                        this.clear_selection();
+                        this.status = Some(status.into());
+                    }
+                    Err(error) => {
+                        this.status =
+                            Some(if matches!(error, lectern_device::DeviceError::Cancelled) {
+                                "Kobo transfer cancelled; no incomplete copy was kept."
+                                    .to_owned()
+                                    .into()
+                            } else {
+                                format!("Kobo transfer failed: {error}").into()
+                            });
+                    }
+                }
+                if this
+                    .device_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.device_id == device_id)
+                {
+                    this.refresh_device_dialog(window, cx);
+                } else {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn pump_device_transfer_progress(
+        device_id: DeviceId,
+        latest_progress: Arc<Mutex<Option<TransferProgress>>>,
+        cx: &mut Context<Self>,
+    ) {
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                executor.timer(DEVICE_PROGRESS_INTERVAL).await;
+                let keep_running = this
+                    .update(cx, |this, cx| {
+                        let Some(active) = this.active_device_transfer.as_mut().filter(|active| {
+                            active.device_id == device_id
+                                && Arc::ptr_eq(&active.latest_progress, &latest_progress)
+                        }) else {
+                            return false;
+                        };
+                        if let Ok(progress) = latest_progress.lock()
+                            && let Some(progress) = progress.clone()
+                        {
+                            active.progress = Some(progress.clone());
+                            this.status = Some(
+                                format_device_transfer_progress(
+                                    &progress,
+                                    active.started.elapsed(),
+                                    active.cancelling,
+                                )
+                                .into(),
+                            );
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_running {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn cancel_device_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = &mut self.active_device_transfer else {
+            return;
+        };
+        active.cancelled.store(true, Ordering::Relaxed);
+        active.cancelling = true;
+        self.status = Some("Cancelling Kobo transfer…".into());
+        cx.notify();
+    }
+
+    fn cancel_device_target(&mut self, cx: &mut Context<Self>) {
+        self.device_target = None;
+        cx.notify();
+    }
+
+    fn cancel_device_duplicate(&mut self, cx: &mut Context<Self>) {
+        self.device_duplicate_plan = None;
+        self.status = Some("Kobo transfer cancelled before copying.".into());
+        cx.notify();
+    }
+
+    fn confirm_device_duplicates(
+        &mut self,
+        duplicate_policy: DuplicatePolicy,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(plan) = self.device_duplicate_plan.take() else {
+            return;
+        };
+        self.start_prepared_transfer(plan, duplicate_policy, window, cx);
+    }
+
     fn add_books_button(&self, id: &'static str, cx: &mut Context<Self>) -> Button {
         let button_label = if self.busy {
             "Adding books…"
@@ -2790,6 +4013,8 @@ impl LecternView {
             .disabled(
                 self.busy
                     || self.removing
+                    || self.device_resolving
+                    || self.active_device_transfer.is_some()
                     || self.selection_pending.is_some()
                     || self.bulk_tags.is_some(),
             )
@@ -2798,6 +4023,10 @@ impl LecternView {
             }))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the contextual bar keeps one compact bulk-action hierarchy"
+    )]
     fn selection_bar(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> gpui::Div {
         let selected_books = self.selection.selected_count();
         let label = if self
@@ -2808,6 +4037,13 @@ impl LecternView {
             format!("Applying tags to {selected_books} selected books…")
         } else if self.bulk_tags.is_some() {
             format!("Editing tags for {selected_books} selected books")
+        } else if self.active_device_transfer.is_some() {
+            format!(
+                "Sending {selected_books} selected {} to Kobo…",
+                pluralize_book(selected_books)
+            )
+        } else if self.device_resolving {
+            "Preparing Kobo transfer…".to_owned()
         } else if self.removing {
             format!(
                 "Removing {selected_books} selected {}…",
@@ -2846,6 +4082,8 @@ impl LecternView {
                                 selected_books == 0
                                     || self.busy
                                     || self.removing
+                                    || self.device_resolving
+                                    || self.active_device_transfer.is_some()
                                     || self.selection_pending.is_some()
                                     || self.bulk_tags.is_some(),
                             )
@@ -2853,12 +4091,48 @@ impl LecternView {
                                 this.request_bulk_tags(window, cx);
                             })),
                     )
+                    .when(self.active_device_transfer.is_some(), |actions| {
+                        actions.child(
+                            Button::new("cancel-device-transfer", "Cancel transfer")
+                                .disabled(
+                                    self.active_device_transfer
+                                        .as_ref()
+                                        .is_some_and(|transfer| transfer.cancelling),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cancel_device_transfer(cx);
+                                })),
+                        )
+                    })
+                    .when(
+                        self.active_device_transfer.is_none() && !self.devices.is_empty(),
+                        |actions| {
+                            actions.child(
+                                Button::new("send-selection-to-device", "Send to Kobo")
+                                    .variant(ButtonVariant::Primary)
+                                    .leading_icon(TablerIcon::Upload)
+                                    .disabled(
+                                        selected_books == 0
+                                            || self.busy
+                                            || self.removing
+                                            || self.device_resolving
+                                            || self.selection_pending.is_some()
+                                            || self.bulk_tags.is_some(),
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.request_send_selection(window, cx);
+                                    })),
+                            )
+                        },
+                    )
                     .when(!self.selection.is_every_matching(), |actions| {
                         actions.child(
                             Button::new("select-all-matching", "Select all matching")
                                 .disabled(
                                     self.busy
                                         || self.removing
+                                        || self.device_resolving
+                                        || self.active_device_transfer.is_some()
                                         || self.selection_pending.is_some()
                                         || self.bulk_tags.is_some(),
                                 )
@@ -2869,7 +4143,12 @@ impl LecternView {
                     })
                     .child(
                         Button::new("clear-selection", "Clear selection")
-                            .disabled(self.removing || self.bulk_tags.is_some())
+                            .disabled(
+                                self.removing
+                                    || self.device_resolving
+                                    || self.active_device_transfer.is_some()
+                                    || self.bulk_tags.is_some(),
+                            )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.clear_selection_action(cx);
                             })),
@@ -2881,6 +4160,8 @@ impl LecternView {
                                 selected_books == 0
                                     || self.busy
                                     || self.removing
+                                    || self.device_resolving
+                                    || self.active_device_transfer.is_some()
                                     || self.selection_pending.is_some()
                                     || self.bulk_tags.is_some(),
                             )
@@ -2989,6 +4270,633 @@ impl LecternView {
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.start_bulk_removal(window, cx);
                                         })),
+                                    ),
+                            ),
+                    ),
+            )
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one declarative tree keeps device information, listing, and actions together"
+    )]
+    fn device_dialog(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> AlertDialog {
+        let dialog = self
+            .device_dialog
+            .as_ref()
+            .expect("device dialog requires state");
+        let device = self
+            .devices
+            .iter()
+            .find(|device| device.id == dialog.device_id);
+        let entity = cx.entity().downgrade();
+        let cancel_entity = entity.clone();
+        let close_entity = entity.clone();
+        let device_name = device.map_or("Kobo eReader", |device| device.name.as_str());
+        let storage = device.map_or_else(
+            || "Storage unavailable".to_owned(),
+            |device| {
+                format!(
+                    "{} free of {}",
+                    format_storage_bytes(device.free_bytes),
+                    format_storage_bytes(device.total_bytes)
+                )
+            },
+        );
+        let formats = device.map_or_else(
+            || "EPUB, PDF".to_owned(),
+            |device| {
+                device
+                    .supported_formats
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        );
+        let transferring = self
+            .active_device_transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer.device_id == dialog.device_id);
+        let ejecting = self.device_ejecting.as_ref() == Some(&dialog.device_id);
+        let visible_books = dialog.books.len().min(DEVICE_VISIBLE_BOOK_LIMIT);
+        let rows = dialog
+            .books
+            .iter()
+            .take(visible_books)
+            .enumerate()
+            .map(|(row_index, book)| {
+                let relative_path = book.relative_path.clone();
+                let removing = dialog.removing.as_ref() == Some(&book.relative_path);
+                div()
+                    .py(theme.spacing.small)
+                    .border_b(theme.border.thin)
+                    .border_color(theme.border.muted)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(theme.spacing.medium)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(theme.spacing.small)
+                            .child(
+                                div()
+                                    .truncate()
+                                    .font_weight(theme.typography.button_weight)
+                                    .child(book.relative_path.display().to_string()),
+                            )
+                            .child(div().text_color(theme.surface.muted_foreground).child(
+                                format!(
+                                    "{} · {} · {}",
+                                    book.format,
+                                    format_storage_bytes(book.bytes),
+                                    if book.library_book_id.is_some() {
+                                        "In library"
+                                    } else {
+                                        "Not in library"
+                                    }
+                                ),
+                            )),
+                    )
+                    .when(book.managed_by_lectern, |row| {
+                        row.child(
+                            Button::new(
+                                format!("remove-device-book-{row_index}"),
+                                if removing { "Removing…" } else { "Remove" },
+                            )
+                            .size(ButtonSize::Small)
+                            .variant(ButtonVariant::Danger)
+                            .disabled(
+                                dialog.loading
+                                    || dialog.removing.is_some()
+                                    || ejecting
+                                    || transferring,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.remove_device_book(relative_path.clone(), window, cx);
+                                },
+                            )),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        let device_id = dialog.device_id.clone();
+        let eject_device_id = device_id.clone();
+
+        AlertDialog::new(cx)
+            .open(true)
+            .close_on_escape(true)
+            .on_open_change(move |open, _, _, cx| {
+                if !open {
+                    _ = close_entity.update(cx, LecternView::close_device_dialog);
+                }
+            })
+            .on_cancel(move |_, _, cx| {
+                _ = cancel_entity.update(cx, LecternView::close_device_dialog);
+                true
+            })
+            .backdrop(
+                AlertDialogBackdrop::new()
+                    .absolute()
+                    .inset_0()
+                    .bg(theme.dialog.backdrop),
+            )
+            .popup(
+                AlertDialogPopup::new()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(DEVICE_DIALOG_WIDTH_PX))
+                            .max_h(rems(34.))
+                            .p(theme.spacing.extra_large)
+                            .rounded(theme.dialog.radius)
+                            .border(theme.border.thin)
+                            .border_color(theme.border.muted)
+                            .bg(theme.surface.background)
+                            .flex()
+                            .flex_col()
+                            .gap(theme.spacing.medium)
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_start()
+                                    .justify_between()
+                                    .gap(theme.spacing.medium)
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(theme.spacing.small)
+                                            .child(
+                                                AlertDialogTitle::new()
+                                                    .text_size(theme.typography.title_size)
+                                                    .font_weight(theme.typography.title_weight)
+                                                    .child(device_name.to_owned()),
+                                            )
+                                            .child(
+                                                AlertDialogDescription::new()
+                                                    .text_color(theme.surface.muted_foreground)
+                                                    .child(format!("Connected · {storage}")),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("close-device-dialog", "Close")
+                                            .size(ButtonSize::Small)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.close_device_dialog(cx);
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(theme.spacing.medium)
+                                    .child(
+                                        div()
+                                            .text_color(theme.surface.muted_foreground)
+                                            .child(format!("Supported formats: {formats}")),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(theme.spacing.small)
+                                            .child(
+                                                Button::new("refresh-device", "Refresh")
+                                                    .size(ButtonSize::Small)
+                                                    .disabled(
+                                                        dialog.loading
+                                                            || dialog.removing.is_some()
+                                                            || ejecting
+                                                            || transferring,
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.refresh_device_dialog(window, cx);
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new(
+                                                    "eject-device",
+                                                    if ejecting {
+                                                        "Ejecting…"
+                                                    } else {
+                                                        "Eject Kobo"
+                                                    },
+                                                )
+                                                .size(ButtonSize::Small)
+                                                .disabled(
+                                                    dialog.loading
+                                                        || dialog.removing.is_some()
+                                                        || ejecting
+                                                        || transferring,
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.eject_device(
+                                                            eject_device_id.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    },
+                                                )),
+                                            ),
+                                    ),
+                            )
+                            .when_some(dialog.error.clone(), |content, error| {
+                                content.child(
+                                    div()
+                                        .text_color(theme.button.danger.foreground)
+                                        .child(error),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .mt(theme.spacing.small)
+                                    .font_weight(theme.typography.button_weight)
+                                    .child(format!("Books on device ({})", dialog.books.len())),
+                            )
+                            .child(
+                                div()
+                                    .id("device-books-scroll")
+                                    .min_h_0()
+                                    .max_h(rems(20.))
+                                    .overflow_y_scroll()
+                                    .when(dialog.loading, |content| {
+                                        content.child(
+                                            div()
+                                                .py(theme.spacing.large)
+                                                .text_color(theme.surface.muted_foreground)
+                                                .child("Refreshing device books…"),
+                                        )
+                                    })
+                                    .when(!dialog.loading && rows.is_empty(), |content| {
+                                        content.child(
+                                            div()
+                                                .py(theme.spacing.large)
+                                                .text_color(theme.surface.muted_foreground)
+                                                .child("No EPUB or PDF files found in Lectern’s Books directory."),
+                                        )
+                                    })
+                                    .children(rows),
+                            )
+                            .when(dialog.books.len() > visible_books, |content| {
+                                content.child(
+                                    div()
+                                        .text_color(theme.surface.muted_foreground)
+                                        .child(format!(
+                                            "Showing the first {visible_books} device books."
+                                        )),
+                                )
+                            }),
+                    ),
+            )
+    }
+
+    fn device_target_dialog(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> AlertDialog {
+        let target = self
+            .device_target
+            .as_ref()
+            .expect("device target dialog requires state");
+        let close_entity = cx.entity().downgrade();
+        let cancel_entity = close_entity.clone();
+        let choices = self
+            .devices
+            .iter()
+            .map(|device| {
+                let device_id = device.id.clone();
+                let selection = target.selection.clone();
+                Button::new(
+                    format!("send-target-{}", device.id.as_str()),
+                    format!(
+                        "{} · {} free",
+                        device.name,
+                        format_storage_bytes(device.free_bytes)
+                    ),
+                )
+                .leading_icon(TablerIcon::DeviceTablet)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.start_send_to_device(device_id.clone(), selection.clone(), window, cx);
+                }))
+            })
+            .collect::<Vec<_>>();
+        AlertDialog::new(cx)
+            .open(true)
+            .close_on_escape(true)
+            .on_open_change(move |open, _, _, cx| {
+                if !open {
+                    _ = close_entity.update(cx, LecternView::cancel_device_target);
+                }
+            })
+            .on_cancel(move |_, _, cx| {
+                _ = cancel_entity.update(cx, LecternView::cancel_device_target);
+                true
+            })
+            .backdrop(
+                AlertDialogBackdrop::new()
+                    .absolute()
+                    .inset_0()
+                    .bg(theme.dialog.backdrop),
+            )
+            .popup(
+                AlertDialogPopup::new()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(DEVICE_DIALOG_WIDTH_PX))
+                            .p(theme.spacing.extra_large)
+                            .rounded(theme.dialog.radius)
+                            .border(theme.border.thin)
+                            .border_color(theme.border.muted)
+                            .bg(theme.surface.background)
+                            .flex()
+                            .flex_col()
+                            .gap(theme.spacing.large)
+                            .child(
+                                AlertDialogTitle::new()
+                                    .text_size(theme.typography.title_size)
+                                    .font_weight(theme.typography.title_weight)
+                                    .child("Choose a Kobo"),
+                            )
+                            .child(
+                                AlertDialogDescription::new()
+                                    .text_size(theme.typography.body_size)
+                                    .text_color(theme.surface.muted_foreground)
+                                    .child(format!(
+                                        "Send {} selected {} to which connected reader?",
+                                        target.selected_books,
+                                        pluralize_book(target.selected_books)
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(theme.spacing.small)
+                                    .children(choices),
+                            )
+                            .child(
+                                div().flex().justify_end().child(
+                                    Button::new("cancel-device-target", "Cancel")
+                                        .size(ButtonSize::Small)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_device_target(cx);
+                                        })),
+                                ),
+                            ),
+                    ),
+            )
+    }
+
+    fn device_duplicate_dialog(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> AlertDialog {
+        let plan = self
+            .device_duplicate_plan
+            .as_ref()
+            .expect("duplicate dialog requires a transfer plan");
+        let close_entity = cx.entity().downgrade();
+        let cancel_entity = close_entity.clone();
+        let choices = vec![
+            Button::new("skip-device-duplicates", "Skip existing").on_click(cx.listener(
+                |this, _, window, cx| {
+                    this.confirm_device_duplicates(DuplicatePolicy::Skip, window, cx);
+                },
+            )),
+            Button::new("replace-device-duplicates", "Replace previous transfers")
+                .variant(ButtonVariant::Primary)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.confirm_device_duplicates(DuplicatePolicy::ReplaceTracked, window, cx);
+                })),
+        ];
+        AlertDialog::new(cx)
+            .open(true)
+            .close_on_escape(true)
+            .on_open_change(move |open, _, _, cx| {
+                if !open {
+                    _ = close_entity.update(cx, LecternView::cancel_device_duplicate);
+                }
+            })
+            .on_cancel(move |_, _, cx| {
+                _ = cancel_entity.update(cx, LecternView::cancel_device_duplicate);
+                true
+            })
+            .backdrop(
+                AlertDialogBackdrop::new()
+                    .absolute()
+                    .inset_0()
+                    .bg(theme.dialog.backdrop),
+            )
+            .popup(
+                AlertDialogPopup::new()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(DEVICE_DIALOG_WIDTH_PX))
+                            .p(theme.spacing.extra_large)
+                            .rounded(theme.dialog.radius)
+                            .border(theme.border.thin)
+                            .border_color(theme.border.muted)
+                            .bg(theme.surface.background)
+                            .flex()
+                            .flex_col()
+                            .gap(theme.spacing.large)
+                            .child(
+                                AlertDialogTitle::new()
+                                    .text_size(theme.typography.title_size)
+                                    .font_weight(theme.typography.title_weight)
+                                    .child("Books already on Kobo"),
+                            )
+                            .child(
+                                AlertDialogDescription::new()
+                                    .text_size(theme.typography.body_size)
+                                    .text_color(theme.surface.muted_foreground)
+                                    .child(format!(
+                                        "{} previous Lectern {} can be replaced safely. Other filename collisions will always be skipped.",
+                                        plan.replacement_count(),
+                                        if plan.replacement_count() == 1 { "copy" } else { "copies" }
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_end()
+                                    .gap(theme.spacing.small)
+                                    .children(choices),
+                            ),
+                    ),
+            )
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the dialog keeps its three small metadata fields in one visual definition"
+    )]
+    fn virtual_library_dialog(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> AlertDialog {
+        let dialog = self
+            .virtual_library_dialog
+            .as_ref()
+            .expect("rendered virtual-library dialog is open");
+        let close_entity = cx.entity().downgrade();
+        let cancel_entity = close_entity.clone();
+        let icon_choices = VirtualLibraryIcon::ALL
+            .into_iter()
+            .map(|icon| {
+                let label = format!("{}  {icon}", icon.glyph());
+                let button = Button::new(format!("virtual-library-icon-{}", icon.as_str()), label)
+                    .size(ButtonSize::Small)
+                    .disabled(dialog.saving);
+                let button = if dialog.icon == icon {
+                    button.variant(ButtonVariant::Primary)
+                } else {
+                    button
+                };
+                button.on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_virtual_library_icon(icon, cx);
+                }))
+            })
+            .collect::<Vec<_>>();
+        let description = if dialog.book.is_some() {
+            "Create a virtual library and add the selected book to it."
+        } else {
+            "Create a library within Lectern. Books can belong to more than one virtual library."
+        };
+
+        AlertDialog::new(cx)
+            .open(true)
+            .close_on_escape(true)
+            .on_open_change(move |open, _, _, cx| {
+                if !open {
+                    _ = close_entity.update(cx, LecternView::close_virtual_library_dialog);
+                }
+            })
+            .on_cancel(move |_, _, cx| {
+                _ = cancel_entity.update(cx, LecternView::close_virtual_library_dialog);
+                true
+            })
+            .backdrop(
+                AlertDialogBackdrop::new()
+                    .absolute()
+                    .inset_0()
+                    .bg(theme.dialog.backdrop),
+            )
+            .popup(
+                AlertDialogPopup::new()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(VIRTUAL_LIBRARY_DIALOG_WIDTH_PX))
+                            .p(theme.spacing.extra_large)
+                            .rounded(theme.dialog.radius)
+                            .border(theme.border.thin)
+                            .border_color(theme.border.muted)
+                            .bg(theme.surface.background)
+                            .flex()
+                            .flex_col()
+                            .gap(theme.spacing.large)
+                            .child(
+                                AlertDialogTitle::new()
+                                    .text_size(theme.typography.title_size)
+                                    .font_weight(theme.typography.title_weight)
+                                    .child("Create Virtual Library"),
+                            )
+                            .child(
+                                AlertDialogDescription::new()
+                                    .text_size(theme.typography.body_size)
+                                    .text_color(theme.surface.muted_foreground)
+                                    .child(description),
+                            )
+                            .child(detail_field_container("Library name", theme).child(
+                                TextInput::new(
+                                    "virtual-library-name",
+                                    "Virtual library name",
+                                    &dialog.name,
+                                ),
+                            ))
+                            .child(
+                                detail_field_container("Description", theme).child(
+                                    TextArea::new(
+                                        "virtual-library-description",
+                                        "Virtual library description",
+                                        &dialog.description,
+                                    )
+                                    .height(rems(6.)),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(theme.spacing.small)
+                                    .child(
+                                        div()
+                                            .font_weight(theme.typography.button_weight)
+                                            .child("Cover icon"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap(theme.spacing.small)
+                                            .children(icon_choices),
+                                    ),
+                            )
+                            .when_some(dialog.error.clone(), |content, error| {
+                                content.child(detail_error_text(error, theme))
+                            })
+                            .child(
+                                div()
+                                    .mt(theme.spacing.small)
+                                    .flex()
+                                    .justify_end()
+                                    .gap(theme.spacing.small)
+                                    .child(
+                                        Button::new("cancel-virtual-library", "Cancel")
+                                            .size(ButtonSize::Small)
+                                            .disabled(dialog.saving)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.close_virtual_library_dialog(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(
+                                            "create-virtual-library",
+                                            if dialog.saving {
+                                                "Creating…"
+                                            } else {
+                                                "Create Virtual Library"
+                                            },
+                                        )
+                                        .size(ButtonSize::Small)
+                                        .variant(ButtonVariant::Primary)
+                                        .disabled(dialog.saving)
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.create_virtual_library(cx);
+                                            }),
+                                        ),
                                     ),
                             ),
                     ),
@@ -3211,6 +5119,31 @@ impl LecternView {
         selection_locked: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let device_buttons = self
+            .devices
+            .iter()
+            .map(|device| {
+                let device_id = device.id.clone();
+                let label = format!(
+                    "{} · {} free",
+                    device.name,
+                    format_storage_bytes(device.free_bytes)
+                );
+                Button::new(format!("open-device-{}", device.id.as_str()), label)
+                    .size(ButtonSize::Small)
+                    .leading_icon(TablerIcon::DeviceTablet)
+                    .disabled(
+                        self.device_ejecting.as_ref() == Some(&device.id)
+                            || self
+                                .active_device_transfer
+                                .as_ref()
+                                .is_some_and(|transfer| transfer.device_id == device.id),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_device_dialog(device_id.clone(), window, cx);
+                    }))
+            })
+            .collect::<Vec<_>>();
         div()
             .flex_none()
             .h(px(TOP_BAR_HEIGHT_PX))
@@ -3233,6 +5166,7 @@ impl LecternView {
                     .flex()
                     .items_center()
                     .gap(theme.spacing.small)
+                    .children(device_buttons)
                     .child(
                         IconButton::new(
                             "open-theme-dialog",
@@ -3243,6 +5177,18 @@ impl LecternView {
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.open_theme_dialog(cx);
                         })),
+                    )
+                    .child(
+                        Button::new("open-virtual-library-dialog", "Create Virtual Library")
+                            .disabled(
+                                self.busy
+                                    || self.removing
+                                    || self.device_resolving
+                                    || self.active_device_transfer.is_some(),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_virtual_library_dialog(String::new(), None, window, cx);
+                            })),
                     )
                     .child(
                         Button::new("begin-selection", "Select books")
@@ -3272,6 +5218,8 @@ impl LecternView {
         let selection_active = self.selection.is_active();
         let selection_locked = self.busy
             || self.removing
+            || self.device_resolving
+            || self.active_device_transfer.is_some()
             || self.selection_pending.is_some()
             || self.bulk_tags.is_some();
         let detail_book = self
@@ -3393,7 +5341,12 @@ impl Render for LecternView {
             LibraryState::Ready if self.books.is_empty() => self.empty_library_view(&theme, cx),
             LibraryState::Ready => self.library_view(&theme, cx),
         };
-        let modal_open = self.removal_confirmation.is_some() || self.theme_dialog_open;
+        let modal_open = self.removal_confirmation.is_some()
+            || self.theme_dialog_open
+            || self.virtual_library_dialog.is_some()
+            || self.device_dialog.is_some()
+            || self.device_target.is_some()
+            || self.device_duplicate_plan.is_some();
 
         div()
             .size_full()
@@ -3431,6 +5384,18 @@ impl Render for LecternView {
             })
             .when(self.theme_dialog_open, |root| {
                 root.child(self.theme_dialog(&theme, cx))
+            })
+            .when(self.virtual_library_dialog.is_some(), |root| {
+                root.child(self.virtual_library_dialog(&theme, cx))
+            })
+            .when(self.device_dialog.is_some(), |root| {
+                root.child(self.device_dialog(&theme, cx))
+            })
+            .when(self.device_target.is_some(), |root| {
+                root.child(self.device_target_dialog(&theme, cx))
+            })
+            .when(self.device_duplicate_plan.is_some(), |root| {
+                root.child(self.device_duplicate_dialog(&theme, cx))
             })
     }
 }
@@ -3861,8 +5826,12 @@ const fn detail_tags_item_index(contributor_count: usize) -> usize {
     detail_contributor_footer_item(contributor_count) + 1
 }
 
-const fn detail_library_item_index(contributor_count: usize) -> usize {
+const fn detail_virtual_libraries_item_index(contributor_count: usize) -> usize {
     detail_tags_item_index(contributor_count) + 1
+}
+
+const fn detail_library_item_index(contributor_count: usize) -> usize {
+    detail_virtual_libraries_item_index(contributor_count) + 1
 }
 
 const fn detail_item_count(contributor_count: usize) -> usize {
@@ -4406,7 +6375,10 @@ fn book_detail_panel(
                 )
                 .child(
                     Button::new("close-book-detail", "Close")
-                        .disabled(editor.operation != DetailOperation::Idle)
+                        .disabled(
+                            editor.operation != DetailOperation::Idle
+                                || editor.virtual_library_busy,
+                        )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.close_book_detail(cx);
                         })),
@@ -4429,7 +6401,7 @@ fn book_detail_action_bar(
     theme: &PrimerTheme,
     cx: &mut Context<LecternView>,
 ) -> gpui::Div {
-    let editing_busy = editor.operation != DetailOperation::Idle;
+    let editing_busy = editor.operation != DetailOperation::Idle || editor.virtual_library_busy;
     div()
         .flex_none()
         .h(px(TOP_BAR_HEIGHT_PX))
@@ -4537,6 +6509,16 @@ impl LecternView {
             if let Some(editor) = &mut self.detail_editor {
                 editor.tag_input = Some(input);
             }
+        } else if item == detail_virtual_libraries_item_index(contributor_count)
+            && editor.virtual_library_input.is_none()
+        {
+            let input = virtual_library_search_input(window, cx);
+            if disabled {
+                input.update(cx, |state, cx| state.set_disabled(true, cx));
+            }
+            if let Some(editor) = &mut self.detail_editor {
+                editor.virtual_library_input = Some(input);
+            }
         }
     }
 
@@ -4554,6 +6536,7 @@ impl LecternView {
         let contributor_count = editor.contributors.len();
         let contributor_footer = detail_contributor_footer_item(contributor_count);
         let tags = detail_tags_item_index(contributor_count);
+        let virtual_libraries = detail_virtual_libraries_item_index(contributor_count);
         let library = detail_library_item_index(contributor_count);
         let editing_busy = editor.operation != DetailOperation::Idle;
 
@@ -4588,6 +6571,8 @@ impl LecternView {
             detail_contributor_footer(editor, &theme, cx)
         } else if item == tags {
             detail_tags_item(editor, &theme, cx)
+        } else if item == virtual_libraries {
+            detail_virtual_libraries_item(editor, &theme, cx)
         } else if item == library {
             detail_library_item(editor, &theme, cx)
         } else {
@@ -4602,6 +6587,7 @@ impl LecternView {
                 | DETAIL_SERIES_ITEM
         ) || item == DETAIL_CONTRIBUTOR_START_ITEM
             || item == tags
+            || item == virtual_libraries
             || item == library;
         let ends_section = matches!(
             item,
@@ -4610,7 +6596,8 @@ impl LecternView {
                 | DETAIL_FILES_ITEM
                 | DETAIL_SERIES_ITEM
         ) || item == contributor_footer
-            || item == tags;
+            || item == tags
+            || item == virtual_libraries;
 
         div()
             .px(theme.spacing.large)
@@ -5312,6 +7299,192 @@ fn detail_tags_item(
         .into_any_element()
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the function declares one cohesive searchable virtual-library hierarchy"
+)]
+fn detail_virtual_libraries_item(
+    editor: &BookDetailEditor,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let editing_busy = editor.operation != DetailOperation::Idle || editor.virtual_library_busy;
+    let query = editor
+        .virtual_library_input
+        .as_ref()
+        .expect("rendered virtual-library input is initialized")
+        .read(cx)
+        .value()
+        .to_string();
+    let selected_ids = editor
+        .original
+        .virtual_libraries
+        .iter()
+        .map(|library| library.id)
+        .collect::<HashSet<_>>();
+    let selected_keys = editor
+        .original
+        .virtual_libraries
+        .iter()
+        .map(|library| identity_key(&library.name))
+        .collect::<HashSet<_>>();
+    let chips = editor.original.virtual_libraries.iter().map(|library| {
+        let selected = library.clone();
+        EntityChip::new(
+            format!("detail-virtual-library-{}", library.id.value()),
+            format!("{}  {}", library.icon.glyph(), library.name),
+        )
+        .disabled(editing_busy)
+        .on_remove(cx.listener(move |this, _, _, cx| {
+            this.toggle_detail_virtual_library(&selected, cx);
+        }))
+    });
+    let selected_items = editor
+        .original
+        .virtual_libraries
+        .iter()
+        .map(|library| {
+            let selected = library.clone();
+            ActionListItem::new(
+                format!("selected-virtual-library-{}", library.id.value()),
+                virtual_library_option_label(library),
+            )
+            .selected(true)
+            .disabled(editor.virtual_library_busy)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_detail_virtual_library(&selected, cx);
+            }))
+        })
+        .collect::<Vec<_>>();
+    let suggestions = editor
+        .virtual_library_suggestions
+        .iter()
+        .filter(|library| !selected_ids.contains(&library.id))
+        .filter(|library| !selected_keys.contains(&identity_key(&library.name)))
+        .map(|library| {
+            let suggestion = library.clone();
+            ActionListItem::new(
+                format!("virtual-library-suggestion-{}", library.id.value()),
+                virtual_library_option_label(library),
+            )
+            .disabled(editor.virtual_library_busy)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_detail_virtual_library(&suggestion, cx);
+            }))
+        })
+        .collect::<Vec<_>>();
+    let has_suggestions = !selected_items.is_empty() || !suggestions.is_empty();
+    let normalized_query = normalize_name(NameKind::VirtualLibrary, &query).ok();
+    let exact_match = normalized_query.as_ref().is_some_and(|query| {
+        let key = identity_key(query);
+        selected_keys.contains(&key)
+            || editor
+                .virtual_library_suggestions
+                .iter()
+                .any(|library| identity_key(&library.name) == key)
+    });
+    let create_name = normalized_query.filter(|_| !exact_match);
+    let menu_content = div()
+        .flex()
+        .flex_col()
+        .gap(theme.spacing.small)
+        .child(TextInput::new(
+            "detail-virtual-library-input",
+            "Add or find a virtual library",
+            editor
+                .virtual_library_input
+                .as_ref()
+                .expect("rendered virtual-library input is initialized"),
+        ))
+        .when(editor.virtual_library_suggestions_loading, |content| {
+            content.child(
+                div()
+                    .px(theme.spacing.medium)
+                    .py(theme.spacing.small)
+                    .text_color(theme.surface.muted_foreground)
+                    .child("Finding virtual libraries…"),
+            )
+        })
+        .when(
+            !editor.virtual_library_suggestions_loading && !has_suggestions,
+            |content| {
+                content.child(
+                    div()
+                        .px(theme.spacing.medium)
+                        .py(theme.spacing.small)
+                        .text_color(theme.surface.muted_foreground)
+                        .child(if query.trim().is_empty() {
+                            "No virtual libraries yet. Start typing to create one."
+                        } else {
+                            "No existing virtual libraries found."
+                        }),
+                )
+            },
+        )
+        .when(!editor.virtual_library_suggestions_loading, |content| {
+            content.children(selected_items).children(suggestions)
+        })
+        .when_some(create_name, |content, name| {
+            let action_name = name.clone();
+            content.child(
+                ActionListItem::new(
+                    "create-detail-virtual-library",
+                    format!("+  Create new virtual library: “{name}”"),
+                )
+                .disabled(editor.virtual_library_busy)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.begin_detail_virtual_library_creation(&action_name, window, cx);
+                })),
+            )
+        });
+
+    detail_section_container("Virtual Libraries", theme)
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(theme.spacing.small)
+                .items_center()
+                .children(chips)
+                .child(
+                    ActionMenu::new(
+                        "detail-virtual-library-menu",
+                        Button::new("open-detail-virtual-library-menu", "+ Virtual Library")
+                            .size(ButtonSize::Small)
+                            .disabled(editing_busy),
+                        menu_content,
+                    )
+                    .width(rems(21.))
+                    .open(editor.virtual_library_menu_open)
+                    .on_open_change(cx.listener(|this, open, _, cx| {
+                        this.set_virtual_library_menu_open(*open, cx);
+                    })),
+                ),
+        )
+        .when(editor.virtual_library_busy, |section| {
+            section.child(
+                div()
+                    .text_color(theme.surface.muted_foreground)
+                    .child("Updating virtual libraries…"),
+            )
+        })
+        .when_some(
+            detail_error(editor, DetailErrorSection::VirtualLibraries),
+            |content, error| content.child(detail_error_text(error, theme)),
+        )
+        .into_any_element()
+}
+
+fn virtual_library_option_label(library: &VirtualLibrary) -> String {
+    format!(
+        "{}  {} · {} {}",
+        library.icon.glyph(),
+        library.name,
+        library.books,
+        if library.books == 1 { "book" } else { "books" }
+    )
+}
+
 fn detail_files_item(
     editor: &BookDetailEditor,
     theme: &PrimerTheme,
@@ -5817,6 +7990,67 @@ fn pluralize_book(count: u64) -> &'static str {
     if count == 1 { "book" } else { "books" }
 }
 
+fn format_storage_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1_024;
+    const MIB: u64 = KIB * 1_024;
+    const GIB: u64 = MIB * 1_024;
+    if bytes >= GIB {
+        format_binary_unit(bytes, GIB, "GB")
+    } else if bytes >= MIB {
+        format_binary_unit(bytes, MIB, "MB")
+    } else if bytes >= KIB {
+        format_binary_unit(bytes, KIB, "KB")
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_binary_unit(bytes: u64, unit: u64, suffix: &str) -> String {
+    let whole = bytes / unit;
+    let tenths = bytes % unit * 10 / unit;
+    format!("{whole}.{tenths} {suffix}")
+}
+
+fn format_device_transfer_progress(
+    progress: &TransferProgress,
+    elapsed: Duration,
+    cancelling: bool,
+) -> String {
+    if cancelling {
+        return "Cancelling Kobo transfer…".to_owned();
+    }
+    let percent = if progress.batch_total_bytes == 0 {
+        100
+    } else {
+        progress
+            .batch_copied_bytes
+            .saturating_mul(100)
+            .checked_div(progress.batch_total_bytes)
+            .unwrap_or(0)
+            .min(100)
+    };
+    let elapsed_millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let speed = if elapsed_millis == 0 {
+        0
+    } else {
+        progress
+            .batch_copied_bytes
+            .saturating_mul(1_000)
+            .checked_div(elapsed_millis)
+            .unwrap_or(0)
+    };
+    format!(
+        "Sending “{}” to Kobo… {}% · {} / {} · {} /s · {} of {} books",
+        progress.current_title,
+        percent,
+        format_storage_bytes(progress.batch_copied_bytes),
+        format_storage_bytes(progress.batch_total_bytes),
+        format_storage_bytes(speed),
+        progress.item_index.saturating_add(1),
+        progress.total_items
+    )
+}
+
 fn benchmark_library_books() -> Vec<LibraryBook> {
     (0..LIBRARY_PAGE_SIZE)
         .map(|index| LibraryBook {
@@ -5830,6 +8064,48 @@ fn benchmark_library_books() -> Vec<LibraryBook> {
                 has_file_issue: false,
             },
             cover: None,
+        })
+        .collect()
+}
+
+fn benchmark_kobo_device() -> DeviceInfo {
+    const GIB: u64 = 1_024 * 1_024 * 1_024;
+    DeviceInfo {
+        id: DeviceId::new("kobo:benchmark"),
+        kind: DeviceKind::Kobo,
+        name: "Kobo eReader".to_owned(),
+        manufacturer: "Kobo".to_owned(),
+        model: None,
+        mount_path: PathBuf::from("/benchmark/kobo"),
+        volume_name: OsString::from("KOBOeReader"),
+        total_bytes: 32 * GIB,
+        free_bytes: 21 * GIB + 400 * 1_024 * 1_024,
+        state: DeviceConnectionState::Connected,
+        supported_formats: Arc::from([
+            DeviceFormat::Epub,
+            DeviceFormat::Kepub,
+            DeviceFormat::Pdf,
+            DeviceFormat::Cbz,
+            DeviceFormat::Cbr,
+            DeviceFormat::Txt,
+        ]),
+    }
+}
+
+fn benchmark_kobo_books() -> Vec<DeviceBook> {
+    (0..DEVICE_VISIBLE_BOOK_LIMIT)
+        .map(|index| DeviceBook {
+            relative_path: PathBuf::from(format!(
+                "Books/Benchmark author {:03}/Benchmark title {index:03}.epub",
+                index % 32
+            )),
+            format: DeviceFormat::Epub,
+            bytes: 1_048_576 + u64::try_from(index).expect("benchmark index fits u64") * 4_096,
+            library_book_id: (index % 2 == 0)
+                .then(|| BookId::new(i64::try_from(index + 1).expect("benchmark index fits i64"))),
+            source_asset_id: (index % 2 == 0)
+                .then(|| AssetId::new(i64::try_from(index + 1).expect("benchmark index fits i64"))),
+            managed_by_lectern: index % 2 == 0,
         })
         .collect()
 }
@@ -5888,6 +8164,7 @@ fn benchmark_book_detail() -> Book {
                 color: TagColor::Azure,
             },
         ],
+        virtual_libraries: benchmark_virtual_libraries(3, 1),
         publisher: Some("Lectern Press".to_owned()),
         publication_date: Some("2026-08-27".parse().expect("valid benchmark date")),
         language: Some("en".to_owned()),
@@ -5914,6 +8191,21 @@ fn benchmark_book_detail() -> Book {
     }
 }
 
+fn benchmark_virtual_libraries(count: usize, first_id: i64) -> Vec<VirtualLibrary> {
+    (0..count)
+        .map(|index| {
+            let id = first_id + i64::try_from(index).expect("benchmark index fits i64");
+            VirtualLibrary {
+                id: VirtualLibraryId::new(id),
+                name: format!("Virtual shelf {id:03}"),
+                description: Some(format!("Representative virtual library {id:03}.")),
+                icon: VirtualLibraryIcon::ALL[index % VirtualLibraryIcon::ALL.len()],
+                books: u64::try_from(index + 1).expect("benchmark count fits u64") * 20,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod selection_tests {
     use super::*;
@@ -5921,6 +8213,10 @@ mod selection_tests {
     #[test]
     fn escape_dismisses_the_topmost_surface_first() {
         let mut surfaces = DismissibleSurfaces {
+            device_duplicate: true,
+            device_target: true,
+            device_dialog: true,
+            virtual_library_dialog: true,
             theme_dialog: true,
             bulk_removal_dialog: true,
             detail_removal_confirmation: true,
@@ -5928,6 +8224,26 @@ mod selection_tests {
             book_detail: true,
         };
 
+        assert_eq!(
+            topmost_dismiss_target(surfaces),
+            DismissTarget::DeviceDuplicate
+        );
+        surfaces.device_duplicate = false;
+        assert_eq!(
+            topmost_dismiss_target(surfaces),
+            DismissTarget::DeviceTarget
+        );
+        surfaces.device_target = false;
+        assert_eq!(
+            topmost_dismiss_target(surfaces),
+            DismissTarget::DeviceDialog
+        );
+        surfaces.device_dialog = false;
+        assert_eq!(
+            topmost_dismiss_target(surfaces),
+            DismissTarget::VirtualLibraryDialog
+        );
+        surfaces.virtual_library_dialog = false;
         assert_eq!(topmost_dismiss_target(surfaces), DismissTarget::ThemeDialog);
         surfaces.theme_dialog = false;
         assert_eq!(
@@ -6057,7 +8373,9 @@ enum BenchmarkWorkload {
     EmptyLibraryAddBooks,
     LibrarySelection,
     BookDetail,
+    VirtualLibrary,
     BulkTags,
+    KoboDevice,
 }
 
 #[derive(Clone, Copy)]
@@ -6111,6 +8429,8 @@ struct BenchmarkRun {
     action_started: Option<Instant>,
     selection_painted: Option<Duration>,
     detail_painted: Option<Duration>,
+    virtual_library_dialog_painted: Option<Duration>,
+    virtual_library_menu_painted: Option<Duration>,
     bulk_tag_config: Option<BulkTagBenchmarkConfig>,
     bulk_tag_library_books: Option<u64>,
     bulk_tag_panels_painted: usize,
@@ -6120,6 +8440,7 @@ struct BenchmarkRun {
     bulk_tag_selection_samples_ns: Vec<u64>,
     bulk_tag_completion_samples_ns: Vec<u64>,
     bulk_tag_completion_started: Option<Instant>,
+    device_painted: Option<Duration>,
     confirmation_started: Option<Instant>,
 }
 
@@ -6344,6 +8665,105 @@ impl BenchmarkRun {
             )
         });
     }
+
+    fn finish_virtual_library(
+        self,
+        library_total: u64,
+        rendered_books: usize,
+        membership_count: usize,
+        suggestion_count: usize,
+    ) {
+        assert_eq!(
+            self.workload,
+            BenchmarkWorkload::VirtualLibrary,
+            "virtual-library completion belongs to its UI benchmark"
+        );
+        let sample = UiVirtualLibraryBenchmarkSample {
+            schema_version: 1,
+            workload: "virtual-library",
+            initial_render_ms: millis(self.initial_render.expect("initial frame was measured")),
+            dialog_to_paint_ms: millis(
+                self.virtual_library_dialog_painted
+                    .expect("virtual-library dialog was presented"),
+            ),
+            detail_menu_to_paint_ms: millis(
+                self.virtual_library_menu_painted
+                    .expect("virtual-library detail menu was presented"),
+            ),
+            peak_rss_bytes: peak_rss_bytes(),
+            correctness: UiVirtualLibraryBenchmarkCorrectness {
+                library_total,
+                rendered_books,
+                membership_count,
+                suggestion_count,
+                icon_choices: VirtualLibraryIcon::ALL.len(),
+                markers: vec![
+                    "create_virtual_library_button",
+                    "create_dialog_presented",
+                    "name_description_icon_fields",
+                    "book_detail_memberships_presented",
+                    "bounded_virtual_library_suggestions",
+                    "inline_create_action_presented",
+                ],
+            },
+        };
+        let json = serde_json::to_vec_pretty(&sample)
+            .expect("serialize GPUI virtual-library benchmark sample");
+        fs::write(&self.output, json).unwrap_or_else(|error| {
+            panic!(
+                "write GPUI virtual-library benchmark sample {}: {error}",
+                self.output.display()
+            )
+        });
+    }
+
+    fn finish_kobo_device(
+        self,
+        device_name: String,
+        total_bytes: u64,
+        free_bytes: u64,
+        listed_books: usize,
+        managed_books: usize,
+    ) {
+        assert_eq!(
+            self.workload,
+            BenchmarkWorkload::KoboDevice,
+            "device completion belongs to the Kobo-device benchmark"
+        );
+        let sample = UiKoboDeviceBenchmarkSample {
+            schema_version: 1,
+            workload: "kobo-device",
+            initial_render_ms: millis(self.initial_render.expect("initial frame was measured")),
+            device_to_paint_ms: millis(
+                self.device_painted
+                    .expect("Kobo device state was presented"),
+            ),
+            peak_rss_bytes: peak_rss_bytes(),
+            correctness: UiKoboDeviceBenchmarkCorrectness {
+                device_name,
+                total_bytes,
+                free_bytes,
+                listed_books,
+                managed_books,
+                markers: vec![
+                    "generic_device_icon",
+                    "storage_presented",
+                    "bounded_device_listing",
+                    "library_correlation_presented",
+                    "remove_action_presented",
+                    "eject_action_presented",
+                ],
+            },
+        };
+        let json =
+            serde_json::to_vec_pretty(&sample).expect("serialize GPUI Kobo benchmark sample");
+        fs::write(&self.output, json).unwrap_or_else(|error| {
+            panic!(
+                "write GPUI Kobo benchmark sample {}: {error}",
+                self.output.display()
+            )
+        });
+    }
 }
 
 fn millis(duration: Duration) -> f64 {
@@ -6390,6 +8810,26 @@ struct UiBenchmarkCorrectness {
     busy_button_label: &'static str,
     initial_state_presented: bool,
     busy_state_presented: bool,
+}
+
+#[derive(Serialize)]
+struct UiKoboDeviceBenchmarkSample {
+    schema_version: u32,
+    workload: &'static str,
+    initial_render_ms: f64,
+    device_to_paint_ms: f64,
+    peak_rss_bytes: Option<u64>,
+    correctness: UiKoboDeviceBenchmarkCorrectness,
+}
+
+#[derive(Serialize)]
+struct UiKoboDeviceBenchmarkCorrectness {
+    device_name: String,
+    total_bytes: u64,
+    free_bytes: u64,
+    listed_books: usize,
+    managed_books: usize,
+    markers: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -6448,5 +8888,26 @@ struct UiBookDetailBenchmarkCorrectness {
     contributor_count: usize,
     tag_count: usize,
     asset_count: usize,
+    markers: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct UiVirtualLibraryBenchmarkSample {
+    schema_version: u32,
+    workload: &'static str,
+    initial_render_ms: f64,
+    dialog_to_paint_ms: f64,
+    detail_menu_to_paint_ms: f64,
+    peak_rss_bytes: Option<u64>,
+    correctness: UiVirtualLibraryBenchmarkCorrectness,
+}
+
+#[derive(Serialize)]
+struct UiVirtualLibraryBenchmarkCorrectness {
+    library_total: u64,
+    rendered_books: usize,
+    membership_count: usize,
+    suggestion_count: usize,
+    icon_choices: usize,
     markers: Vec<&'static str>,
 }

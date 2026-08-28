@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-organisation-regression-budget",
+  "workload": {
+    "query_mode": "virtual-libraries",
+    "fixture_version": 2,
+    "virtual_library_fixture_version": 1,
+    "books": 50000,
+    "seed": 20260828,
+    "cover_every": 3,
+    "page_size": 128,
+    "contributors": 20000,
+    "series": 2500,
+    "tags": 500,
+    "tags_per_book": 8,
+    "saved_searches": 250,
+    "virtual_libraries": 2500,
+    "detail_memberships": 20,
+    "autocomplete_limit": 50,
+    "warmup_iterations": 10,
+    "measured_iterations": 40,
+    "scenarios": [
+      "virtual_library_autocomplete",
+      "book_detail_with_virtual_libraries",
+      "virtual_library_membership_toggle",
+      "virtual_library_create_and_assign"
+    ],
+    "correctness": [
+      "bounded_autocomplete",
+      "selected_libraries_first",
+      "derived_book_counts",
+      "complete_book_memberships",
+      "idempotent_membership",
+      "atomic_create_and_assign"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 0.25
+  },
+  "budgets": {
+    "virtual_library_autocomplete": {
+      "max_p95_ms": 20,
+      "max_peak_rss_delta_bytes": 67108864
+    },
+    "book_detail_with_virtual_libraries": {
+      "max_p95_ms": 20,
+      "max_peak_rss_delta_bytes": 67108864
+    },
+    "virtual_library_membership_toggle": {
+      "max_p95_ms": 50,
+      "max_peak_rss_delta_bytes": 67108864
+    },
+    "virtual_library_create_and_assign": {
+      "max_p95_ms": 50,
+      "max_peak_rss_delta_bytes": 67108864
+    }
+  }
+}
