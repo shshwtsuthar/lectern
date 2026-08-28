@@ -2,7 +2,7 @@
 
 #[allow(
     dead_code,
-    reason = "the library GPUI binary and legacy binary use different parts of shared editor state"
+    reason = "shared editor state retains workflow helpers for incremental GPUI interactions"
 )]
 mod curation;
 

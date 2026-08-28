@@ -11,9 +11,7 @@ publish = false
 
 [workspace.dependencies]
 base64 = "0.22.1"
-crossbeam-channel = "0.5.16"
 directories = "6.0.0"
-eframe = "0.36.1"
 flate2 = "1.1.2"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui-base = { git = "https://github.com/longbridge/gpui-component", rev = "ff3eb1128ac1058f1bb88e777744ce1237aa3b79" }

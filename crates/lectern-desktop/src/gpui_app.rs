@@ -1,4 +1,4 @@
-//! Minimal GPUI application used to migrate Lectern's library journey.
+//! Lectern's native GPUI desktop application.
 
 use std::{
     collections::HashSet,
@@ -65,7 +65,7 @@ gpui::actions!(
     ]
 );
 
-/// Runs Lectern's additive GPUI migration executable.
+/// Runs Lectern's native GPUI desktop application.
 ///
 /// # Panics
 ///

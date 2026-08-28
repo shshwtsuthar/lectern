@@ -6,9 +6,10 @@ This directory contains two complementary workflows:
   and diagnostics, full-result and paged queries, normalized curation, and book/asset lifecycle
   operations each week in GitHub Actions, can be dispatched manually, and fails when a release
   latency or resource budget is exceeded.
-- `run.py` is an opt-in exploratory study for large libraries. It exercises the production SQLite
-  query path, EPUB/PDF importer, and native egui cover grid. Its raw JSON is intentionally
-  non-gating because the workload requires a prepared corpus and a graphical desktop session.
+- `run.py` retains the opt-in SQLite query and EPUB/PDF import portions of the historical
+  large-library study. Run it with `--skip-desktop`; its retired egui desktop workload remains
+  documented only for interpreting existing artifacts. Use the deterministic GPUI suites for
+  current desktop measurements.
 
 ## Storage regression suites
 
@@ -185,6 +186,11 @@ than duplicating their commands in workflow YAML. Repository administrators must
 
 ## Exploratory study
 
+The egui desktop workload in this historical study was retired with the old frontend. The workload
+and measurement definitions below remain as provenance for existing artifacts, but no current
+Lectern build produces that interface. `run.py --skip-desktop` continues to run its storage and
+import portions; current UI work uses the versioned GPUI regression suites above.
+
 ## Workloads
 
 - A deterministic 50,000-book SQLite library, with stable metadata and one 320×480 JPEG cover
@@ -207,16 +213,15 @@ It measures a synthetic parser and persistence workload, not 10,000 unique title
 
 ## Prepare and run
 
-The desktop measurements require Linux with `/proc`, an active Wayland or X11 session, and a
-working native graphics backend. The corpus recipe additionally requires `curl`, `qpdf`, and
-`unzip`.
+The retained storage and import measurements require Linux with `/proc`. The corpus recipe
+additionally requires `curl`, `qpdf`, and `unzip`.
 
 From the repository root:
 
 ```bash
 benchmarks/import-corpus-v1/prepare.sh --check-manifest
 benchmarks/import-corpus-v1/prepare.sh
-python3 benchmarks/run.py
+python3 benchmarks/run.py --skip-desktop
 ```
 
 Use `python3 benchmarks/run.py --help` to change library size, repetitions, sort iterations, scroll

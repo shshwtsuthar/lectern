@@ -1,4 +1,4 @@
-//! GPUI migration entry point for Lectern.
+//! Native GPUI entry point for Lectern.
 
 use std::time::Instant;
 

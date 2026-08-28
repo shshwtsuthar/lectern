@@ -38,12 +38,11 @@ single-asset export without adding another parser or deleting externally referen
 rules, sequence, performance evidence, and exclusions are defined in
 [`docs/asset-management-scope.md`](docs/asset-management-scope.md).
 
-The target GPUI interface uses an internal, token-generated Primer design-system layer. It is a
+The desktop interface uses an internal, token-generated Primer design-system layer. It is a
 one-component-at-a-time application architecture rather than a general Primer port; see the
 [Primer-to-GPUI porting guide](docs/porting-primer-to-gpui.md) and
-[ADR 0004](docs/adr/0004-own-a-primer-inspired-gpui-ui-layer.md). The default desktop launch now
-shows the first migrated GPUI empty-library slice. The existing egui/eframe interface remains
-available explicitly as the `lectern` binary while its journeys are ported incrementally.
+[ADR 0004](docs/adr/0004-own-a-primer-inspired-gpui-ui-layer.md). The former egui/eframe frontend is
+retired and no longer has a build target; every desktop launch uses the GPUI interface.
 
 The first broad library-management slice is **Organisation**: normalized contributors and series,
 flat tags, safe multi-selection and bulk tagging, exact filters, fielded search, and saved searches.
@@ -57,7 +56,7 @@ the latest stable toolchain for day-to-day development.
 
 ```sh
 cargo run
-cargo run --release --bin lectern
+cargo run --release
 cargo run -p lectern-ui --example component_gallery
 cargo run -p lectern-cli -- stats
 cargo run -p lectern-cli -- doctor
@@ -108,9 +107,9 @@ docs/
 ```
 
 Shared dependency versions live at the workspace root, while adapter-specific dependencies stay in
-their owning crates. The production desktop uses egui/eframe, the additive migration target uses
-GPUI and `lectern-ui`, storage uses bundled SQLite through rusqlite, EPUB ingestion uses bounded
-ZIP, XML, and image processing, and PDF ingestion uses bounded parsing with a native CPU renderer.
+their owning crates. The production desktop uses GPUI and `lectern-ui`, storage uses bundled SQLite
+through rusqlite, EPUB ingestion uses bounded ZIP, XML, and image processing, and PDF ingestion
+uses bounded parsing with a native CPU renderer.
 
 The storage model keeps logical metadata and cover data separate from format-specific file assets.
 Current file and folder import remains conservative and does not guess that similarly named files
