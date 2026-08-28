@@ -62,7 +62,7 @@ python3 benchmarks/performance_regression.py \
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-migration-regression-v3.json
 python3 benchmarks/performance_regression.py \
-  --budget benchmarks/organisation-query-regression-v2.json
+  --budget benchmarks/organisation-query-regression-v3.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-vocabulary-regression-v2.json
 python3 benchmarks/performance_regression.py \
@@ -118,11 +118,14 @@ populated first paint, book-selection-to-painted-sidebar p95, and peak RSS.
 The normalized organisation v2 fixture replaces the historical duplicate series-number
 distribution with deterministic unique exact numbers at the same 50,000-book, 2,500-series scale.
 Its query suite includes the indexed conflict/self-exclusion check used by the Book number input.
-The version-five-to-current migration suite reaches schema version 9 and measures installation of
-the partial unique index plus the canonical publication-date and half-star-rating detail table;
-unit migration coverage separately supplies deliberate version-seven duplicates, verifies the
-deterministic repair, and covers version-eight metadata defaults. Keeping these detail-only values
-outside the hot `books` rows preserves the compact indexed projection used by grid and search scans.
+The query-only v3 fixture additionally assigns three identifiers per book and covers bounded
+identifier-type lookup plus a complete identifier metadata save/reload through production paths.
+The version-five-to-current migration suite reaches schema version 10 and measures installation of
+the partial unique index, canonical publication-date and half-star-rating detail table, identifier
+tables, and seeded default types. Unit migration coverage separately supplies deliberate
+version-seven duplicates, verifies the deterministic repair, and covers version-eight metadata and
+version-nine identifier defaults. Keeping detail-only publication metadata outside the hot `books`
+rows preserves the compact indexed projection used by grid and search scans.
 
 The export suite is also mandatory for changes to copy buffers, publication, overwrite behavior,
 export scheduling, or export progress. Import, startup, scrolling, rendering, or memory changes

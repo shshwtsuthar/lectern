@@ -18,9 +18,9 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 use lectern_core::organisation::{
     BookEdit, BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, ContributorId,
-    ContributorUsage, LibraryGeneration, NameKind, SavedSearch, SavedSearchId, SearchClause,
-    SearchExpression, SearchParseError, SelectionSnapshot, SelectionTagUsage, SeriesId,
-    SeriesIndex, SeriesUsage, TagColor, TagId, TagReference, TagUsage, TextMatch,
+    ContributorUsage, IdentifierTypeUsage, LibraryGeneration, NameKind, SavedSearch, SavedSearchId,
+    SearchClause, SearchExpression, SearchParseError, SelectionSnapshot, SelectionTagUsage,
+    SeriesId, SeriesIndex, SeriesUsage, TagColor, TagId, TagReference, TagUsage, TextMatch,
     VocabularyMutationResult, identity_key, normalize_name,
 };
 use lectern_core::{
@@ -38,7 +38,7 @@ use thiserror::Error;
 #[cfg(not(any(unix, windows)))]
 compile_error!("Lectern's lossless path codec currently supports Unix and Windows targets");
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const BACKUP_PAGES_PER_STEP: i32 = 2_048;
 static NEXT_BACKUP_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1074,6 +1074,7 @@ impl LibraryDatabase {
                     contributors: Vec::new(),
                     series_membership: None,
                     tags: Vec::new(),
+                    identifiers: Vec::new(),
                     publisher: row.get(4)?,
                     publication_date,
                     language: row.get(6)?,
@@ -1104,11 +1105,12 @@ impl LibraryDatabase {
         }
 
         if let Some(book) = &mut book {
-            let (contributors, series, tags) =
+            let (contributors, series, tags, identifiers) =
                 organisation::load_book_curation(&self.connection, book.id)?;
             book.contributors = contributors;
             book.series_membership = series;
             book.tags = tags;
+            book.identifiers = identifiers;
         }
 
         Ok(book)
@@ -1230,6 +1232,22 @@ impl LibraryDatabase {
         limit: u32,
     ) -> Result<Vec<TagUsage>> {
         organisation::autocomplete_tags(&self.connection, prefix, selected, limit)
+    }
+
+    /// Returns at most fifty identifier-type identity-prefix matches.
+    ///
+    /// Stored defaults remain available even before any book uses them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prefix violates the identifier-type input bound or the indexed
+    /// vocabulary query fails.
+    pub fn autocomplete_identifier_types(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<IdentifierTypeUsage>> {
+        organisation::autocomplete_identifier_types(&self.connection, prefix, limit)
     }
 
     /// Returns at most one hundred normalized-name contributor rows for vocabulary management.
@@ -2279,7 +2297,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
     let observed = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match observed {
         SCHEMA_VERSION => return Ok(()),
-        0..=8 => {}
+        0..=9 => {}
         unsupported => return Err(StorageError::UnsupportedSchema(unsupported)),
     }
 
@@ -2308,6 +2326,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         1 | 2 => {
@@ -2318,6 +2337,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         3 => {
@@ -2327,6 +2347,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         4 => {
@@ -2335,6 +2356,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         5 => {
@@ -2342,21 +2364,29 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         6 => {
             organisation::migrate_v6_to_v7(&transaction)?;
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         7 => {
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         8 => {
             transaction.execute_batch(MIGRATE_8_TO_9)?;
+            organisation::migrate_v9_to_v10(&transaction)?;
+            true
+        }
+        9 => {
+            organisation::migrate_v9_to_v10(&transaction)?;
             true
         }
         SCHEMA_VERSION => false,
@@ -3291,17 +3321,18 @@ mod tests {
         AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAssetDraft, BookFormat,
         BookId, BookMetadataDraft, BookRating, LibraryQuery, ReimportMetadataPolicy, SortOrder,
         organisation::{
-            BookEdit, BookSelection, BulkTagEdit, ContributorCreditEdit, ContributorFacet,
-            ContributorReference, ContributorRole, ExactFacets, ImportedContributorCredit,
-            ImportedOrganisation, SavedSearchId, SearchExpression, SeriesIndex,
-            SeriesMembershipEdit, SeriesReference, TagId, TagReference, VocabularyMutationResult,
+            BookEdit, BookIdentifierEdit, BookSelection, BulkTagEdit, ContributorCreditEdit,
+            ContributorFacet, ContributorReference, ContributorRole, ExactFacets,
+            IdentifierTypeReference, ImportedContributorCredit, ImportedOrganisation,
+            SavedSearchId, SearchExpression, SeriesIndex, SeriesMembershipEdit, SeriesReference,
+            TagId, TagReference, VocabularyMutationResult,
         },
     };
     use rusqlite::{Connection, params};
 
     use super::{
         BookImport, ImportRecord, LibraryDatabase, SCHEMA, SCHEMA_VERSION, StorageError,
-        configure_persistent_database, decode_path,
+        configure_persistent_database, decode_path, initialize_schema_transaction,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -3965,6 +3996,54 @@ END;
                     .expect("run foreign-key check")
             );
         }
+    }
+
+    #[test]
+    fn migrates_version_nine_with_stored_default_identifier_types() {
+        let mut connection = Connection::open_in_memory().expect("open database");
+        connection.execute_batch(SCHEMA).expect("create v5 schema");
+        {
+            let transaction = connection.transaction().expect("begin v8 fixture");
+            super::organisation::migrate_v5_to_v6(&transaction).expect("migrate to v6");
+            super::organisation::migrate_v6_to_v7(&transaction).expect("migrate to v7");
+            super::organisation::migrate_v7_to_v8(&transaction).expect("migrate to v8");
+            transaction
+                .execute_batch(super::MIGRATE_8_TO_9)
+                .expect("migrate to v9");
+            transaction
+                .pragma_update(None, "user_version", 9)
+                .expect("mark v9 fixture");
+            transaction.commit().expect("commit v9 fixture");
+        }
+
+        initialize_schema_transaction(&mut connection).expect("migrate identifier schema");
+
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM identifier_types", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            10
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT group_concat(name, '|') FROM ( \
+                         SELECT name FROM identifier_types ORDER BY id \
+                     )",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "ISBN|ASIN|DOI|Google Books|Goodreads|Open Library|OCLC|LCCN|ISSN|arXiv"
+        );
     }
 
     #[test]
@@ -5073,6 +5152,7 @@ END;
                 TagReference::New("Science Fiction".into()),
                 TagReference::New(" Fantasy ".into()),
             ],
+            identifiers: Vec::new(),
         }
     }
 
@@ -5165,6 +5245,91 @@ END;
                 .map(|index| index.to_string())
                 .as_deref(),
             Some("1.25")
+        );
+    }
+
+    #[test]
+    fn identifiers_store_default_and_custom_types_with_multiple_values() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let defaults = database
+            .autocomplete_identifier_types("", 50)
+            .expect("load default identifier types");
+        assert_eq!(defaults.len(), 10);
+        assert!(
+            defaults
+                .iter()
+                .any(|usage| usage.identifier_type.name == "ISBN")
+        );
+
+        let id = database
+            .import_books(&[record("/books/identifiers.epub", "Identifiers", "Author")])
+            .expect("import book")[0];
+        let mut edit = earthsea_edit(id);
+        edit.identifiers = vec![
+            BookIdentifierEdit {
+                identifier_type: IdentifierTypeReference::New(" ISBN ".into()),
+                value: " 978-0-1234-5678-9 ".into(),
+            },
+            BookIdentifierEdit {
+                identifier_type: IdentifierTypeReference::New("Library Source".into()),
+                value: "Record-42".into(),
+            },
+        ];
+        database.save_book_edit(&edit).expect("save identifiers");
+
+        let stored = database.get_book(id).unwrap().unwrap();
+        assert_eq!(stored.identifiers.len(), 2);
+        let isbn = stored
+            .identifiers
+            .iter()
+            .find(|identifier| identifier.identifier_type.name == "ISBN")
+            .expect("stored ISBN");
+        assert_eq!(isbn.value, "978-0-1234-5678-9");
+        let isbn_type = isbn.identifier_type.id;
+
+        edit.identifiers.push(BookIdentifierEdit {
+            identifier_type: IdentifierTypeReference::Existing(isbn_type),
+            value: "978-0-9876-5432-1".into(),
+        });
+        database.save_book_edit(&edit).expect("save a second ISBN");
+        let stored = database.get_book(id).unwrap().unwrap();
+        assert_eq!(
+            stored
+                .identifiers
+                .iter()
+                .filter(|identifier| identifier.identifier_type.id == isbn_type)
+                .count(),
+            2
+        );
+        let suggestions = database
+            .autocomplete_identifier_types("isbn", 50)
+            .expect("autocomplete ISBN");
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].identifier_type.id, isbn_type);
+        assert_eq!(suggestions[0].identifiers, 2);
+    }
+
+    #[test]
+    fn invalid_identifier_rolls_back_its_new_type() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let id = database
+            .import_books(&[record("/books/invalid-identifier.epub", "Book", "Author")])
+            .expect("import book")[0];
+        let mut edit = earthsea_edit(id);
+        edit.identifiers = vec![BookIdentifierEdit {
+            identifier_type: IdentifierTypeReference::New("Should Roll Back".into()),
+            value: " \n ".into(),
+        }];
+
+        assert!(matches!(
+            database.save_book_edit(&edit),
+            Err(StorageError::InvalidCuration(message)) if message.contains("identifier value")
+        ));
+        assert!(
+            database
+                .autocomplete_identifier_types("Should", 50)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -5264,6 +5429,7 @@ END;
             ],
             series: None,
             tags: vec![TagReference::New("Should Not Persist".into())],
+            identifiers: Vec::new(),
         };
 
         assert!(matches!(
@@ -5325,6 +5491,7 @@ END;
                     TagReference::New("Alpha Tag".into()),
                     TagReference::New("Alpine".into()),
                 ],
+                identifiers: Vec::new(),
             })
             .expect("save curation");
         let book = database.get_book(id).unwrap().unwrap();
@@ -5815,6 +5982,7 @@ END;
                     TagReference::New("Source Tag".into()),
                     TagReference::New("Target Tag".into()),
                 ],
+                identifiers: Vec::new(),
             })
             .unwrap();
         let seeded_first = database.get_book(first).unwrap().unwrap();
@@ -5871,6 +6039,7 @@ END;
                     index: Some("2".parse().unwrap()),
                 }),
                 tags: vec![TagReference::Existing(source_tag)],
+                identifiers: Vec::new(),
             })
             .unwrap();
         let target_series = {
@@ -6358,6 +6527,7 @@ END;
             contributors: Vec::new(),
             series_membership: None,
             tags: Vec::new(),
+            identifiers: Vec::new(),
             publisher: None,
             publication_date: None,
             language: None,

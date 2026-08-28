@@ -10,7 +10,11 @@ use std::{
 
 use lectern_core::{
     BookFormat, BookId, LibraryQuery, SortOrder,
-    organisation::{ContributorFacet, ContributorId, ExactFacets, SeriesId, SeriesIndex, TagId},
+    organisation::{
+        BookEdit, BookIdentifierEdit, ContributorCreditEdit, ContributorFacet, ContributorId,
+        ContributorReference, ExactFacets, IdentifierTypeReference, SeriesId, SeriesIndex,
+        SeriesMembershipEdit, SeriesReference, TagId, TagReference,
+    },
 };
 use lectern_storage::LibraryDatabase;
 use rusqlite::{Connection, TransactionBehavior, params};
@@ -24,6 +28,7 @@ Options:
   --books N          Logical books in the fixture (default: 50000)
   --seed N           Deterministic fixture seed (default: 20260825)
   --cover-every N    Give every Nth book a cover; zero disables covers (default: 3)
+  --fixture-version N Normalized fixture version, 2 or 3 (default: 2)
   --iterations N     Measured iterations per scenario (default: 40)
   --warmup N         Warmup iterations per scenario (default: 10)
 ";
@@ -35,6 +40,7 @@ const TAGS_PER_BOOK: u64 = 8;
 const SAVED_SEARCHES: u64 = 250;
 const PAGE_SIZE: u32 = 128;
 const AUTOCOMPLETE_LIMIT: u32 = 50;
+const IDENTIFIERS_PER_BOOK: u64 = 3;
 
 #[derive(Clone, Debug)]
 struct Options {
@@ -43,6 +49,7 @@ struct Options {
     books: u64,
     seed: u64,
     cover_every: u64,
+    fixture_version: u32,
     iterations: usize,
     warmup: usize,
 }
@@ -63,6 +70,7 @@ impl Options {
             books: 50_000,
             seed: 20_260_825,
             cover_every: 3,
+            fixture_version: 2,
             iterations: 40,
             warmup: 10,
         };
@@ -79,6 +87,7 @@ impl Options {
                 "--books" => options.books = parse_number(&name, value)?,
                 "--seed" => options.seed = parse_number(&name, value)?,
                 "--cover-every" => options.cover_every = parse_number(&name, value)?,
+                "--fixture-version" => options.fixture_version = parse_number(&name, value)?,
                 "--iterations" => options.iterations = parse_number(&name, value)?,
                 "--warmup" => options.warmup = parse_number(&name, value)?,
                 _ => return Err(format!("unknown option {name:?}")),
@@ -95,6 +104,9 @@ impl Options {
         }
         if options.books == 0 || options.iterations == 0 {
             return Err("--books and --iterations must be greater than zero".into());
+        }
+        if !matches!(options.fixture_version, 2 | 3) {
+            return Err("--fixture-version must be 2 or 3".into());
         }
         Ok((command, options))
     }
@@ -139,6 +151,7 @@ struct SeedResult {
     series: u64,
     tags: u64,
     tags_per_book: u64,
+    identifiers_per_book: u64,
     saved_searches: u64,
     seed: u64,
     database_bytes: u64,
@@ -245,6 +258,15 @@ fn seed(options: &Options) -> Result<(), String> {
     let mut insert_cover = transaction
         .prepare("INSERT INTO book_covers(book_id, jpeg) VALUES (?1, ?2)")
         .map_err(display_error)?;
+    let mut insert_identifier = (options.fixture_version >= 3)
+        .then(|| {
+            transaction.prepare(
+                "INSERT INTO book_identifiers(book_id, identifier_type_id, value) \
+                 VALUES (?1, ?2, ?3)",
+            )
+        })
+        .transpose()
+        .map_err(display_error)?;
     let cover = representative_cover();
 
     for offset in 0..options.books {
@@ -344,6 +366,17 @@ fn seed(options: &Options) -> Result<(), String> {
                 .execute(params![id_i64, cover])
                 .map_err(display_error)?;
         }
+        if let Some(insert_identifier) = &mut insert_identifier {
+            for (identifier_type, value) in [
+                (1_i64, format!("978-0-{id:010}")),
+                (1_i64, format!("978-1-{id:010}")),
+                (3_i64, format!("10.0000/lectern.{id}")),
+            ] {
+                insert_identifier
+                    .execute(params![id_i64, identifier_type, value])
+                    .map_err(display_error)?;
+            }
+        }
     }
 
     {
@@ -365,6 +398,7 @@ fn seed(options: &Options) -> Result<(), String> {
                 .map_err(display_error)?;
         }
     }
+    drop(insert_identifier);
     drop(insert_cover);
     drop(insert_tag);
     drop(insert_membership);
@@ -379,7 +413,7 @@ fn seed(options: &Options) -> Result<(), String> {
 
     let result = SeedResult {
         schema_version: 1,
-        fixture_version: 2,
+        fixture_version: options.fixture_version,
         kind: "organisation-query-seed",
         database_path: options.database.display().to_string(),
         library_books: options.books,
@@ -387,6 +421,11 @@ fn seed(options: &Options) -> Result<(), String> {
         series: SERIES.min(options.books),
         tags: TAGS.min(options.books),
         tags_per_book: TAGS_PER_BOOK.min(options.books),
+        identifiers_per_book: if options.fixture_version >= 3 {
+            IDENTIFIERS_PER_BOOK
+        } else {
+            0
+        },
         saved_searches: SAVED_SEARCHES,
         seed: options.seed,
         database_bytes: fs::metadata(&options.database)
@@ -412,10 +451,11 @@ enum Scenario {
     DeepPage,
     Autocomplete,
     SeriesIndexAvailability,
+    IdentifierMetadataRoundTrip,
 }
 
 impl Scenario {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Contributor,
         Self::Series,
         Self::IncludedTags,
@@ -424,6 +464,7 @@ impl Scenario {
         Self::DeepPage,
         Self::Autocomplete,
         Self::SeriesIndexAvailability,
+        Self::IdentifierMetadataRoundTrip,
     ];
 
     const fn name(self) -> &'static str {
@@ -436,6 +477,7 @@ impl Scenario {
             Self::DeepPage => "deep_bounded_page_without_count",
             Self::Autocomplete => "bounded_vocabulary_autocomplete",
             Self::SeriesIndexAvailability => "series_index_availability",
+            Self::IdentifierMetadataRoundTrip => "identifier_metadata_round_trip",
         }
     }
 }
@@ -550,6 +592,7 @@ fn run_queries(options: &Options) -> Result<(), String> {
             "covering_query_plans",
             "bounded_autocomplete",
             "series_index_availability",
+            "identifier_metadata_round_trip",
         ],
         query_plans,
         scenarios,
@@ -658,6 +701,7 @@ fn run_scenario(
             .map_err(display_error),
         Scenario::Autocomplete => run_autocomplete(database),
         Scenario::SeriesIndexAvailability => run_series_index_availability(database, seed, books),
+        Scenario::IdentifierMetadataRoundTrip => run_identifier_metadata_round_trip(database),
     }
 }
 
@@ -681,6 +725,9 @@ fn run_autocomplete(database: &LibraryDatabase) -> Result<Observation, String> {
     let tags = database
         .autocomplete_tags("tag 0", &[TagId::new(1)], 50)
         .map_err(display_error)?;
+    let identifier_types = database
+        .autocomplete_identifier_types("is", 50)
+        .map_err(display_error)?;
     let mut ids = contributors
         .into_iter()
         .map(|entry| entry.contributor.id.value())
@@ -689,6 +736,11 @@ fn run_autocomplete(database: &LibraryDatabase) -> Result<Observation, String> {
     ids.extend(
         tags.into_iter()
             .map(|entry| -100_000 - entry.tag.id.value()),
+    );
+    ids.extend(
+        identifier_types
+            .into_iter()
+            .map(|entry| -200_000 - entry.identifier_type.id.value()),
     );
     Ok(Observation { ids, total: None })
 }
@@ -717,6 +769,71 @@ fn run_series_index_availability(
     })
 }
 
+fn run_identifier_metadata_round_trip(
+    database: &mut LibraryDatabase,
+) -> Result<Observation, String> {
+    let book = database
+        .get_book(BookId::new(1))
+        .map_err(display_error)?
+        .ok_or_else(|| "identifier fixture book is missing".to_owned())?;
+    if book.identifiers.len() != usize::try_from(IDENTIFIERS_PER_BOOK).unwrap_or(3) {
+        return Err("identifier fixture did not load every assignment".into());
+    }
+    let edit = BookEdit {
+        id: book.id,
+        title: book.title.clone(),
+        publisher: book.publisher.clone(),
+        publication_date: book.publication_date,
+        language: book.language.clone(),
+        description: book.description.clone(),
+        rating: book.rating,
+        contributors: book
+            .contributors
+            .iter()
+            .map(|credit| ContributorCreditEdit {
+                contributor: ContributorReference::Existing(credit.contributor.id),
+                role: credit.role,
+                position: credit.position,
+            })
+            .collect(),
+        series: book
+            .series_membership
+            .as_ref()
+            .map(|membership| SeriesMembershipEdit {
+                series: SeriesReference::Existing(membership.series.id),
+                index: membership.index,
+            }),
+        tags: book
+            .tags
+            .iter()
+            .map(|tag| TagReference::Existing(tag.id))
+            .collect(),
+        identifiers: book
+            .identifiers
+            .iter()
+            .map(|identifier| BookIdentifierEdit {
+                identifier_type: IdentifierTypeReference::Existing(identifier.identifier_type.id),
+                value: identifier.value.clone(),
+            })
+            .collect(),
+    };
+    database.save_book_edit(&edit).map_err(display_error)?;
+    let stored = database
+        .get_book(book.id)
+        .map_err(display_error)?
+        .ok_or_else(|| "saved identifier fixture book disappeared".to_owned())?;
+    if stored.identifiers != book.identifiers {
+        return Err("identifier metadata did not round-trip exactly".into());
+    }
+    Ok(Observation {
+        ids: vec![
+            book.id.value(),
+            i64::try_from(stored.identifiers.len()).map_err(display_error)?,
+        ],
+        total: None,
+    })
+}
+
 fn validate_observation(
     scenario: Scenario,
     observation: &Observation,
@@ -735,7 +852,7 @@ fn validate_observation(
             }
         }
         Scenario::Autocomplete => {
-            if observation.ids.len() > 3 * usize::try_from(AUTOCOMPLETE_LIMIT).unwrap_or(50)
+            if observation.ids.len() > 4 * usize::try_from(AUTOCOMPLETE_LIMIT).unwrap_or(50)
                 || observation.ids.first() != Some(&1)
             {
                 return Err("autocomplete was unbounded or did not put selection first".into());
@@ -744,6 +861,11 @@ fn validate_observation(
         Scenario::SeriesIndexAvailability => {
             if observation.ids.len() != 2 || observation.total.is_some() {
                 return Err("series index availability did not reconcile".into());
+            }
+        }
+        Scenario::IdentifierMetadataRoundTrip => {
+            if observation.ids.len() != 2 || observation.total.is_some() {
+                return Err("identifier metadata round trip did not reconcile".into());
             }
         }
         _ => {
@@ -781,6 +903,11 @@ fn collect_query_plans(connection: &Connection) -> Result<Vec<QueryPlan>, String
             "book_tags_tag_book_idx",
             "SELECT book_id FROM book_tags WHERE tag_id = 1",
         ),
+        (
+            "identifier_type_lookup",
+            "book_identifiers_type_book_idx",
+            "SELECT book_id FROM book_identifiers WHERE identifier_type_id = 1",
+        ),
     ];
     specifications
         .into_iter()
@@ -817,6 +944,7 @@ fn validate_seed(path: &Path, books: u64) -> Result<(), String> {
         ("series_entities", SERIES.min(books)),
         ("tags", TAGS.min(books)),
         ("book_tags", books * TAGS_PER_BOOK.min(books)),
+        ("book_identifiers", books * IDENTIFIERS_PER_BOOK),
         ("saved_searches", SAVED_SEARCHES),
     ] {
         let count: i64 = connection

@@ -390,6 +390,7 @@ struct MigrationResult {
     initial_tags_and_saved_searches_empty: bool,
     schema_invariants_valid: bool,
     canonical_metadata_defaults_valid: bool,
+    default_identifier_types_valid: bool,
     duplicate_series_numbers_repaired: bool,
     failed_migration_rolled_back: bool,
     scenarios: Vec<MigrationScenario>,
@@ -475,7 +476,7 @@ fn run_migration(options: &Options) -> Result<(), String> {
             .as_millis(),
         database_path: options.database.display().to_string(),
         source_schema_version: 5,
-        final_schema_version: 9,
+        final_schema_version: 10,
         library_books: options.books,
         warmup_iterations: options.warmup,
         measured_iterations: options.iterations,
@@ -485,6 +486,7 @@ fn run_migration(options: &Options) -> Result<(), String> {
         initial_tags_and_saved_searches_empty: true,
         schema_invariants_valid: true,
         canonical_metadata_defaults_valid: true,
+        default_identifier_types_valid: true,
         duplicate_series_numbers_repaired: true,
         failed_migration_rolled_back: rollback_valid,
         scenarios: vec![
@@ -526,6 +528,8 @@ fn prepare_version_seven_template(
              UPDATE series_memberships SET series_index = 1000000; \
              UPDATE books SET series_index = 1000000 WHERE series IS NOT NULL; \
              DROP TABLE book_metadata; \
+             DROP TABLE book_identifiers; \
+             DROP TABLE identifier_types; \
              PRAGMA user_version = 7;",
         )
         .map_err(display_error)?;
@@ -553,19 +557,19 @@ fn validate_version_seven_template(path: &Path, options: &Options) -> Result<(),
             "series-repair source schema is {version}, expected 7"
         ));
     }
-    let future_metadata_tables: i64 = connection
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema \
-             WHERE type = 'table' AND name = 'book_metadata'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(display_error)?;
-    if future_metadata_tables != 0 {
-        return Err(
-            "version-seven repair fixture contains publication metadata from schema version nine"
-                .into(),
-        );
+    for table in ["book_metadata", "identifier_types", "book_identifiers"] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(display_error)?;
+        if exists {
+            return Err(format!(
+                "version-seven repair fixture contains future table {table}"
+            ));
+        }
     }
     expect_count(&connection, "books", options.books)?;
     let duplicates: bool = connection
@@ -646,6 +650,10 @@ fn validate_source_template(path: &Path, books: u64) -> Result<(), String> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one post-migration audit checks every required schema and data invariant"
+)]
 fn validate_migrated_candidate(path: &Path, options: &Options) -> Result<(), String> {
     let connection = Connection::open(path).map_err(display_error)?;
     connection
@@ -654,8 +662,8 @@ fn validate_migrated_candidate(path: &Path, options: &Options) -> Result<(), Str
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(display_error)?;
-    if version != 9 {
-        return Err(format!("candidate schema is {version}, expected 9"));
+    if version != 10 {
+        return Err(format!("candidate schema is {version}, expected 10"));
     }
     expect_count(&connection, "books", options.books)?;
     expect_count(&connection, "book_assets", options.books)?;
@@ -679,6 +687,22 @@ fn validate_migrated_candidate(path: &Path, options: &Options) -> Result<(), Str
     if invalid_metadata_defaults != 0 {
         return Err(format!(
             "migration left {invalid_metadata_defaults} books with non-default canonical metadata"
+        ));
+    }
+    expect_count(&connection, "identifier_types", 10)?;
+    expect_count(&connection, "book_identifiers", 0)?;
+    let defaults: String = connection
+        .query_row(
+            "SELECT group_concat(name, '|') FROM ( \
+                 SELECT name FROM identifier_types ORDER BY id \
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(display_error)?;
+    if defaults != "ISBN|ASIN|DOI|Google Books|Goodreads|Open Library|OCLC|LCCN|ISSN|arXiv" {
+        return Err(format!(
+            "migration stored an invalid identifier vocabulary: {defaults}"
         ));
     }
     expect_count(

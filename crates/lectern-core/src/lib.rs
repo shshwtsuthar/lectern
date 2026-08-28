@@ -676,6 +676,8 @@ pub struct Book {
     pub series_membership: Option<organisation::SeriesMembership>,
     /// Authoritative normalized tags in display-name order.
     pub tags: Vec<organisation::Tag>,
+    /// Authoritative book identifiers in type-and-value display order.
+    pub identifiers: Vec<organisation::BookIdentifier>,
     /// Optional publisher.
     pub publisher: Option<String>,
     /// Optional calendar publication date.
@@ -871,6 +873,13 @@ pub trait LibraryService {
         selected: &[organisation::TagId],
         limit: u32,
     ) -> Result<Vec<organisation::TagUsage>, Self::Error>;
+
+    /// Returns bounded identifier-type suggestions, including stored defaults.
+    fn autocomplete_identifier_types(
+        &mut self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<organisation::IdentifierTypeUsage>, Self::Error>;
 
     /// Returns one bounded contributor vocabulary page with global usage counts.
     fn search_contributors(

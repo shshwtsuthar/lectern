@@ -4485,6 +4485,7 @@ fn benchmark_book_detail() -> Book {
                 color: TagColor::Azure,
             },
         ],
+        identifiers: Vec::new(),
         publisher: Some("Lectern Press".to_owned()),
         publication_date: Some("2026-08-27".parse().expect("valid benchmark date")),
         language: Some("en".to_owned()),

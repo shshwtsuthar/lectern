@@ -374,7 +374,7 @@ later changes also use the repository's paired 10%/material-delta regression rul
 
 ### Normalized query workload
 
-Add `organisation-query-regression-v2.json` over 50,000 books with deterministic distributions of
+Add `organisation-query-regression-v3.json` over 50,000 books with deterministic distributions of
 20,000 contributors, 2,500 series, 500 tags, eight tags per book, one to four contributor credits
 per book, 70% series membership, existing mixed assets/covers, and 250 saved searches. Retain 10
 warmups and 40 measured samples for:
