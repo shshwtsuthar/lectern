@@ -6,8 +6,8 @@ use lectern_core::{
     Book, BookRating, PublicationDate,
     organisation::{
         BookEdit, ContributorCreditEdit, ContributorId, ContributorReference, ContributorRole,
-        NameKind, SeriesId, SeriesIndex, SeriesMembershipEdit, SeriesReference, TagColor, TagId,
-        TagReference, identity_key, normalize_name,
+        Genre, NameKind, SeriesId, SeriesIndex, SeriesMembershipEdit, SeriesReference, TagColor,
+        TagId, TagReference, identity_key, normalize_name,
     },
 };
 
@@ -115,6 +115,7 @@ pub(crate) struct BookCurationDraft {
     pub(crate) contributors: Vec<ContributorDraft>,
     pub(crate) series: SeriesDraft,
     pub(crate) tags: Vec<TagDraft>,
+    pub(crate) genres: Vec<Genre>,
     next_row_id: u64,
 }
 
@@ -159,6 +160,7 @@ impl BookCurationDraft {
             contributors,
             series,
             tags,
+            genres: book.genres.clone(),
         }
     }
 
@@ -211,6 +213,17 @@ impl BookCurationDraft {
             color,
         });
         Ok(true)
+    }
+
+    pub(crate) fn toggle_genre(&mut self, genre: Genre) -> bool {
+        if let Some(index) = self.genres.iter().position(|selected| *selected == genre) {
+            self.genres.remove(index);
+            true
+        } else {
+            self.genres.push(genre);
+            self.genres.sort_unstable();
+            true
+        }
     }
 
     #[allow(dead_code, reason = "used by the GPUI frontend during its migration")]
@@ -314,6 +327,7 @@ impl BookCurationDraft {
             contributors,
             series,
             tags,
+            genres: self.genres.clone(),
         })
     }
 
@@ -365,8 +379,8 @@ mod tests {
     use lectern_core::{
         AssetHealth, AssetId, AssetStorage, BookAsset, BookFormat, BookId, BookRating,
         organisation::{
-            Contributor, ContributorCredit, ContributorId, ContributorRole, Series, SeriesId,
-            SeriesIndex, SeriesMembership, Tag, TagColor, TagId,
+            Contributor, ContributorCredit, ContributorId, ContributorRole, Genre, Series,
+            SeriesId, SeriesIndex, SeriesMembership, Tag, TagColor, TagId,
         },
     };
 
@@ -399,6 +413,7 @@ mod tests {
                 name: "Fantasy".into(),
                 color: TagColor::Slate,
             }],
+            genres: vec![Genre::Fantasy],
             virtual_libraries: Vec::new(),
             publisher: Some("Parnassus".into()),
             publication_date: Some("1968-09".parse().unwrap()),
@@ -435,6 +450,7 @@ mod tests {
         assert_eq!(edit.contributors[0].position, 0);
         assert_eq!(edit.series.unwrap().index.unwrap().to_string(), "1.5");
         assert_eq!(edit.tags.len(), 1);
+        assert_eq!(edit.genres, [Genre::Fantasy]);
         assert_eq!(edit.description, None);
         assert_eq!(edit.publication_date.unwrap().to_string(), "1968-09");
         assert_eq!(edit.rating.half_stars(), 9);
@@ -510,5 +526,14 @@ mod tests {
         );
         assert_eq!(draft.tags[1].name, "Science Fiction");
         assert_eq!(draft.tags[1].color, TagColor::Azure);
+    }
+
+    #[test]
+    fn genres_toggle_only_fixed_catalog_values() {
+        let mut draft = BookCurationDraft::from_book(&book());
+        assert!(draft.toggle_genre(Genre::ScienceFiction));
+        assert_eq!(draft.genres, [Genre::Fantasy, Genre::ScienceFiction]);
+        assert!(draft.toggle_genre(Genre::Fantasy));
+        assert_eq!(draft.genres, [Genre::ScienceFiction]);
     }
 }

@@ -676,6 +676,8 @@ pub struct Book {
     pub series_membership: Option<organisation::SeriesMembership>,
     /// Authoritative normalized tags in display-name order.
     pub tags: Vec<organisation::Tag>,
+    /// Fixed genres assigned to this canonical book, in catalog order.
+    pub genres: Vec<organisation::Genre>,
     /// Virtual libraries containing this canonical book, in display-name order.
     pub virtual_libraries: Vec<organisation::VirtualLibrary>,
     /// Optional publisher.

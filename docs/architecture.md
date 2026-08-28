@@ -84,6 +84,12 @@ join from `(format, book_id)` so multi-format books still produce one grid row. 
 adapters may supply several assets in one atomic record; ordinary file discovery never guesses
 cross-format identity.
 
+Genres are a closed core-domain enum and not a mutable vocabulary. Each canonical book can own
+multiple `book_genres` relationships, but the schema constraint and typed metadata-edit payload both
+reject values outside Lectern's built-in catalog. Tags and series remain normalized user-owned
+vocabularies with creation paths; genre choices are filtered locally in the desktop picker and have
+no creation API.
+
 Persistent connections request WAL and use full synchronization. If SQLite cannot activate WAL for
 a filesystem, full synchronization remains in effect for the returned rollback journal mode. Schema
 creation and upgrades acquire an immediate transaction, validate relational and FTS integrity, and

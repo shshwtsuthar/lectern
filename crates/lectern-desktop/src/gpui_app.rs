@@ -30,7 +30,7 @@ use lectern_core::{
     BookSummary, ImportSummary, LibraryQuery, LibraryService,
     organisation::{
         BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, Contributor,
-        ContributorCredit, ContributorId, ContributorRole, LibraryGeneration, NameKind,
+        ContributorCredit, ContributorId, ContributorRole, Genre, LibraryGeneration, NameKind,
         SelectionSnapshot, SelectionTagUsage, Series, SeriesId, SeriesIndex, SeriesMembership,
         SeriesUsage, Tag, TagColor, TagId, TagReference, TagUsage, VirtualLibrary,
         VirtualLibraryIcon, VirtualLibraryId, identity_key, normalize_name,
@@ -205,6 +205,7 @@ pub fn run(main_entry: Instant) {
         let workload = match env::var(BENCHMARK_WORKLOAD_ENV).as_deref() {
             Ok("library-selection") => BenchmarkWorkload::LibrarySelection,
             Ok("book-detail") => BenchmarkWorkload::BookDetail,
+            Ok("genres") => BenchmarkWorkload::Genres,
             Ok("virtual-library") => BenchmarkWorkload::VirtualLibrary,
             Ok("bulk-tags") => BenchmarkWorkload::BulkTags,
             Ok("kobo-device") => BenchmarkWorkload::KoboDevice,
@@ -220,6 +221,7 @@ pub fn run(main_entry: Instant) {
             action_started: None,
             selection_painted: None,
             detail_painted: None,
+            genre_picker_painted: None,
             virtual_library_dialog_painted: None,
             virtual_library_menu_painted: None,
             bulk_tag_config: (workload == BenchmarkWorkload::BulkTags)
@@ -429,6 +431,7 @@ struct BookDetailEditor {
     tag_suggestions: Vec<TagUsage>,
     tag_suggestion_generation: u64,
     tag_suggestions_loading: bool,
+    genre_menu_open: bool,
     virtual_library_input: Option<Entity<InputState>>,
     virtual_library_menu_open: bool,
     virtual_library_suggestions: Vec<VirtualLibrary>,
@@ -460,6 +463,7 @@ enum DetailErrorSection {
     Series,
     Contributors,
     Tags,
+    Genres,
     VirtualLibraries,
     Library,
 }
@@ -521,6 +525,7 @@ impl BookDetailEditor {
             tag_suggestions: Vec::new(),
             tag_suggestion_generation: 0,
             tag_suggestions_loading: false,
+            genre_menu_open: false,
             virtual_library_input: None,
             virtual_library_menu_open: false,
             virtual_library_suggestions: Vec::new(),
@@ -856,6 +861,7 @@ impl LecternView {
                 benchmark.workload,
                 BenchmarkWorkload::LibrarySelection
                     | BenchmarkWorkload::BookDetail
+                    | BenchmarkWorkload::Genres
                     | BenchmarkWorkload::VirtualLibrary
             )
         });
@@ -910,6 +916,7 @@ impl LecternView {
                     self.start_benchmark_selection(window, cx);
                 }
                 BenchmarkWorkload::BookDetail => self.start_benchmark_book_detail(window, cx),
+                BenchmarkWorkload::Genres => self.start_benchmark_genres(window, cx),
                 BenchmarkWorkload::VirtualLibrary => {
                     self.start_benchmark_virtual_library(window, cx);
                 }
@@ -1297,6 +1304,56 @@ impl LecternView {
             .action_started = Some(Instant::now());
         self.open_virtual_library_dialog(String::new(), None, window, cx);
         cx.on_next_frame(window, Self::benchmark_virtual_library_dialog_presented);
+    }
+
+    fn start_benchmark_genres(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = BookDetailEditor::new(benchmark_book_detail(), window, cx);
+        editor
+            .list_state
+            .scroll_to_reveal_item(detail_genres_item_index(editor.contributors.len()));
+        self.detail_editor = Some(editor);
+        cx.notify();
+        cx.on_next_frame(window, Self::benchmark_genres_detail_presented);
+    }
+
+    fn benchmark_genres_detail_presented(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.detail_editor
+            .as_mut()
+            .expect("genre benchmark has a detail editor")
+            .genre_menu_open = true;
+        self.benchmark
+            .as_mut()
+            .expect("genre benchmark state is present")
+            .action_started = Some(Instant::now());
+        cx.notify();
+        cx.on_next_frame(window, Self::benchmark_genres_presented);
+    }
+
+    fn benchmark_genres_presented(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let selected_genres = self
+            .detail_editor
+            .as_ref()
+            .expect("genre benchmark has a detail editor")
+            .curation
+            .genres
+            .len();
+        let mut benchmark = self
+            .benchmark
+            .take()
+            .expect("genre benchmark state is present");
+        benchmark.genre_picker_painted = Some(
+            benchmark
+                .action_started
+                .expect("genre benchmark action started")
+                .elapsed(),
+        );
+        benchmark.finish_genres(
+            self.library_total,
+            self.books.len(),
+            selected_genres,
+            Genre::ALL.len(),
+        );
+        cx.quit();
     }
 
     fn benchmark_virtual_library_dialog_presented(
@@ -2462,6 +2519,28 @@ impl LecternView {
         cx.notify();
     }
 
+    fn set_genre_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        editor.genre_menu_open = open;
+        cx.notify();
+    }
+
+    fn toggle_detail_genre(&mut self, genre: Genre, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        editor.curation.toggle_genre(genre);
+        let genres_item = detail_genres_item_index(editor.contributors.len());
+        editor
+            .list_state
+            .remeasure_items(genres_item..genres_item + 1);
+        editor.dirty = true;
+        editor.error = None;
+        cx.notify();
+    }
+
     fn set_virtual_library_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
         let query = {
             let Some(editor) = &mut self.detail_editor else {
@@ -2693,6 +2772,9 @@ impl LecternView {
                     DetailErrorSection::Series => DETAIL_SERIES_ITEM,
                     DetailErrorSection::Contributors => DETAIL_CONTRIBUTOR_START_ITEM,
                     DetailErrorSection::Tags => detail_tags_item_index(editor.contributors.len()),
+                    DetailErrorSection::Genres => {
+                        detail_genres_item_index(editor.contributors.len())
+                    }
                     DetailErrorSection::VirtualLibraries => {
                         detail_virtual_libraries_item_index(editor.contributors.len())
                     }
@@ -5826,8 +5908,12 @@ const fn detail_tags_item_index(contributor_count: usize) -> usize {
     detail_contributor_footer_item(contributor_count) + 1
 }
 
-const fn detail_virtual_libraries_item_index(contributor_count: usize) -> usize {
+const fn detail_genres_item_index(contributor_count: usize) -> usize {
     detail_tags_item_index(contributor_count) + 1
+}
+
+const fn detail_virtual_libraries_item_index(contributor_count: usize) -> usize {
+    detail_genres_item_index(contributor_count) + 1
 }
 
 const fn detail_library_item_index(contributor_count: usize) -> usize {
@@ -6536,6 +6622,7 @@ impl LecternView {
         let contributor_count = editor.contributors.len();
         let contributor_footer = detail_contributor_footer_item(contributor_count);
         let tags = detail_tags_item_index(contributor_count);
+        let genres = detail_genres_item_index(contributor_count);
         let virtual_libraries = detail_virtual_libraries_item_index(contributor_count);
         let library = detail_library_item_index(contributor_count);
         let editing_busy = editor.operation != DetailOperation::Idle;
@@ -6571,6 +6658,8 @@ impl LecternView {
             detail_contributor_footer(editor, &theme, cx)
         } else if item == tags {
             detail_tags_item(editor, &theme, cx)
+        } else if item == genres {
+            detail_genres_item(editor, &theme, cx)
         } else if item == virtual_libraries {
             detail_virtual_libraries_item(editor, &theme, cx)
         } else if item == library {
@@ -6587,6 +6676,7 @@ impl LecternView {
                 | DETAIL_SERIES_ITEM
         ) || item == DETAIL_CONTRIBUTOR_START_ITEM
             || item == tags
+            || item == genres
             || item == virtual_libraries
             || item == library;
         let ends_section = matches!(
@@ -6597,7 +6687,8 @@ impl LecternView {
                 | DETAIL_SERIES_ITEM
         ) || item == contributor_footer
             || item == tags
-            || item == virtual_libraries;
+            || item == genres;
+        let ends_section = ends_section || item == virtual_libraries;
 
         div()
             .px(theme.spacing.large)
@@ -6711,6 +6802,8 @@ fn metadata_error_section(error: &str) -> DetailErrorSection {
         DetailErrorSection::Series
     } else if error.contains("tag") {
         DetailErrorSection::Tags
+    } else if error.contains("genre") {
+        DetailErrorSection::Genres
     } else if error.contains("publication date") {
         DetailErrorSection::Publication
     } else {
@@ -7294,6 +7387,64 @@ fn detail_tags_item(
         )
         .when_some(
             detail_error(editor, DetailErrorSection::Tags),
+            |content, error| content.child(detail_error_text(error, theme)),
+        )
+        .into_any_element()
+}
+
+fn detail_genres_item(
+    editor: &BookDetailEditor,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let editing_busy = editor.operation != DetailOperation::Idle;
+    let chips = editor.curation.genres.iter().copied().map(|genre| {
+        EntityChip::new(
+            format!("detail-genre-{}", genre.as_str()),
+            genre.to_string(),
+        )
+        .removal_noun("genre")
+        .disabled(editing_busy)
+        .on_remove(cx.listener(move |this, _, _, cx| {
+            this.toggle_detail_genre(genre, cx);
+        }))
+    });
+    let options = Genre::ALL.into_iter().map(|genre| {
+        ActionListItem::new(
+            format!("genre-option-{}", genre.as_str()),
+            genre.to_string(),
+        )
+        .selected(editor.curation.genres.contains(&genre))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.toggle_detail_genre(genre, cx);
+        }))
+    });
+
+    detail_section_container("Genres", theme)
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(theme.spacing.small)
+                .items_center()
+                .children(chips)
+                .child(
+                    ActionMenu::new(
+                        "detail-genre-menu",
+                        Button::new("open-detail-genre-menu", "+ Genre")
+                            .size(ButtonSize::Small)
+                            .disabled(editing_busy),
+                        div().flex().flex_col().children(options),
+                    )
+                    .width(rems(21.))
+                    .open(editor.genre_menu_open)
+                    .on_open_change(cx.listener(|this, open, _, cx| {
+                        this.set_genre_menu_open(*open, cx);
+                    })),
+                ),
+        )
+        .when_some(
+            detail_error(editor, DetailErrorSection::Genres),
             |content, error| content.child(detail_error_text(error, theme)),
         )
         .into_any_element()
@@ -8164,6 +8315,7 @@ fn benchmark_book_detail() -> Book {
                 color: TagColor::Azure,
             },
         ],
+        genres: vec![Genre::Classics, Genre::Fantasy, Genre::YoungAdult],
         virtual_libraries: benchmark_virtual_libraries(3, 1),
         publisher: Some("Lectern Press".to_owned()),
         publication_date: Some("2026-08-27".parse().expect("valid benchmark date")),
@@ -8373,6 +8525,7 @@ enum BenchmarkWorkload {
     EmptyLibraryAddBooks,
     LibrarySelection,
     BookDetail,
+    Genres,
     VirtualLibrary,
     BulkTags,
     KoboDevice,
@@ -8429,6 +8582,7 @@ struct BenchmarkRun {
     action_started: Option<Instant>,
     selection_painted: Option<Duration>,
     detail_painted: Option<Duration>,
+    genre_picker_painted: Option<Duration>,
     virtual_library_dialog_painted: Option<Duration>,
     virtual_library_menu_painted: Option<Duration>,
     bulk_tag_config: Option<BulkTagBenchmarkConfig>,
@@ -8666,6 +8820,50 @@ impl BenchmarkRun {
         });
     }
 
+    fn finish_genres(
+        self,
+        library_total: u64,
+        rendered_books: usize,
+        selected_genres: usize,
+        catalog_genres: usize,
+    ) {
+        assert_eq!(
+            self.workload,
+            BenchmarkWorkload::Genres,
+            "genre completion belongs to the genre UI benchmark"
+        );
+        let sample = UiGenreBenchmarkSample {
+            schema_version: 1,
+            workload: "genres",
+            initial_render_ms: millis(self.initial_render.expect("initial frame was measured")),
+            picker_to_paint_ms: millis(
+                self.genre_picker_painted
+                    .expect("genre picker state was presented"),
+            ),
+            peak_rss_bytes: peak_rss_bytes(),
+            correctness: UiGenreBenchmarkCorrectness {
+                library_total,
+                rendered_books,
+                selected_genres,
+                catalog_genres,
+                markers: vec![
+                    "book_detail_genres_presented",
+                    "fixed_catalog_complete",
+                    "selected_genres_marked",
+                    "no_genre_creation_action",
+                ],
+            },
+        };
+        let json =
+            serde_json::to_vec_pretty(&sample).expect("serialize GPUI genre benchmark sample");
+        fs::write(&self.output, json).unwrap_or_else(|error| {
+            panic!(
+                "write GPUI genre benchmark sample {}: {error}",
+                self.output.display()
+            )
+        });
+    }
+
     fn finish_virtual_library(
         self,
         library_total: u64,
@@ -8888,6 +9086,25 @@ struct UiBookDetailBenchmarkCorrectness {
     contributor_count: usize,
     tag_count: usize,
     asset_count: usize,
+    markers: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct UiGenreBenchmarkSample {
+    schema_version: u32,
+    workload: &'static str,
+    initial_render_ms: f64,
+    picker_to_paint_ms: f64,
+    peak_rss_bytes: Option<u64>,
+    correctness: UiGenreBenchmarkCorrectness,
+}
+
+#[derive(Serialize)]
+struct UiGenreBenchmarkCorrectness {
+    library_total: u64,
+    rendered_books: usize,
+    selected_genres: usize,
+    catalog_genres: usize,
     markers: Vec<&'static str>,
 }
 

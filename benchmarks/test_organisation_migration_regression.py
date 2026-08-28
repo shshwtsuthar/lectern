@@ -29,7 +29,7 @@ def valid_result() -> dict:
     return {
         "library_books": 50_000,
         "source_schema_version": 5,
-        "final_schema_version": 10,
+        "final_schema_version": 11,
         "warmup_iterations": 2,
         "measured_iterations": 20,
         "visible_projections_preserved": True,

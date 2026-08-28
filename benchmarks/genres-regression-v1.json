@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-organisation-regression-budget",
+  "workload": {
+    "query_mode": "genres",
+    "fixture_version": 2,
+    "genre_fixture_version": 1,
+    "books": 50000,
+    "seed": 20260828,
+    "cover_every": 0,
+    "contributors": 20000,
+    "series": 2500,
+    "tags": 500,
+    "tags_per_book": 8,
+    "saved_searches": 250,
+    "catalog_genres": 28,
+    "detail_genres": 12,
+    "warmup_iterations": 10,
+    "measured_iterations": 40,
+    "scenarios": [
+      "book_detail_with_genres",
+      "genre_membership_save_and_reload"
+    ],
+    "correctness": [
+      "fixed_catalog_size",
+      "complete_book_genres",
+      "catalog_order",
+      "atomic_membership_replace",
+      "duplicate_memberships_eliminated"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 1.0
+  },
+  "budgets": {
+    "book_detail_with_genres": {
+      "max_p95_ms": 25,
+      "max_peak_rss_delta_bytes": 67108864
+    },
+    "genre_membership_save_and_reload": {
+      "max_p95_ms": 50,
+      "max_peak_rss_delta_bytes": 67108864
+    }
+  }
+}

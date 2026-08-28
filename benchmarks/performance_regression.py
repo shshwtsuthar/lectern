@@ -89,6 +89,7 @@ def main(arguments: list[str]) -> int:
             "ui-bootstrap",
             "ui-selection",
             "ui-book-detail",
+            "ui-genres",
             "ui-virtual-library",
         ):
             query_output = output / f"{mode}.json"
@@ -101,6 +102,9 @@ def main(arguments: list[str]) -> int:
             elif mode == "ui-book-detail":
                 ui_result = run_ui_book_detail(query_output, output, workload, commands)
                 decisions = evaluate_ui_book_detail_result(ui_result, budget)
+            elif mode == "ui-genres":
+                ui_result = run_ui_genres(query_output, output, workload, commands)
+                decisions = evaluate_ui_genres_result(ui_result, budget)
             else:
                 ui_result = run_ui_virtual_library(
                     query_output, output, workload, commands
@@ -143,6 +147,7 @@ def main(arguments: list[str]) -> int:
             "bulk-tags": "organisation-bulk-tags.json",
             "bulk-remove": "organisation-bulk-remove.json",
             "saved-searches": "organisation-saved-searches.json",
+            "genres": "genres.json",
             "virtual-libraries": "virtual-libraries.json",
             "maintenance": "maintenance.json",
         }
@@ -157,6 +162,7 @@ def main(arguments: list[str]) -> int:
             "bulk-tags",
             "bulk-remove",
             "saved-searches",
+            "genres",
             "virtual-libraries",
         ):
             validate_organisation_query_seed_result(seed, workload)
@@ -199,6 +205,8 @@ def main(arguments: list[str]) -> int:
             decisions = evaluate_bulk_remove_result(query_result, budget)
         elif mode == "saved-searches":
             decisions = evaluate_saved_search_result(query_result, budget)
+        elif mode == "genres":
+            decisions = evaluate_genre_result(query_result, budget)
         elif mode == "virtual-libraries":
             decisions = evaluate_virtual_library_result(query_result, budget)
         elif mode == "maintenance":
@@ -249,6 +257,7 @@ def seed_command(
         "bulk-tags",
         "bulk-remove",
         "saved-searches",
+        "genres",
         "virtual-libraries",
     ):
         command += ["--bin", "organisation-query-benchmark", "--", "seed"]
@@ -285,6 +294,8 @@ def workload_command(
         command += ["--bin", "organisation-bulk-benchmark", "--"]
     elif mode == "saved-searches":
         command += ["--bin", "organisation-saved-search-benchmark", "--"]
+    elif mode == "genres":
+        command += ["--bin", "genre-benchmark", "--"]
     elif mode == "virtual-libraries":
         command += ["--bin", "virtual-library-benchmark", "--"]
     else:
@@ -394,24 +405,26 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "bulk-tags",
         "bulk-remove",
         "saved-searches",
+        "genres",
         "virtual-libraries",
         "maintenance",
         "ui-bootstrap",
         "ui-selection",
         "ui-book-detail",
+        "ui-genres",
         "ui-virtual-library",
     ):
         raise RegressionError(
             "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
             "'remove', 'detach', 'attach', 'replace', 'export', 'reimport', "
             "'organisation-migration', 'organisation-query', "
-            "'organisation-vocabulary', 'bulk-tags', 'bulk-remove', 'saved-searches', 'maintenance', "
+            "'organisation-vocabulary', 'bulk-tags', 'bulk-remove', 'saved-searches', 'genres', 'maintenance', "
             "'virtual-libraries', "
-            "'ui-bootstrap', 'ui-selection', 'ui-book-detail', or 'ui-virtual-library'"
+            "'ui-bootstrap', 'ui-selection', 'ui-book-detail', 'ui-genres', or 'ui-virtual-library'"
         )
     if (
         query_mode
-        in ("ui-bootstrap", "ui-selection", "ui-book-detail", "ui-virtual-library")
+        in ("ui-bootstrap", "ui-selection", "ui-book-detail", "ui-genres", "ui-virtual-library")
     ) != (
         budget["kind"] == UI_CONFIGURATION_KIND
     ):
@@ -542,7 +555,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                     raise RegressionError(
                         f"bulk removal workload {field} must be greater than zero"
                     )
-        if query_mode in ("ui-selection", "ui-book-detail", "ui-virtual-library"):
+        if query_mode in ("ui-selection", "ui-book-detail", "ui-genres", "ui-virtual-library"):
             if positive_or_zero_field(workload, "page_size", "budget.workload") == 0:
                 raise RegressionError(
                     "populated UI workload page_size must be greater than zero"
@@ -551,6 +564,16 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             workload, "fixture_version", "budget.workload"
         ) != 2:
             raise RegressionError("book-detail UI workload must use fixture version two")
+        if query_mode == "ui-genres" and positive_or_zero_field(
+            workload, "fixture_version", "budget.workload"
+        ) != 1:
+            raise RegressionError("genre UI workload must use fixture version one")
+        if query_mode == "ui-genres":
+            for field in ("selected_genres", "catalog_genres"):
+                if positive_or_zero_field(workload, field, "budget.workload") == 0:
+                    raise RegressionError(
+                        f"genre UI workload {field} must be greater than zero"
+                    )
         if query_mode == "ui-virtual-library" and positive_or_zero_field(
             workload, "fixture_version", "budget.workload"
         ) != 1:
@@ -574,6 +597,16 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 if positive_or_zero_field(workload, field, "budget.workload") == 0:
                     raise RegressionError(
                         f"saved-search workload {field} must be greater than zero"
+                    )
+        if query_mode == "genres":
+            if positive_or_zero_field(
+                workload, "genre_fixture_version", "budget.workload"
+            ) != 1:
+                raise RegressionError("genre workload must use fixture version one")
+            for field in ("catalog_genres", "detail_genres"):
+                if positive_or_zero_field(workload, field, "budget.workload") == 0:
+                    raise RegressionError(
+                        f"genre workload {field} must be greater than zero"
                     )
         if query_mode == "virtual-libraries":
             if positive_or_zero_field(
@@ -627,6 +660,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             "ui-bootstrap",
             "ui-selection",
             "ui-book-detail",
+            "ui-genres",
             "ui-virtual-library",
         ):
             positive_or_zero_field(
@@ -658,6 +692,12 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 f"budget {name!r}",
             )
         if query_mode == "virtual-libraries":
+            positive_or_zero_field(
+                scenario_budget,
+                "max_peak_rss_delta_bytes",
+                f"budget {name!r}",
+            )
+        if query_mode == "genres":
             positive_or_zero_field(
                 scenario_budget,
                 "max_peak_rss_delta_bytes",
@@ -1145,6 +1185,75 @@ def evaluate_virtual_library_result(
     return decisions
 
 
+def evaluate_genre_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "genre result"
+    if result.get("kind") != "genre-performance":
+        raise RegressionError("genre result kind is invalid")
+    expected_counts = {
+        "library_books": workload["books"],
+        "catalog_genres": workload["catalog_genres"],
+        "detail_genres": workload["detail_genres"],
+        "warmup_iterations": workload["warmup_iterations"],
+        "measured_iterations": workload["measured_iterations"],
+    }
+    for field, expected in expected_counts.items():
+        if positive_or_zero_field(result, field, context) != expected:
+            raise RegressionError(f"genre result {field} does not match the budget")
+    checks = result.get("verified_checks")
+    if not isinstance(checks, list) or set(checks) != set(workload["correctness"]):
+        raise RegressionError("genre correctness checks did not reconcile")
+    peak_delta = positive_or_zero_field(result, "peak_rss_delta_bytes", context)
+
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError("genre result must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    total_rounds = workload["warmup_iterations"] + workload["measured_iterations"]
+    for index, scenario in enumerate(scenarios):
+        scenario_context = f"genre scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{scenario_context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{scenario_context}.name must be unique and non-empty")
+        if positive_or_zero_field(
+            scenario, "successful_operations", scenario_context
+        ) != total_rounds:
+            raise RegressionError(
+                f"{scenario_context} successful operation count does not reconcile"
+            )
+        samples = scenario.get("samples_ns")
+        if not isinstance(samples, list) or len(samples) != workload["measured_iterations"]:
+            raise RegressionError(f"{scenario_context} sample count does not match the budget")
+        if any(
+            isinstance(sample, bool) or not isinstance(sample, int) or sample <= 0
+            for sample in samples
+        ):
+            raise RegressionError(f"{scenario_context}.samples_ns must contain positive integers")
+        positive_number_field(
+            object_field(scenario, "latency_ms", scenario_context),
+            "p95",
+            f"{scenario_context}.latency_ms",
+        )
+        by_name[name] = scenario
+
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("genre scenarios do not match the versioned budget")
+    decisions = evaluate_latency_budgets(by_name, budget)
+    for decision in decisions:
+        maximum = budget["budgets"][decision["name"]]["max_peak_rss_delta_bytes"]
+        decision |= {
+            "peak_rss_delta_bytes": peak_delta,
+            "max_peak_rss_delta_bytes": maximum,
+        }
+        decision["passed"] = bool(decision["passed"] and peak_delta <= maximum)
+    return decisions
+
+
 def evaluate_maintenance_result(
     result: dict[str, Any], budget: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -1363,8 +1472,8 @@ def evaluate_migration_result(
         raise RegressionError("migration library count does not match the budget")
     if positive_or_zero_field(result, "source_schema_version", context) != 5:
         raise RegressionError("migration source schema version is not five")
-    if positive_or_zero_field(result, "final_schema_version", context) != 10:
-        raise RegressionError("migration did not reach schema version ten")
+    if positive_or_zero_field(result, "final_schema_version", context) != 11:
+        raise RegressionError("migration did not reach schema version eleven")
     warmup = positive_or_zero_field(result, "warmup_iterations", context)
     measured = positive_or_zero_field(result, "measured_iterations", context)
     if warmup != workload["warmup_iterations"] or measured != workload["measured_iterations"]:
@@ -2153,6 +2262,96 @@ def run_ui_virtual_library(
     return result
 
 
+def run_ui_genres(
+    output: pathlib.Path,
+    artifact_directory: pathlib.Path,
+    workload: dict[str, Any],
+    commands: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Measure presentation of the fixed genre picker in populated book details."""
+
+    run_command(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "lectern-desktop",
+            "--bin",
+            "lectern-gpui",
+        ],
+        commands,
+        timeout_seconds=1_800,
+    )
+    target_directory = pathlib.Path(
+        os.environ.get("CARGO_TARGET_DIR", str(REPOSITORY / "target"))
+    )
+    if not target_directory.is_absolute():
+        target_directory = REPOSITORY / target_directory
+    executable = target_directory / "release/lectern-gpui"
+    if sys.platform == "win32":
+        executable = executable.with_suffix(".exe")
+    if not executable.is_file():
+        raise RegressionError(f"release GPUI executable is missing: {executable}")
+
+    warmup = workload["warmup_iterations"]
+    measured = workload["measured_iterations"]
+    samples_directory = artifact_directory / "ui-samples"
+    samples_directory.mkdir()
+    measured_samples: list[dict[str, Any]] = []
+    raw_paths: list[str] = []
+    for index in range(warmup + measured):
+        phase = "warmup" if index < warmup else "measured"
+        phase_index = index if phase == "warmup" else index - warmup
+        sample_path = samples_directory / f"{phase}-{phase_index:03d}.json"
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "LECTERN_GPUI_BENCHMARK_OUTPUT": str(sample_path),
+                "LECTERN_GPUI_BENCHMARK_WORKLOAD": "genres",
+            }
+        )
+        run_command(
+            [str(executable)],
+            commands,
+            environment=environment,
+            timeout_seconds=15,
+        )
+        sample = read_json(sample_path)
+        validate_ui_genre_sample(sample, sample_path, workload)
+        raw_paths.append(str(sample_path))
+        if phase == "measured":
+            measured_samples.append(sample)
+
+    peak_samples = [
+        sample["peak_rss_bytes"]
+        for sample in measured_samples
+        if sample.get("peak_rss_bytes") is not None
+    ]
+    peak_rss = max(peak_samples) if peak_samples else None
+    scenarios = []
+    for name, field in (
+        ("initial_library_render", "initial_render_ms"),
+        ("genre_picker_to_painted_state", "picker_to_paint_ms"),
+    ):
+        samples_ns = [
+            round(float(sample[field]) * 1_000_000) for sample in measured_samples
+        ]
+        scenarios.append(ui_scenario(name, samples_ns, peak_rss))
+    result = {
+        "kind": "lectern-ui-genre-performance",
+        "library_books": workload["books"],
+        "warmup_iterations": warmup,
+        "measured_iterations": measured,
+        "raw_samples": raw_paths,
+        "correctness": measured_samples[0]["correctness"],
+        "scenarios": scenarios,
+    }
+    write_json(output, result)
+    return result
+
+
 def validate_ui_bootstrap_sample(sample: dict[str, Any], path: pathlib.Path) -> None:
     context = f"UI sample {path.name}"
     if sample.get("schema_version") != 1:
@@ -2277,6 +2476,40 @@ def validate_ui_virtual_library_sample(
         raise RegressionError(f"{context} peak_rss_bytes must be positive when present")
     if sample.get("correctness") != expected_ui_virtual_library_correctness(workload):
         raise RegressionError(f"{context} correctness markers are invalid")
+
+
+def validate_ui_genre_sample(
+    sample: dict[str, Any], path: pathlib.Path, workload: dict[str, Any]
+) -> None:
+    context = f"UI genre sample {path.name}"
+    if sample.get("schema_version") != 1:
+        raise RegressionError(f"{context} schema_version must be 1")
+    if sample.get("workload") != "genres":
+        raise RegressionError(f"{context} workload identity is invalid")
+    for field in ("initial_render_ms", "picker_to_paint_ms"):
+        positive_number_field(sample, field, context)
+    peak_rss = sample.get("peak_rss_bytes")
+    if peak_rss is not None and positive_or_zero_field(
+        sample, "peak_rss_bytes", context
+    ) == 0:
+        raise RegressionError(f"{context} peak_rss_bytes must be positive when present")
+    if sample.get("correctness") != expected_ui_genre_correctness(workload):
+        raise RegressionError(f"{context} correctness markers are invalid")
+
+
+def expected_ui_genre_correctness(workload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "library_total": workload["books"],
+        "rendered_books": workload["page_size"],
+        "selected_genres": workload["selected_genres"],
+        "catalog_genres": workload["catalog_genres"],
+        "markers": [
+            "book_detail_genres_presented",
+            "fixed_catalog_complete",
+            "selected_genres_marked",
+            "no_genre_creation_action",
+        ],
+    }
 
 
 def expected_ui_virtual_library_correctness(workload: dict[str, Any]) -> dict[str, Any]:
@@ -2801,6 +3034,25 @@ def evaluate_ui_virtual_library_result(
         raise RegressionError(f"{context} correctness markers are invalid")
 
     # Reuse the common retained-sample, p95, scenario, and memory validation.
+    common_result = dict(result)
+    common_result["kind"] = "lectern-ui-bootstrap-performance"
+    common_result["library_books"] = 0
+    common_result["correctness"] = expected_ui_correctness()
+    return evaluate_ui_bootstrap_result(common_result, budget)
+
+
+def evaluate_ui_genres_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "UI genre result"
+    if result.get("kind") != "lectern-ui-genre-performance":
+        raise RegressionError(f"{context} kind is invalid")
+    if positive_or_zero_field(result, "library_books", context) != workload["books"]:
+        raise RegressionError(f"{context} library size does not match the budget")
+    if result.get("correctness") != expected_ui_genre_correctness(workload):
+        raise RegressionError(f"{context} correctness markers are invalid")
+
     common_result = dict(result)
     common_result["kind"] = "lectern-ui-bootstrap-performance"
     common_result["library_books"] = 0

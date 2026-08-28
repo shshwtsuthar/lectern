@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-ui-regression-budget",
+  "workload": {
+    "query_mode": "ui-genres",
+    "fixture_version": 1,
+    "books": 50000,
+    "seed": 20260828,
+    "cover_every": 0,
+    "page_size": 128,
+    "selected_genres": 3,
+    "catalog_genres": 28,
+    "warmup_iterations": 5,
+    "measured_iterations": 40,
+    "scenarios": [
+      "initial_library_render",
+      "genre_picker_to_painted_state"
+    ],
+    "correctness": [
+      "book_detail_genres_presented",
+      "fixed_catalog_complete",
+      "selected_genres_marked",
+      "no_genre_creation_action"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 1.0
+  },
+  "budgets": {
+    "initial_library_render": {
+      "max_p95_ms": 500,
+      "max_peak_rss_bytes": 536870912
+    },
+    "genre_picker_to_painted_state": {
+      "max_p95_ms": 50,
+      "max_peak_rss_bytes": 536870912
+    }
+  }
+}

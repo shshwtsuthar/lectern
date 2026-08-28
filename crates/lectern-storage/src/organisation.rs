@@ -6,7 +6,7 @@ use lectern_core::{
     AssetHealth, BookFormat, BookId, LibraryQuery, SortOrder,
     organisation::{
         BookEdit, Contributor, ContributorCredit, ContributorCreditEdit, ContributorId,
-        ContributorReference, ContributorRole, ContributorUsage, ImportedContributorCredit,
+        ContributorReference, ContributorRole, ContributorUsage, Genre, ImportedContributorCredit,
         ImportedOrganisation, NameKind, SavedSearch, SavedSearchId, Series, SeriesId, SeriesIndex,
         SeriesMembership, SeriesMembershipEdit, SeriesReference, SeriesUsage, Tag, TagColor, TagId,
         TagReference, TagUsage, VirtualLibrary, VirtualLibraryIcon, VirtualLibraryId,
@@ -355,6 +355,28 @@ pub(super) fn migrate_v9_to_v10(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Adds fixed, indexed many-to-many genre membership in schema 11.
+pub(super) fn migrate_v10_to_v11(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE book_genres ( \
+             book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE, \
+             genre   TEXT NOT NULL CHECK (genre IN ( \
+                 'art_and_photography', 'biography_and_memoir', 'business_and_economics', \
+                 'childrens', 'classics', 'comics_and_graphic_novels', \
+                 'cookbooks_food_and_wine', 'crime_and_mystery', 'education_and_reference', \
+                 'essays', 'fantasy', 'historical_fiction', 'history', 'horror', 'humor', \
+                 'literary_fiction', 'poetry', 'politics_and_society', \
+                 'religion_and_spirituality', 'romance', 'science_and_nature', \
+                 'science_fiction', 'self_help', 'sports_and_recreation', \
+                 'thriller_and_suspense', 'travel', 'true_crime', 'young_adult' \
+             )), \
+             PRIMARY KEY (book_id, genre) \
+         ) STRICT; \
+         CREATE INDEX book_genres_genre_book_idx ON book_genres(genre, book_id);",
+    )?;
+    Ok(())
+}
+
 fn validate_legacy_name(kind: NameKind, value: &str) -> Result<String> {
     normalize_name(kind, value).map_err(|error| {
         StorageError::Integrity(format!("legacy {kind} cannot be normalized: {error}"))
@@ -568,11 +590,18 @@ fn normalize_user_name(kind: NameKind, value: &str) -> Result<String> {
     normalize_name(kind, value).map_err(|error| StorageError::InvalidCuration(error.to_string()))
 }
 
-/// Loads authoritative contributor, series, and tag records for one complete book.
+type LoadedBookCuration = (
+    Vec<ContributorCredit>,
+    Option<SeriesMembership>,
+    Vec<Tag>,
+    Vec<Genre>,
+);
+
+/// Loads authoritative contributor, series, tag, and genre records for one complete book.
 pub(super) fn load_book_curation(
     connection: &Connection,
     book_id: BookId,
-) -> Result<(Vec<ContributorCredit>, Option<SeriesMembership>, Vec<Tag>)> {
+) -> Result<LoadedBookCuration> {
     let contributors = {
         let mut statement = connection.prepare_cached(
             "SELECT c.id, c.display_name, c.sort_name, bc.role, bc.position \
@@ -644,7 +673,25 @@ pub(super) fn load_book_curation(
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
-    Ok((contributors, series, tags))
+    let genres = {
+        let mut statement = connection
+            .prepare_cached("SELECT genre FROM book_genres WHERE book_id = ?1 ORDER BY genre")?;
+        let rows = statement.query_map([book_id.value()], |row| {
+            let value = row.get::<_, String>(0)?;
+            Genre::parse(&value).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    format!("invalid genre {value:?}").into(),
+                )
+            })
+        })?;
+        let mut genres = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        genres.sort_unstable();
+        genres
+    };
+
+    Ok((contributors, series, tags, genres))
 }
 
 /// Atomically stores ordinary metadata and every authoritative curation relationship.
@@ -753,7 +800,26 @@ pub(super) fn save_book_edit(transaction: &Transaction<'_>, edit: &BookEdit) -> 
         }
     }
 
+    replace_book_genres(transaction, edit.id, &edit.genres)?;
+
     rebuild_book_projection(transaction, edit.id.value())
+}
+
+fn replace_book_genres(
+    transaction: &Transaction<'_>,
+    book: BookId,
+    genres: &[Genre],
+) -> Result<()> {
+    transaction.execute("DELETE FROM book_genres WHERE book_id = ?1", [book.value()])?;
+    let mut genres = genres.to_vec();
+    genres.sort_unstable();
+    genres.dedup();
+    let mut insert =
+        transaction.prepare("INSERT INTO book_genres(book_id, genre) VALUES (?1, ?2)")?;
+    for genre in genres {
+        insert.execute(params![book.value(), genre.as_str()])?;
+    }
+    Ok(())
 }
 
 fn validate_credit_positions(credits: &[ContributorCreditEdit]) -> Result<()> {

@@ -39,7 +39,7 @@ use thiserror::Error;
 #[cfg(not(any(unix, windows)))]
 compile_error!("Lectern's lossless path codec currently supports Unix and Windows targets");
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const BACKUP_PAGES_PER_STEP: i32 = 2_048;
 static NEXT_BACKUP_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1080,6 +1080,7 @@ impl LibraryDatabase {
                     contributors: Vec::new(),
                     series_membership: None,
                     tags: Vec::new(),
+                    genres: Vec::new(),
                     virtual_libraries: Vec::new(),
                     publisher: row.get(4)?,
                     publication_date,
@@ -1111,11 +1112,12 @@ impl LibraryDatabase {
         }
 
         if let Some(book) = &mut book {
-            let (contributors, series, tags) =
+            let (contributors, series, tags, genres) =
                 organisation::load_book_curation(&self.connection, book.id)?;
             book.contributors = contributors;
             book.series_membership = series;
             book.tags = tags;
+            book.genres = genres;
             book.virtual_libraries =
                 organisation::load_book_virtual_libraries(&self.connection, book.id)?;
         }
@@ -2352,7 +2354,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
     let observed = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match observed {
         SCHEMA_VERSION if current_schema_complete(connection)? => return Ok(()),
-        SCHEMA_VERSION | 0..=9 => {}
+        SCHEMA_VERSION | 0..=10 => {}
         unsupported => return Err(StorageError::UnsupportedSchema(unsupported)),
     }
 
@@ -2382,6 +2384,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
             organisation::migrate_v9_to_v10(&transaction)?;
+            organisation::migrate_v10_to_v11(&transaction)?;
             true
         }
         1 | 2 => {
@@ -2393,6 +2396,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
             organisation::migrate_v9_to_v10(&transaction)?;
+            organisation::migrate_v10_to_v11(&transaction)?;
             true
         }
         3 => {
@@ -2403,6 +2407,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
             organisation::migrate_v9_to_v10(&transaction)?;
+            organisation::migrate_v10_to_v11(&transaction)?;
             true
         }
         4 => {
@@ -2412,6 +2417,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
             organisation::migrate_v9_to_v10(&transaction)?;
+            organisation::migrate_v10_to_v11(&transaction)?;
             true
         }
         5 => {
@@ -2420,6 +2426,7 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
             organisation::migrate_v9_to_v10(&transaction)?;
+            organisation::migrate_v10_to_v11(&transaction)?;
             true
         }
         6 => {
@@ -2427,17 +2434,20 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
             organisation::migrate_v9_to_v10(&transaction)?;
+            organisation::migrate_v10_to_v11(&transaction)?;
             true
         }
         7 => {
             organisation::migrate_v7_to_v8(&transaction)?;
             transaction.execute_batch(MIGRATE_8_TO_9)?;
             organisation::migrate_v9_to_v10(&transaction)?;
+            organisation::migrate_v10_to_v11(&transaction)?;
             true
         }
         8 => {
             transaction.execute_batch(MIGRATE_8_TO_9)?;
             organisation::migrate_v9_to_v10(&transaction)?;
+            organisation::migrate_v10_to_v11(&transaction)?;
             true
         }
         9 => {
@@ -2445,6 +2455,11 @@ fn initialize_schema_transaction(connection: &mut Connection) -> Result<()> {
                 transaction.execute_batch(MIGRATE_8_TO_9)?;
             }
             organisation::migrate_v9_to_v10(&transaction)?;
+            organisation::migrate_v10_to_v11(&transaction)?;
+            true
+        }
+        10 => {
+            organisation::migrate_v10_to_v11(&transaction)?;
             true
         }
         SCHEMA_VERSION => repair_current_schema(&transaction)?,
@@ -2482,8 +2497,22 @@ fn virtual_library_tables_exist(connection: &Connection) -> Result<bool> {
         .map_err(StorageError::from)
 }
 
+fn genre_table_exists(connection: &Connection) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'book_genres' \
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::from)
+}
+
 fn current_schema_complete(connection: &Connection) -> Result<bool> {
-    Ok(book_metadata_table_exists(connection)? && virtual_library_tables_exist(connection)?)
+    Ok(book_metadata_table_exists(connection)?
+        && virtual_library_tables_exist(connection)?
+        && genre_table_exists(connection)?)
 }
 
 fn repair_current_schema(transaction: &Transaction<'_>) -> Result<bool> {
@@ -2494,6 +2523,10 @@ fn repair_current_schema(transaction: &Transaction<'_>) -> Result<bool> {
     }
     if !virtual_library_tables_exist(transaction)? {
         organisation::migrate_v9_to_v10(transaction)?;
+        changed = true;
+    }
+    if !genre_table_exists(transaction)? {
+        organisation::migrate_v10_to_v11(transaction)?;
         changed = true;
     }
     Ok(changed)
@@ -2508,6 +2541,11 @@ fn validate_schema(transaction: &Transaction<'_>) -> Result<()> {
     if !virtual_library_tables_exist(transaction)? {
         return Err(StorageError::Integrity(
             "schema migration left virtual-library tables missing".into(),
+        ));
+    }
+    if !genre_table_exists(transaction)? {
+        return Err(StorageError::Integrity(
+            "schema migration left the book genre table missing".into(),
         ));
     }
     let mut foreign_keys = transaction.prepare("PRAGMA foreign_key_check")?;
@@ -3430,7 +3468,7 @@ mod tests {
         BookId, BookMetadataDraft, BookRating, LibraryQuery, ReimportMetadataPolicy, SortOrder,
         organisation::{
             BookEdit, BookSelection, BulkTagEdit, ContributorCreditEdit, ContributorFacet,
-            ContributorReference, ContributorRole, ExactFacets, ImportedContributorCredit,
+            ContributorReference, ContributorRole, ExactFacets, Genre, ImportedContributorCredit,
             ImportedOrganisation, SavedSearchId, SearchExpression, SeriesIndex,
             SeriesMembershipEdit, SeriesReference, TagId, TagReference, VirtualLibraryIcon,
             VocabularyMutationResult,
@@ -5210,6 +5248,37 @@ END;
         );
     }
 
+    #[test]
+    fn version_ten_library_adds_the_fixed_genre_relation() {
+        let database_file = TestDatabase::new("genre-migration");
+        drop(LibraryDatabase::open(database_file.path()).expect("create current library"));
+        let connection = Connection::open(database_file.path()).expect("open current library");
+        connection
+            .execute_batch("DROP TABLE book_genres; PRAGMA user_version = 10;")
+            .expect("construct version ten library");
+        drop(connection);
+
+        drop(LibraryDatabase::open(database_file.path()).expect("migrate genre schema"));
+        let connection = Connection::open(database_file.path()).expect("inspect migrated library");
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("read migrated version"),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema \
+                     WHERE type = 'table' AND name = 'book_genres'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("genre relation exists"),
+            1
+        );
+    }
+
     fn earthsea_edit(id: BookId) -> BookEdit {
         BookEdit {
             id,
@@ -5245,6 +5314,7 @@ END;
                 TagReference::New("Science Fiction".into()),
                 TagReference::New(" Fantasy ".into()),
             ],
+            genres: vec![Genre::Fantasy, Genre::ScienceFiction, Genre::Fantasy],
         }
     }
 
@@ -5301,6 +5371,17 @@ END;
                 .map(|tag| tag.name.as_str())
                 .collect::<Vec<_>>(),
             ["Fantasy", "Science Fiction"]
+        );
+        assert_eq!(stored.genres, [Genre::Fantasy, Genre::ScienceFiction]);
+        assert!(
+            database
+                .connection
+                .execute(
+                    "INSERT INTO book_genres(book_id, genre) VALUES (?1, 'invented')",
+                    [id.value()],
+                )
+                .is_err(),
+            "the database must reject genres outside the fixed catalog"
         );
         assert_eq!(stored.assets, original_asset);
 
@@ -5436,6 +5517,7 @@ END;
             ],
             series: None,
             tags: vec![TagReference::New("Should Not Persist".into())],
+            genres: Vec::new(),
         };
 
         assert!(matches!(
@@ -5497,6 +5579,7 @@ END;
                     TagReference::New("Alpha Tag".into()),
                     TagReference::New("Alpine".into()),
                 ],
+                genres: Vec::new(),
             })
             .expect("save curation");
         let book = database.get_book(id).unwrap().unwrap();
@@ -6071,6 +6154,7 @@ END;
                     TagReference::New("Source Tag".into()),
                     TagReference::New("Target Tag".into()),
                 ],
+                genres: Vec::new(),
             })
             .unwrap();
         let seeded_first = database.get_book(first).unwrap().unwrap();
@@ -6127,6 +6211,7 @@ END;
                     index: Some("2".parse().unwrap()),
                 }),
                 tags: vec![TagReference::Existing(source_tag)],
+                genres: Vec::new(),
             })
             .unwrap();
         let target_series = {
@@ -6614,6 +6699,7 @@ END;
             contributors: Vec::new(),
             series_membership: None,
             tags: Vec::new(),
+            genres: Vec::new(),
             virtual_libraries: Vec::new(),
             publisher: None,
             publication_date: None,

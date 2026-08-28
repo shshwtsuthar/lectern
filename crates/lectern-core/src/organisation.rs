@@ -344,7 +344,181 @@ pub struct Tag {
     pub color: TagColor,
 }
 
-/// One user-created library projection backed by explicit book membership.One user-created library projection backed by explicit book membership.
+/// One genre from Lectern's fixed, built-in book classification catalog.
+///
+/// Genres are deliberately represented as a closed enum rather than user-owned vocabulary rows,
+/// so neither frontends nor persistence adapters can create arbitrary genre values.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Genre {
+    /// Art, design, architecture, and photography.
+    ArtAndPhotography,
+    /// Biography, autobiography, and memoir.
+    BiographyAndMemoir,
+    /// Business, finance, and economics.
+    BusinessAndEconomics,
+    /// Books primarily written for children.
+    Childrens,
+    /// Enduring and historically significant literature.
+    Classics,
+    /// Comics, manga, and graphic novels.
+    ComicsAndGraphicNovels,
+    /// Cooking, food writing, and wine.
+    CookbooksFoodAndWine,
+    /// Crime stories and mysteries.
+    CrimeAndMystery,
+    /// Education, study, and general reference.
+    EducationAndReference,
+    /// Literary and personal essays.
+    Essays,
+    /// Fantasy fiction.
+    Fantasy,
+    /// Fiction set substantially in a historical period.
+    HistoricalFiction,
+    /// History and historical analysis.
+    History,
+    /// Horror fiction.
+    Horror,
+    /// Humor and comedy.
+    Humor,
+    /// Literary fiction.
+    LiteraryFiction,
+    /// Poetry.
+    Poetry,
+    /// Politics, current affairs, and society.
+    PoliticsAndSociety,
+    /// Religion, theology, and spirituality.
+    ReligionAndSpirituality,
+    /// Romance fiction.
+    Romance,
+    /// Science, mathematics, technology, and nature.
+    ScienceAndNature,
+    /// Science fiction.
+    ScienceFiction,
+    /// Personal development and self-help.
+    SelfHelp,
+    /// Sports, games, and recreation.
+    SportsAndRecreation,
+    /// Thrillers and suspense fiction.
+    ThrillerAndSuspense,
+    /// Travel guides and travel writing.
+    Travel,
+    /// True crime.
+    TrueCrime,
+    /// Books primarily written for young adults.
+    YoungAdult,
+}
+
+impl Genre {
+    /// Every genre available to the metadata editor, in display order.
+    pub const ALL: [Self; 28] = [
+        Self::ArtAndPhotography,
+        Self::BiographyAndMemoir,
+        Self::BusinessAndEconomics,
+        Self::Childrens,
+        Self::Classics,
+        Self::ComicsAndGraphicNovels,
+        Self::CookbooksFoodAndWine,
+        Self::CrimeAndMystery,
+        Self::EducationAndReference,
+        Self::Essays,
+        Self::Fantasy,
+        Self::HistoricalFiction,
+        Self::History,
+        Self::Horror,
+        Self::Humor,
+        Self::LiteraryFiction,
+        Self::Poetry,
+        Self::PoliticsAndSociety,
+        Self::ReligionAndSpirituality,
+        Self::Romance,
+        Self::ScienceAndNature,
+        Self::ScienceFiction,
+        Self::SelfHelp,
+        Self::SportsAndRecreation,
+        Self::ThrillerAndSuspense,
+        Self::Travel,
+        Self::TrueCrime,
+        Self::YoungAdult,
+    ];
+
+    /// Returns the stable lowercase storage value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ArtAndPhotography => "art_and_photography",
+            Self::BiographyAndMemoir => "biography_and_memoir",
+            Self::BusinessAndEconomics => "business_and_economics",
+            Self::Childrens => "childrens",
+            Self::Classics => "classics",
+            Self::ComicsAndGraphicNovels => "comics_and_graphic_novels",
+            Self::CookbooksFoodAndWine => "cookbooks_food_and_wine",
+            Self::CrimeAndMystery => "crime_and_mystery",
+            Self::EducationAndReference => "education_and_reference",
+            Self::Essays => "essays",
+            Self::Fantasy => "fantasy",
+            Self::HistoricalFiction => "historical_fiction",
+            Self::History => "history",
+            Self::Horror => "horror",
+            Self::Humor => "humor",
+            Self::LiteraryFiction => "literary_fiction",
+            Self::Poetry => "poetry",
+            Self::PoliticsAndSociety => "politics_and_society",
+            Self::ReligionAndSpirituality => "religion_and_spirituality",
+            Self::Romance => "romance",
+            Self::ScienceAndNature => "science_and_nature",
+            Self::ScienceFiction => "science_fiction",
+            Self::SelfHelp => "self_help",
+            Self::SportsAndRecreation => "sports_and_recreation",
+            Self::ThrillerAndSuspense => "thriller_and_suspense",
+            Self::Travel => "travel",
+            Self::TrueCrime => "true_crime",
+            Self::YoungAdult => "young_adult",
+        }
+    }
+
+    /// Parses a stable storage value from a library database.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|genre| genre.as_str() == value)
+    }
+}
+
+impl fmt::Display for Genre {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ArtAndPhotography => "Art & Photography",
+            Self::BiographyAndMemoir => "Biography & Memoir",
+            Self::BusinessAndEconomics => "Business & Economics",
+            Self::Childrens => "Children's",
+            Self::Classics => "Classics",
+            Self::ComicsAndGraphicNovels => "Comics & Graphic Novels",
+            Self::CookbooksFoodAndWine => "Cookbooks, Food & Wine",
+            Self::CrimeAndMystery => "Crime & Mystery",
+            Self::EducationAndReference => "Education & Reference",
+            Self::Essays => "Essays",
+            Self::Fantasy => "Fantasy",
+            Self::HistoricalFiction => "Historical Fiction",
+            Self::History => "History",
+            Self::Horror => "Horror",
+            Self::Humor => "Humor",
+            Self::LiteraryFiction => "Literary Fiction",
+            Self::Poetry => "Poetry",
+            Self::PoliticsAndSociety => "Politics & Society",
+            Self::ReligionAndSpirituality => "Religion & Spirituality",
+            Self::Romance => "Romance",
+            Self::ScienceAndNature => "Science & Nature",
+            Self::ScienceFiction => "Science Fiction",
+            Self::SelfHelp => "Self-Help",
+            Self::SportsAndRecreation => "Sports & Recreation",
+            Self::ThrillerAndSuspense => "Thriller & Suspense",
+            Self::Travel => "Travel",
+            Self::TrueCrime => "True Crime",
+            Self::YoungAdult => "Young Adult",
+        })
+    }
+}
+
+/// One user-created library projection backed by explicit book membership.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VirtualLibrary {
     /// Stable virtual-library identifier.
@@ -608,6 +782,8 @@ pub struct BookEdit {
     pub series: Option<SeriesMembershipEdit>,
     /// Unordered set of tags.
     pub tags: Vec<TagReference>,
+    /// Unordered set selected from Lectern's fixed genre catalog.
+    pub genres: Vec<Genre>,
 }
 
 /// Contributor autocomplete or vocabulary row with a global usage count.
@@ -1516,6 +1692,19 @@ mod tests {
         assert_eq!(SeriesId::new(8).to_string(), "8");
         assert_eq!(TagId::new(9).value(), 9);
         assert_eq!(super::SavedSearchId::new(10).to_string(), "10");
+        assert_eq!(super::VirtualLibraryId::new(11).value(), 11);
+    }
+
+    #[test]
+    fn fixed_genres_round_trip_storage_values() {
+        let mut storage_values = std::collections::HashSet::new();
+        for genre in super::Genre::ALL {
+            assert_eq!(super::Genre::parse(genre.as_str()), Some(genre));
+            assert!(storage_values.insert(genre.as_str()));
+            assert!(!genre.to_string().is_empty());
+        }
+        assert_eq!(storage_values.len(), 28);
+        assert_eq!(super::Genre::parse("made_up_genre"), None);
     }
 
     #[test]

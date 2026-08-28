@@ -123,6 +123,7 @@ pub struct TagChip {
 pub struct EntityChip {
     id: ElementId,
     name: SharedString,
+    removal_noun: SharedString,
     disabled: bool,
     on_remove: Option<ClickHandler>,
 }
@@ -133,6 +134,7 @@ impl EntityChip {
         Self {
             id: id.into(),
             name: name.into(),
+            removal_noun: "series".into(),
             disabled: false,
             on_remove: None,
         }
@@ -142,6 +144,13 @@ impl EntityChip {
     #[must_use]
     pub const fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// Sets the entity noun used by the removal accessibility label.
+    #[must_use]
+    pub fn removal_noun(mut self, noun: impl Into<SharedString>) -> Self {
+        self.removal_noun = noun.into();
         self
     }
 
@@ -163,7 +172,7 @@ impl RenderOnce for EntityChip {
         let disabled = self.disabled;
         let hover_background = theme.button.default.hover_background;
         let accessibility_label = if removable {
-            format!("Remove series {}", self.name)
+            format!("Remove {} {}", self.removal_noun, self.name)
         } else {
             self.name.to_string()
         };
