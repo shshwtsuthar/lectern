@@ -29,7 +29,7 @@ def valid_result() -> dict:
     return {
         "library_books": 50_000,
         "source_schema_version": 5,
-        "final_schema_version": 11,
+        "final_schema_version": 12,
         "warmup_iterations": 2,
         "measured_iterations": 20,
         "visible_projections_preserved": True,
@@ -38,6 +38,7 @@ def valid_result() -> dict:
         "initial_tags_and_saved_searches_empty": True,
         "schema_invariants_valid": True,
         "canonical_metadata_defaults_valid": True,
+        "default_identifier_types_valid": True,
         "duplicate_series_numbers_repaired": True,
         "failed_migration_rolled_back": True,
         "scenarios": [

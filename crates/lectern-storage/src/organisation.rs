@@ -6,11 +6,13 @@ use lectern_core::{
     AssetHealth, BookFormat, BookId, LibraryQuery, SortOrder,
     organisation::{
         BookEdit, Contributor, ContributorCredit, ContributorCreditEdit, ContributorId,
-        ContributorReference, ContributorRole, ContributorUsage, Genre, ImportedContributorCredit,
-        ImportedOrganisation, NameKind, SavedSearch, SavedSearchId, Series, SeriesId, SeriesIndex,
-        SeriesMembership, SeriesMembershipEdit, SeriesReference, SeriesUsage, Tag, TagColor, TagId,
-        TagReference, TagUsage, VirtualLibrary, VirtualLibraryIcon, VirtualLibraryId,
-        VirtualLibraryMembershipResult, VocabularyMutationResult, identity_key, normalize_name,
+        ContributorReference, ContributorRole, ContributorUsage, DEFAULT_IDENTIFIER_TYPES, Genre,
+        IdentifierType, IdentifierTypeId, IdentifierTypeReference, IdentifierTypeUsage,
+        ImportedContributorCredit, ImportedOrganisation, NameKind, SavedSearch, SavedSearchId,
+        Series, SeriesId, SeriesIndex, SeriesMembership, SeriesMembershipEdit, SeriesReference,
+        SeriesUsage, Tag, TagColor, TagId, TagReference, TagUsage, VirtualLibrary,
+        VirtualLibraryIcon, VirtualLibraryId, VirtualLibraryMembershipResult,
+        VocabularyMutationResult, identity_key, normalize_identifier_value, normalize_name,
     },
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -374,6 +376,33 @@ pub(super) fn migrate_v10_to_v11(transaction: &Transaction<'_>) -> Result<()> {
          ) STRICT; \
          CREATE INDEX book_genres_genre_book_idx ON book_genres(genre, book_id);",
     )?;
+
+    Ok(())
+}
+
+/// Adds extensible per-book identifiers and seeds Lectern's default type vocabulary in version 12.
+pub(super) fn migrate_v11_to_v12(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE identifier_types ( \
+             id           INTEGER PRIMARY KEY, \
+             name         TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 64), \
+             identity_key TEXT NOT NULL UNIQUE CHECK (length(identity_key) > 0) \
+         ) STRICT; \
+         CREATE INDEX identifier_types_name_idx ON identifier_types(identity_key, id); \
+         CREATE TABLE book_identifiers ( \
+             book_id            INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE, \
+             identifier_type_id INTEGER NOT NULL REFERENCES identifier_types(id), \
+             value              TEXT NOT NULL CHECK (length(value) BETWEEN 1 AND 512), \
+             PRIMARY KEY (book_id, identifier_type_id, value) \
+         ) STRICT; \
+         CREATE INDEX book_identifiers_type_book_idx \
+             ON book_identifiers(identifier_type_id, book_id);",
+    )?;
+    let mut insert =
+        transaction.prepare("INSERT INTO identifier_types(name, identity_key) VALUES (?1, ?2)")?;
+    for name in DEFAULT_IDENTIFIER_TYPES {
+        insert.execute(params![name, identity_key(name)])?;
+    }
     Ok(())
 }
 
@@ -595,9 +624,10 @@ type LoadedBookCuration = (
     Option<SeriesMembership>,
     Vec<Tag>,
     Vec<Genre>,
+    Vec<lectern_core::organisation::BookIdentifier>,
 );
 
-/// Loads authoritative contributor, series, tag, and genre records for one complete book.
+/// Loads authoritative contributor, series, tag, genre, and identifier records for one book.
 pub(super) fn load_book_curation(
     connection: &Connection,
     book_id: BookId,
@@ -691,10 +721,33 @@ pub(super) fn load_book_curation(
         genres
     };
 
-    Ok((contributors, series, tags, genres))
+    let identifiers = {
+        let mut statement = connection.prepare_cached(
+            "SELECT it.id, it.name, bi.value FROM book_identifiers bi \
+             JOIN identifier_types it ON it.id = bi.identifier_type_id \
+             WHERE bi.book_id = ?1 \
+             ORDER BY it.identity_key, it.id, bi.value COLLATE NOCASE, bi.value",
+        )?;
+        let rows = statement.query_map([book_id.value()], |row| {
+            Ok(lectern_core::organisation::BookIdentifier {
+                identifier_type: IdentifierType {
+                    id: IdentifierTypeId::new(row.get(0)?),
+                    name: row.get(1)?,
+                },
+                value: row.get(2)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    Ok((contributors, series, tags, genres, identifiers))
 }
 
 /// Atomically stores ordinary metadata and every authoritative curation relationship.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one transaction resolves and replaces the complete authoritative book edit"
+)]
 pub(super) fn save_book_edit(transaction: &Transaction<'_>, edit: &BookEdit) -> Result<()> {
     validate_credit_positions(&edit.contributors)?;
 
@@ -743,6 +796,27 @@ pub(super) fn save_book_edit(transaction: &Transaction<'_>, edit: &BookEdit) -> 
         .collect::<Result<Vec<_>>>()?;
     resolved_tags.sort_unstable_by_key(|(id, _, _)| *id);
     resolved_tags.dedup_by_key(|(id, _, _)| *id);
+    let mut resolved_identifiers = edit
+        .identifiers
+        .iter()
+        .map(|identifier| {
+            let (identifier_type, _, _) =
+                resolve_identifier_type(transaction, &identifier.identifier_type)?;
+            let value = normalize_identifier_value(&identifier.value)
+                .map_err(StorageError::InvalidCuration)?;
+            Ok((identifier_type, value))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    resolved_identifiers
+        .sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    if resolved_identifiers
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
+    {
+        return Err(StorageError::InvalidCuration(
+            "the same identifier is assigned more than once".into(),
+        ));
+    }
 
     transaction.execute(
         "DELETE FROM book_contributors WHERE book_id = ?1",
@@ -801,6 +875,20 @@ pub(super) fn save_book_edit(transaction: &Transaction<'_>, edit: &BookEdit) -> 
     }
 
     replace_book_genres(transaction, edit.id, &edit.genres)?;
+
+    transaction.execute(
+        "DELETE FROM book_identifiers WHERE book_id = ?1",
+        [edit.id.value()],
+    )?;
+    {
+        let mut insert = transaction.prepare(
+            "INSERT INTO book_identifiers(book_id, identifier_type_id, value) \
+             VALUES (?1, ?2, ?3)",
+        )?;
+        for (identifier_type, value) in resolved_identifiers {
+            insert.execute(params![edit.id.value(), identifier_type.value(), value])?;
+        }
+    }
 
     rebuild_book_projection(transaction, edit.id.value())
 }
@@ -956,6 +1044,37 @@ fn resolve_new_tag(
             |row| Ok((TagId::new(row.get(0)?), row.get(1)?, row.get(2)?)),
         )
         .map_err(Into::into)
+}
+
+fn resolve_identifier_type(
+    transaction: &Transaction<'_>,
+    identifier_type: &IdentifierTypeReference,
+) -> Result<(IdentifierTypeId, String, String)> {
+    match identifier_type {
+        IdentifierTypeReference::Existing(id) => transaction
+            .query_row(
+                "SELECT name, identity_key FROM identifier_types WHERE id = ?1",
+                [id.value()],
+                |row| Ok((*id, row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StorageError::InvalidCuration(format!("identifier type {id} does not exist"))
+            }),
+        IdentifierTypeReference::New(name) => {
+            let name = normalize_user_name(NameKind::IdentifierType, name)?;
+            let key = identity_key(&name);
+            transaction
+                .query_row(
+                    "INSERT INTO identifier_types(name, identity_key) VALUES (?1, ?2) \
+                     ON CONFLICT(identity_key) DO UPDATE SET identity_key = excluded.identity_key \
+                     RETURNING id, name, identity_key",
+                    params![name, key],
+                    |row| Ok((IdentifierTypeId::new(row.get(0)?), row.get(1)?, row.get(2)?)),
+                )
+                .map_err(Into::into)
+        }
+    }
 }
 
 /// Returns selected contributors first, followed by bounded identity-prefix matches.
@@ -1409,6 +1528,41 @@ fn validate_virtual_library_description(description: Option<&str>) -> Result<Opt
         )));
     }
     Ok(Some(description.to_owned()))
+}
+
+/// Returns bounded identifier-type identity-prefix matches, including unused defaults.
+pub(super) fn autocomplete_identifier_types(
+    connection: &Connection,
+    prefix: &str,
+    limit: u32,
+) -> Result<Vec<IdentifierTypeUsage>> {
+    let limit = i64::from(limit.min(50));
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let (lower, upper) = prefix_bounds(NameKind::IdentifierType, prefix)?;
+    let mut statement = connection.prepare_cached(
+        "SELECT it.id, it.name, count(bi.book_id) \
+         FROM identifier_types it \
+         LEFT JOIN book_identifiers bi ON bi.identifier_type_id = it.id \
+         WHERE it.identity_key >= ?1 AND it.identity_key < ?2 \
+         GROUP BY it.id ORDER BY it.identity_key, it.id LIMIT ?3",
+    )?;
+    let rows = statement.query_map(params![lower, upper, limit], |row| {
+        Ok((
+            IdentifierTypeId::new(row.get(0)?),
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (id, name, identifiers) = row?;
+        Ok(IdentifierTypeUsage {
+            identifier_type: IdentifierType { id, name },
+            identifiers: checked_count(identifiers)?,
+        })
+    })
+    .collect()
 }
 
 /// Returns one bounded, normalized-name page for the contributor manager.
@@ -2912,6 +3066,7 @@ pub(super) fn validate_organisation_schema(transaction: &Transaction<'_>) -> Res
     validate_identity_keys(transaction, "series_entities", "name", "identity_key")?;
     validate_identity_keys(transaction, "tags", "name", "identity_key")?;
     validate_identity_keys(transaction, "saved_searches", "name", "identity_key")?;
+    validate_identity_keys(transaction, "identifier_types", "name", "identity_key")?;
 
     let invalid_tag_color = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM tags WHERE color NOT IN \

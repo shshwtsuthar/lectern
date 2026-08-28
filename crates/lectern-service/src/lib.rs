@@ -13,9 +13,10 @@ use lectern_core::{
     LibraryStats,
     organisation::{
         BookEdit, BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, ContributorId,
-        ContributorUsage, SavedSearch, SavedSearchId, SelectionSnapshot, SelectionTagUsage,
-        SeriesId, SeriesIndex, SeriesUsage, TagId, TagUsage, VirtualLibrary, VirtualLibraryIcon,
-        VirtualLibraryId, VirtualLibraryMembershipResult, VocabularyMutationResult,
+        ContributorUsage, IdentifierTypeUsage, SavedSearch, SavedSearchId, SelectionSnapshot,
+        SelectionTagUsage, SeriesId, SeriesIndex, SeriesUsage, TagId, TagUsage, VirtualLibrary,
+        VirtualLibraryIcon, VirtualLibraryId, VirtualLibraryMembershipResult,
+        VocabularyMutationResult,
     },
 };
 use lectern_import::{import_paths_into, validate_publication};
@@ -215,6 +216,14 @@ impl LibraryService for SqliteLibraryService {
         Ok(self
             .database
             .set_book_virtual_library_membership(book, library, included)?)
+    }
+
+    fn autocomplete_identifier_types(
+        &mut self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<IdentifierTypeUsage>, Self::Error> {
+        Ok(self.database.autocomplete_identifier_types(prefix, limit)?)
     }
 
     fn search_contributors(

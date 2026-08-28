@@ -20,7 +20,9 @@ def load_budget(name: str) -> dict[str, Any]:
 
 
 class OrganisationPerformanceContractTests(unittest.TestCase):
-    def assert_common_library(self, workload: dict[str, Any]) -> None:
+    def assert_common_library(
+        self, workload: dict[str, Any], fixture_version: int = 2
+    ) -> None:
         self.assertEqual(workload["books"], 50_000)
         self.assertEqual(workload["contributors"], 20_000)
         self.assertEqual(workload["series"], 2_500)
@@ -32,7 +34,7 @@ class OrganisationPerformanceContractTests(unittest.TestCase):
         )
         self.assertEqual(workload["series_membership_percent"], 70)
         self.assertEqual(workload["saved_searches"], 250)
-        self.assertEqual(workload["fixture_version"], 2)
+        self.assertEqual(workload["fixture_version"], fixture_version)
 
     def assert_scenarios_have_budgets(self, budget: dict[str, Any]) -> None:
         scenarios = budget["workload"]["scenarios"]
@@ -44,10 +46,11 @@ class OrganisationPerformanceContractTests(unittest.TestCase):
         )
 
     def test_query_contract_covers_every_required_projection(self) -> None:
-        budget = load_budget("organisation-query-regression-v2.json")
+        budget = load_budget("organisation-query-regression-v3.json")
         self.assertEqual(budget["kind"], "lectern-organisation-regression-budget")
         workload = budget["workload"]
-        self.assert_common_library(workload)
+        self.assert_common_library(workload, fixture_version=3)
+        self.assertEqual(workload["identifiers_per_book"], 3)
         self.assertEqual(workload["page_size"], 128)
         self.assertEqual(workload["autocomplete_limit"], 50)
         self.assertEqual(workload["warmup_iterations"], 10)
@@ -62,6 +65,7 @@ class OrganisationPerformanceContractTests(unittest.TestCase):
                 "covering_query_plans",
                 "bounded_autocomplete",
                 "series_index_availability",
+                "identifier_metadata_round_trip",
             }.issubset(workload["correctness"])
         )
         for scenario in workload["scenarios"]:

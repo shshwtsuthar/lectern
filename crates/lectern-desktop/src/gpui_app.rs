@@ -29,11 +29,12 @@ use lectern_core::{
     AssetHealth, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId, BookRating,
     BookSummary, ImportSummary, LibraryQuery, LibraryService,
     organisation::{
-        BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, Contributor,
-        ContributorCredit, ContributorId, ContributorRole, Genre, LibraryGeneration, NameKind,
-        SelectionSnapshot, SelectionTagUsage, Series, SeriesId, SeriesIndex, SeriesMembership,
-        SeriesUsage, Tag, TagColor, TagId, TagReference, TagUsage, VirtualLibrary,
-        VirtualLibraryIcon, VirtualLibraryId, identity_key, normalize_name,
+        BookIdentifier, BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, Contributor,
+        ContributorCredit, ContributorId, ContributorRole, Genre, IdentifierType, IdentifierTypeId,
+        IdentifierTypeUsage, LibraryGeneration, NameKind, SelectionSnapshot, SelectionTagUsage,
+        Series, SeriesId, SeriesIndex, SeriesMembership, SeriesUsage, Tag, TagColor, TagId,
+        TagReference, TagUsage, VirtualLibrary, VirtualLibraryIcon, VirtualLibraryId, identity_key,
+        normalize_identifier_value, normalize_name,
     },
 };
 use lectern_device::{
@@ -438,6 +439,13 @@ struct BookDetailEditor {
     virtual_library_suggestion_generation: u64,
     virtual_library_suggestions_loading: bool,
     virtual_library_busy: bool,
+    identifier_type_input: Option<Entity<InputState>>,
+    identifier_value_input: Option<Entity<InputState>>,
+    identifier_menu_open: bool,
+    pending_identifier_type: Option<PendingIdentifierType>,
+    identifier_type_suggestions: Vec<IdentifierTypeUsage>,
+    identifier_suggestion_generation: u64,
+    identifier_suggestions_loading: bool,
     role_picker: Option<u64>,
     dirty: bool,
     operation: DetailOperation,
@@ -465,6 +473,7 @@ enum DetailErrorSection {
     Tags,
     Genres,
     VirtualLibraries,
+    Identifiers,
     Library,
 }
 
@@ -484,6 +493,12 @@ struct ContributorField {
     persisted_sort_name: String,
     name: Entity<InputState>,
     role: ContributorRole,
+}
+
+#[derive(Clone)]
+struct PendingIdentifierType {
+    existing_id: Option<IdentifierTypeId>,
+    name: String,
 }
 
 impl BookDetailEditor {
@@ -532,6 +547,13 @@ impl BookDetailEditor {
             virtual_library_suggestion_generation: 0,
             virtual_library_suggestions_loading: false,
             virtual_library_busy: false,
+            identifier_type_input: None,
+            identifier_value_input: None,
+            identifier_menu_open: false,
+            pending_identifier_type: None,
+            identifier_type_suggestions: Vec::new(),
+            identifier_suggestion_generation: 0,
+            identifier_suggestions_loading: false,
             role_picker: None,
             list_state: ListState::new(
                 detail_item_count(contributor_count),
@@ -618,6 +640,8 @@ impl BookDetailEditor {
             self.publication_date.as_ref(),
             self.tag_input.as_ref(),
             self.virtual_library_input.as_ref(),
+            self.identifier_type_input.as_ref(),
+            self.identifier_value_input.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -762,6 +786,33 @@ fn virtual_library_dialog_description(
         cx.notify();
     })
     .detach();
+    state
+}
+
+fn identifier_type_search_input(
+    window: &mut Window,
+    cx: &mut Context<LecternView>,
+) -> Entity<InputState> {
+    let state =
+        cx.new(|cx| InputState::new(window, cx).placeholder("Add or find an identifier type…"));
+    cx.subscribe(&state, |this, state, event: &InputEvent, cx| {
+        if matches!(event, InputEvent::Change) {
+            let query = state.read(cx).value().to_string();
+            this.request_detail_identifier_type_suggestions(query, cx);
+        }
+        cx.notify();
+    })
+    .detach();
+    state
+}
+
+fn identifier_value_input(
+    window: &mut Window,
+    cx: &mut Context<LecternView>,
+) -> Entity<InputState> {
+    let state = cx.new(|cx| InputState::new(window, cx).placeholder("Identifier value"));
+    cx.subscribe(&state, |_, _, _: &InputEvent, cx| cx.notify())
+        .detach();
     state
 }
 
@@ -1273,6 +1324,7 @@ impl LecternView {
         let rating_half_stars = book.rating.half_stars();
         let contributor_count = book.contributors.len();
         let tag_count = book.tags.len();
+        let identifier_count = book.identifiers.len();
         let asset_count = book.assets.len();
         let mut benchmark = self
             .benchmark
@@ -1292,6 +1344,7 @@ impl LecternView {
             rating_half_stars,
             contributor_count,
             tag_count,
+            identifier_count,
             asset_count,
         );
         cx.quit();
@@ -2740,6 +2793,202 @@ impl LecternView {
         self.open_virtual_library_dialog(name, Some(book), window, cx);
     }
 
+    fn set_identifier_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        let query = {
+            let Some(editor) = &mut self.detail_editor else {
+                return;
+            };
+            editor.identifier_menu_open = open;
+            if !open {
+                editor.pending_identifier_type = None;
+                cx.notify();
+                return;
+            }
+            editor
+                .identifier_type_input
+                .as_ref()
+                .map_or_else(String::new, |input| input.read(cx).value().to_string())
+        };
+        self.request_detail_identifier_type_suggestions(query, cx);
+    }
+
+    fn request_detail_identifier_type_suggestions(
+        &mut self,
+        query: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        if !editor.identifier_menu_open || editor.pending_identifier_type.is_some() {
+            return;
+        }
+        editor.identifier_suggestion_generation =
+            editor.identifier_suggestion_generation.wrapping_add(1);
+        let generation = editor.identifier_suggestion_generation;
+        editor.identifier_suggestions_loading = true;
+        let database_path = self.database_path.clone();
+        let load = cx.background_executor().spawn(async move {
+            let mut service =
+                SqliteLibraryService::open(&database_path).map_err(|error| error.to_string())?;
+            service
+                .autocomplete_identifier_types(query.trim(), 50)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                let Some(editor) = &mut this.detail_editor else {
+                    return;
+                };
+                if editor.identifier_suggestion_generation != generation {
+                    return;
+                }
+                editor.identifier_suggestions_loading = false;
+                match result {
+                    Ok(suggestions) => {
+                        editor.identifier_type_suggestions = suggestions;
+                        editor.error = None;
+                    }
+                    Err(error) => {
+                        editor.error = Some(error.into());
+                        editor.error_section = DetailErrorSection::Identifiers;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn select_detail_identifier_type(
+        &mut self,
+        identifier_type: &IdentifierType,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        editor.pending_identifier_type = Some(PendingIdentifierType {
+            existing_id: Some(identifier_type.id),
+            name: identifier_type.name.clone(),
+        });
+        if let Some(input) = &editor.identifier_value_input {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        editor.error = None;
+        cx.notify();
+    }
+
+    fn begin_detail_identifier_type_creation(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        match normalize_name(NameKind::IdentifierType, name) {
+            Ok(name) => {
+                editor.pending_identifier_type = Some(PendingIdentifierType {
+                    existing_id: None,
+                    name,
+                });
+                if let Some(input) = &editor.identifier_value_input {
+                    input.update(cx, |state, cx| state.set_value("", window, cx));
+                }
+                editor.error = None;
+            }
+            Err(error) => {
+                editor.error = Some(error.to_string().into());
+                editor.error_section = DetailErrorSection::Identifiers;
+            }
+        }
+        cx.notify();
+    }
+
+    fn clear_pending_identifier_type(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        editor.pending_identifier_type = None;
+        editor.error = None;
+        cx.notify();
+    }
+
+    fn create_detail_identifier(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        let Some(pending) = editor.pending_identifier_type.clone() else {
+            return;
+        };
+        let value = editor
+            .identifier_value_input
+            .as_ref()
+            .expect("rendered identifier value input is initialized")
+            .read(cx)
+            .value()
+            .to_string();
+        match editor
+            .curation
+            .add_identifier(pending.existing_id, &pending.name, &value)
+        {
+            Ok(true) => {
+                for input in [
+                    editor.identifier_type_input.as_ref(),
+                    editor.identifier_value_input.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    input.update(cx, |state, cx| state.set_value("", window, cx));
+                }
+                editor.pending_identifier_type = None;
+                editor.identifier_menu_open = false;
+                editor.dirty = true;
+                editor.error = None;
+                let item = detail_identifiers_item_index(editor.contributors.len());
+                editor.list_state.remeasure_items(item..item + 1);
+            }
+            Ok(false) => {
+                editor.error = Some(
+                    format!(
+                        "{} identifier '{}' is already assigned.",
+                        pending.name,
+                        value.trim()
+                    )
+                    .into(),
+                );
+                editor.error_section = DetailErrorSection::Identifiers;
+            }
+            Err(error) => {
+                editor.error = Some(error.into());
+                editor.error_section = DetailErrorSection::Identifiers;
+            }
+        }
+        cx.notify();
+    }
+
+    fn remove_detail_identifier(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.detail_editor else {
+            return;
+        };
+        if index >= editor.curation.identifiers.len() {
+            return;
+        }
+        editor.curation.identifiers.remove(index);
+        let item = detail_identifiers_item_index(editor.contributors.len());
+        editor.list_state.remeasure_items(item..item + 1);
+        editor.dirty = true;
+        editor.error = None;
+        cx.notify();
+    }
+
     fn save_book_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = &self.detail_editor else {
             return;
@@ -2777,6 +3026,9 @@ impl LecternView {
                     }
                     DetailErrorSection::VirtualLibraries => {
                         detail_virtual_libraries_item_index(editor.contributors.len())
+                    }
+                    DetailErrorSection::Identifiers => {
+                        detail_identifiers_item_index(editor.contributors.len())
                     }
                     DetailErrorSection::Library => {
                         detail_library_item_index(editor.contributors.len())
@@ -5912,8 +6164,12 @@ const fn detail_genres_item_index(contributor_count: usize) -> usize {
     detail_tags_item_index(contributor_count) + 1
 }
 
-const fn detail_virtual_libraries_item_index(contributor_count: usize) -> usize {
+const fn detail_identifiers_item_index(contributor_count: usize) -> usize {
     detail_genres_item_index(contributor_count) + 1
+}
+
+const fn detail_virtual_libraries_item_index(contributor_count: usize) -> usize {
+    detail_identifiers_item_index(contributor_count) + 1
 }
 
 const fn detail_library_item_index(contributor_count: usize) -> usize {
@@ -6605,6 +6861,19 @@ impl LecternView {
             if let Some(editor) = &mut self.detail_editor {
                 editor.virtual_library_input = Some(input);
             }
+        } else if item == detail_identifiers_item_index(contributor_count)
+            && (editor.identifier_type_input.is_none() || editor.identifier_value_input.is_none())
+        {
+            let type_input = identifier_type_search_input(window, cx);
+            let value_input = identifier_value_input(window, cx);
+            if disabled {
+                type_input.update(cx, |state, cx| state.set_disabled(true, cx));
+                value_input.update(cx, |state, cx| state.set_disabled(true, cx));
+            }
+            if let Some(editor) = &mut self.detail_editor {
+                editor.identifier_type_input = Some(type_input);
+                editor.identifier_value_input = Some(value_input);
+            }
         }
     }
 
@@ -6624,6 +6893,7 @@ impl LecternView {
         let tags = detail_tags_item_index(contributor_count);
         let genres = detail_genres_item_index(contributor_count);
         let virtual_libraries = detail_virtual_libraries_item_index(contributor_count);
+        let identifiers = detail_identifiers_item_index(contributor_count);
         let library = detail_library_item_index(contributor_count);
         let editing_busy = editor.operation != DetailOperation::Idle;
 
@@ -6660,6 +6930,8 @@ impl LecternView {
             detail_tags_item(editor, &theme, cx)
         } else if item == genres {
             detail_genres_item(editor, &theme, cx)
+        } else if item == identifiers {
+            detail_identifiers_item(editor, &theme, cx)
         } else if item == virtual_libraries {
             detail_virtual_libraries_item(editor, &theme, cx)
         } else if item == library {
@@ -6678,6 +6950,7 @@ impl LecternView {
             || item == tags
             || item == genres
             || item == virtual_libraries
+            || item == identifiers
             || item == library;
         let ends_section = matches!(
             item,
@@ -6687,7 +6960,8 @@ impl LecternView {
                 | DETAIL_SERIES_ITEM
         ) || item == contributor_footer
             || item == tags
-            || item == genres;
+            || item == genres
+            || item == identifiers;
         let ends_section = ends_section || item == virtual_libraries;
 
         div()
@@ -6806,6 +7080,8 @@ fn metadata_error_section(error: &str) -> DetailErrorSection {
         DetailErrorSection::Genres
     } else if error.contains("publication date") {
         DetailErrorSection::Publication
+    } else if error.contains("identifier") {
+        DetailErrorSection::Identifiers
     } else {
         DetailErrorSection::Information
     }
@@ -7445,6 +7721,238 @@ fn detail_genres_item(
         )
         .when_some(
             detail_error(editor, DetailErrorSection::Genres),
+            |content, error| content.child(detail_error_text(error, theme)),
+        )
+        .into_any_element()
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the function declares one cohesive searchable-identifier hierarchy"
+)]
+fn detail_identifiers_item(
+    editor: &BookDetailEditor,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let editing_busy = editor.operation != DetailOperation::Idle;
+    let rows = editor
+        .curation
+        .identifiers
+        .iter()
+        .enumerate()
+        .map(|(index, identifier)| {
+            div()
+                .flex()
+                .items_center()
+                .gap(theme.spacing.medium)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(theme.spacing.small)
+                        .child(
+                            div()
+                                .font_weight(theme.typography.button_weight)
+                                .child(identifier.type_name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme.surface.muted_foreground)
+                                .overflow_hidden()
+                                .child(identifier.value.clone()),
+                        ),
+                )
+                .child(
+                    Button::new(format!("identifier-{index}-remove"), "Remove")
+                        .size(ButtonSize::Small)
+                        .disabled(editing_busy)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.remove_detail_identifier(index, cx);
+                        })),
+                )
+        });
+    let menu_content = if let Some(pending) = &editor.pending_identifier_type {
+        let value = editor
+            .identifier_value_input
+            .as_ref()
+            .expect("rendered identifier value input is initialized")
+            .read(cx)
+            .value()
+            .to_string();
+        let valid_value = normalize_identifier_value(&value).is_ok();
+        div()
+            .flex()
+            .flex_col()
+            .gap(theme.spacing.medium)
+            .child(
+                div()
+                    .px(theme.spacing.medium)
+                    .py(theme.spacing.small)
+                    .pb(theme.spacing.medium)
+                    .border_b(theme.border.thin)
+                    .border_color(theme.border.muted)
+                    .text_color(theme.surface.muted_foreground)
+                    .child(if pending.existing_id.is_some() {
+                        format!("Add {} identifier", pending.name)
+                    } else {
+                        format!("Create type “{}”", pending.name)
+                    }),
+            )
+            .child(
+                div()
+                    .px(theme.spacing.medium)
+                    .flex()
+                    .flex_col()
+                    .gap(theme.spacing.small)
+                    .child(
+                        div()
+                            .font_weight(theme.typography.button_weight)
+                            .child("Assign a value"),
+                    )
+                    .child(TextInput::new(
+                        "detail-identifier-value-input",
+                        "Identifier value",
+                        editor
+                            .identifier_value_input
+                            .as_ref()
+                            .expect("rendered identifier value input is initialized"),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(theme.spacing.small)
+                            .child(
+                                Button::new("add-detail-identifier", "Add identifier")
+                                    .size(ButtonSize::Small)
+                                    .disabled(!valid_value)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.create_detail_identifier(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("change-detail-identifier-type", "Change type")
+                                    .size(ButtonSize::Small)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.clear_pending_identifier_type(cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    } else {
+        let query = editor
+            .identifier_type_input
+            .as_ref()
+            .expect("rendered identifier type input is initialized")
+            .read(cx)
+            .value()
+            .to_string();
+        let suggestions = editor
+            .identifier_type_suggestions
+            .iter()
+            .map(|usage| {
+                let identifier_type = usage.identifier_type.clone();
+                ActionListItem::new(
+                    format!("identifier-type-{}", identifier_type.id.value()),
+                    identifier_type.name.clone(),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.select_detail_identifier_type(&identifier_type, window, cx);
+                }))
+            })
+            .collect::<Vec<_>>();
+        let normalized_query = normalize_name(NameKind::IdentifierType, &query).ok();
+        let exact_match = normalized_query.as_ref().is_some_and(|query| {
+            let key = identity_key(query);
+            editor
+                .identifier_type_suggestions
+                .iter()
+                .any(|usage| identity_key(&usage.identifier_type.name) == key)
+        });
+        let create_name = normalized_query.filter(|_| !exact_match);
+        div()
+            .flex()
+            .flex_col()
+            .gap(theme.spacing.small)
+            .child(TextInput::new(
+                "detail-identifier-type-input",
+                "Add or find an identifier type",
+                editor
+                    .identifier_type_input
+                    .as_ref()
+                    .expect("rendered identifier type input is initialized"),
+            ))
+            .when(editor.identifier_suggestions_loading, |content| {
+                content.child(
+                    div()
+                        .px(theme.spacing.medium)
+                        .py(theme.spacing.small)
+                        .text_color(theme.surface.muted_foreground)
+                        .child("Finding identifier types…"),
+                )
+            })
+            .when(
+                !editor.identifier_suggestions_loading && suggestions.is_empty(),
+                |content| {
+                    content.child(
+                        div()
+                            .px(theme.spacing.medium)
+                            .py(theme.spacing.small)
+                            .text_color(theme.surface.muted_foreground)
+                            .child(if query.trim().is_empty() {
+                                "No identifier types found."
+                            } else {
+                                "No existing identifier types found."
+                            }),
+                    )
+                },
+            )
+            .when(!editor.identifier_suggestions_loading, |content| {
+                content.children(suggestions)
+            })
+            .when_some(create_name, |content, name| {
+                let action_name = name.clone();
+                content.child(
+                    ActionListItem::new(
+                        "create-detail-identifier-type",
+                        format!("+  Create new type: “{name}”"),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.begin_detail_identifier_type_creation(&action_name, window, cx);
+                    })),
+                )
+            })
+            .into_any_element()
+    };
+
+    detail_section_container("Identifiers", theme)
+        .when(editor.curation.identifiers.is_empty(), |section| {
+            section.child(
+                div()
+                    .text_color(theme.surface.muted_foreground)
+                    .child("No identifiers assigned."),
+            )
+        })
+        .children(rows)
+        .child(
+            ActionMenu::new(
+                "detail-identifier-menu",
+                Button::new("open-detail-identifier-menu", "+ Identifier")
+                    .size(ButtonSize::Small)
+                    .disabled(editing_busy),
+                menu_content,
+            )
+            .width(rems(21.))
+            .open(editor.identifier_menu_open)
+            .on_open_change(cx.listener(|this, open, _, cx| {
+                this.set_identifier_menu_open(*open, cx);
+            })),
+        )
+        .when_some(
+            detail_error(editor, DetailErrorSection::Identifiers),
             |content, error| content.child(detail_error_text(error, theme)),
         )
         .into_any_element()
@@ -8317,6 +8825,29 @@ fn benchmark_book_detail() -> Book {
         ],
         genres: vec![Genre::Classics, Genre::Fantasy, Genre::YoungAdult],
         virtual_libraries: benchmark_virtual_libraries(3, 1),
+        identifiers: vec![
+            BookIdentifier {
+                identifier_type: IdentifierType {
+                    id: IdentifierTypeId::new(1),
+                    name: "ISBN".to_owned(),
+                },
+                value: "978-0-1234-5678-9".to_owned(),
+            },
+            BookIdentifier {
+                identifier_type: IdentifierType {
+                    id: IdentifierTypeId::new(1),
+                    name: "ISBN".to_owned(),
+                },
+                value: "978-0-9876-5432-1".to_owned(),
+            },
+            BookIdentifier {
+                identifier_type: IdentifierType {
+                    id: IdentifierTypeId::new(3),
+                    name: "DOI".to_owned(),
+                },
+                value: "10.0000/lectern.benchmark".to_owned(),
+            },
+        ],
         publisher: Some("Lectern Press".to_owned()),
         publication_date: Some("2026-08-27".parse().expect("valid benchmark date")),
         language: Some("en".to_owned()),
@@ -8775,6 +9306,7 @@ impl BenchmarkRun {
         rating_half_stars: u8,
         contributor_count: usize,
         tag_count: usize,
+        identifier_count: usize,
         asset_count: usize,
     ) {
         assert_eq!(
@@ -8799,6 +9331,7 @@ impl BenchmarkRun {
                 rating_half_stars,
                 contributor_count,
                 tag_count,
+                identifier_count,
                 asset_count,
                 markers: vec![
                     "bounded_first_page",
@@ -8806,6 +9339,7 @@ impl BenchmarkRun {
                     "complete_metadata_fixture",
                     "publication_metadata_presented",
                     "half_star_rating_presented",
+                    "identifiers_presented",
                     "multiple_assets_presented",
                 ],
             },
@@ -9085,6 +9619,7 @@ struct UiBookDetailBenchmarkCorrectness {
     rating_half_stars: u8,
     contributor_count: usize,
     tag_count: usize,
+    identifier_count: usize,
     asset_count: usize,
     markers: Vec<&'static str>,
 }

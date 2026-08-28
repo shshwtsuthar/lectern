@@ -15,7 +15,7 @@ SPEC.loader.exec_module(REGRESSION)
 
 
 def checked_in_budget() -> dict:
-    with (BENCHMARKS / "organisation-query-regression-v2.json").open(
+    with (BENCHMARKS / "organisation-query-regression-v3.json").open(
         encoding="utf-8"
     ) as source:
         return json.load(source)
@@ -42,6 +42,7 @@ def valid_result() -> dict:
                 "series_memberships_series_index_book_idx",
                 "series_memberships_series_number_uidx",
                 "book_tags_tag_book_idx",
+                "book_identifiers_type_book_idx",
             )
         ],
         "scenarios": [
@@ -64,7 +65,7 @@ class OrganisationQueryRegressionTests(unittest.TestCase):
         decisions = REGRESSION.evaluate_organisation_query_result(
             valid_result(), budget
         )
-        self.assertEqual(len(decisions), 8)
+        self.assertEqual(len(decisions), 9)
         self.assertTrue(all(decision["passed"] for decision in decisions))
 
     def test_missing_plan_or_bad_sample_is_rejected(self) -> None:

@@ -42,6 +42,10 @@ stable_id!(
 stable_id!(SeriesId, "Stable identifier for one normalized series.");
 stable_id!(TagId, "Stable identifier for one normalized tag.");
 stable_id!(
+    IdentifierTypeId,
+    "Stable identifier for one normalized book-identifier type."
+);
+stable_id!(
     VirtualLibraryId,
     "Stable identifier for one user-created virtual library."
 );
@@ -59,6 +63,8 @@ pub enum NameKind {
     Series,
     /// Tag display name.
     Tag,
+    /// Book-identifier type display name.
+    IdentifierType,
     /// Saved-search display name.
     SavedSearch,
     /// Virtual-library display name.
@@ -71,7 +77,7 @@ impl NameKind {
     pub const fn maximum_scalars(self) -> usize {
         match self {
             Self::Contributor | Self::Series => 256,
-            Self::Tag => 64,
+            Self::Tag | Self::IdentifierType => 64,
             Self::SavedSearch | Self::VirtualLibrary => 80,
         }
     }
@@ -83,6 +89,7 @@ impl fmt::Display for NameKind {
             Self::Contributor => "contributor name",
             Self::Series => "series name",
             Self::Tag => "tag name",
+            Self::IdentifierType => "identifier type",
             Self::SavedSearch => "saved-search name",
             Self::VirtualLibrary => "virtual-library name",
         })
@@ -627,6 +634,38 @@ pub struct VirtualLibraryMembershipResult {
     pub changed: bool,
 }
 
+/// Default identifier types stored in every Lectern library.
+pub const DEFAULT_IDENTIFIER_TYPES: [&str; 10] = [
+    "ISBN",
+    "ASIN",
+    "DOI",
+    "Google Books",
+    "Goodreads",
+    "Open Library",
+    "OCLC",
+    "LCCN",
+    "ISSN",
+    "arXiv",
+];
+
+/// One stable normalized identifier type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdentifierType {
+    /// Stable identifier-type identity.
+    pub id: IdentifierTypeId,
+    /// Display-ready type name.
+    pub name: String,
+}
+
+/// One identifier assigned to a logical book.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BookIdentifier {
+    /// Stable or newly resolved identifier type.
+    pub identifier_type: IdentifierType,
+    /// Display-ready identifier value.
+    pub value: String,
+}
+
 /// Restrained, named colors available to library tags.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum TagColor {
@@ -756,6 +795,24 @@ pub enum TagReference {
     },
 }
 
+/// Existing or not-yet-persisted identifier type selected in a book edit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdentifierTypeReference {
+    /// Reuse one stable library identifier type.
+    Existing(IdentifierTypeId),
+    /// Create or reuse the identifier type identified by this name.
+    New(String),
+}
+
+/// One identifier submitted by the metadata editor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BookIdentifierEdit {
+    /// Existing or new identifier-type identity.
+    pub identifier_type: IdentifierTypeReference,
+    /// Identifier value, preserved apart from surrounding whitespace.
+    pub value: String,
+}
+
 /// Complete metadata-editor payload for one logical book.
 ///
 /// Assets are intentionally absent: curation saves cannot detach, relink, replace, or mutate a
@@ -784,6 +841,8 @@ pub struct BookEdit {
     pub tags: Vec<TagReference>,
     /// Unordered set selected from Lectern's fixed genre catalog.
     pub genres: Vec<Genre>,
+    /// Identifiers in stable type-and-value display order.
+    pub identifiers: Vec<BookIdentifierEdit>,
 }
 
 /// Contributor autocomplete or vocabulary row with a global usage count.
@@ -813,6 +872,47 @@ pub struct TagUsage {
     pub books: u64,
     /// Number of saved searches that include or exclude the tag.
     pub saved_searches: u64,
+}
+
+/// Identifier-type autocomplete row with a global assignment count.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdentifierTypeUsage {
+    /// Stable identifier-type entity.
+    pub identifier_type: IdentifierType,
+    /// Number of book identifiers using this type.
+    pub identifiers: u64,
+}
+
+/// Maximum Unicode scalar values accepted in a book-identifier value.
+pub const IDENTIFIER_VALUE_MAXIMUM_SCALARS: usize = 512;
+
+/// Validates and trims a book-identifier value without changing its internal representation.
+///
+/// # Errors
+///
+/// Returns an error when the value is empty, contains a control character, or exceeds the
+/// identifier-value limit.
+pub fn normalize_identifier_value(input: &str) -> Result<String, String> {
+    let value = input.trim();
+    if value.is_empty() {
+        return Err("identifier value must not be empty".into());
+    }
+    if let Some((scalar_index, _)) = value
+        .chars()
+        .enumerate()
+        .find(|(_, character)| character.is_control())
+    {
+        return Err(format!(
+            "identifier value contains a control character at position {scalar_index}"
+        ));
+    }
+    let scalars = value.chars().count();
+    if scalars > IDENTIFIER_VALUE_MAXIMUM_SCALARS {
+        return Err(format!(
+            "identifier value contains {scalars} Unicode scalar values; the maximum is {IDENTIFIER_VALUE_MAXIMUM_SCALARS}"
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 /// Connection-visible library state used to invalidate query-backed selections.
@@ -1682,7 +1782,8 @@ mod tests {
     use super::{
         ContributorFacet, ContributorId, ExactFacets, FacetError, NameKind, NameValidationError,
         SearchClause, SearchExpression, SearchParseErrorKind, SeriesId, SeriesIndex,
-        SeriesIndexError, TagId, TextMatch, identity_key, normalize_name,
+        SeriesIndexError, TagId, TextMatch, identity_key, normalize_identifier_value,
+        normalize_name,
     };
     use crate::{AssetHealth, BookFormat};
 
@@ -1758,6 +1859,17 @@ mod tests {
             assert_eq!(super::VirtualLibraryIcon::parse(icon.as_str()), Some(icon));
             assert!(!icon.glyph().is_empty());
         }
+    }
+
+    #[test]
+    fn identifier_values_preserve_content_and_reject_unsafe_bounds() {
+        assert_eq!(
+            normalize_identifier_value("  978-0-1234-5678-9  ").unwrap(),
+            "978-0-1234-5678-9"
+        );
+        assert!(normalize_identifier_value(" \t ").is_err());
+        assert!(normalize_identifier_value("doi\nvalue").is_err());
+        assert!(normalize_identifier_value(&"x".repeat(513)).is_err());
     }
 
     #[test]

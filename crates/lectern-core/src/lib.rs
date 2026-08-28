@@ -680,6 +680,8 @@ pub struct Book {
     pub genres: Vec<organisation::Genre>,
     /// Virtual libraries containing this canonical book, in display-name order.
     pub virtual_libraries: Vec<organisation::VirtualLibrary>,
+    /// Authoritative book identifiers in type-and-value display order.
+    pub identifiers: Vec<organisation::BookIdentifier>,
     /// Optional publisher.
     pub publisher: Option<String>,
     /// Optional calendar publication date.
@@ -900,6 +902,13 @@ pub trait LibraryService {
         library: organisation::VirtualLibraryId,
         included: bool,
     ) -> Result<organisation::VirtualLibraryMembershipResult, Self::Error>;
+
+    /// Returns bounded identifier-type suggestions, including stored defaults.
+    fn autocomplete_identifier_types(
+        &mut self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<organisation::IdentifierTypeUsage>, Self::Error>;
 
     /// Returns one bounded contributor vocabulary page with global usage counts.
     fn search_contributors(

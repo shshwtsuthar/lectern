@@ -263,7 +263,7 @@ def seed_command(
         command += ["--bin", "organisation-query-benchmark", "--", "seed"]
     else:
         command += ["--", "seed"]
-    return command + [
+    arguments = command + [
         "--database",
         str(database),
         "--output",
@@ -275,6 +275,15 @@ def seed_command(
         "--cover-every",
         str(workload["cover_every"]),
     ]
+    if "fixture_version" in workload and mode in (
+        "organisation-query",
+        "organisation-vocabulary",
+        "bulk-tags",
+        "bulk-remove",
+        "saved-searches",
+    ):
+        arguments += ["--fixture-version", str(workload["fixture_version"])]
+    return arguments
 
 
 def workload_command(
@@ -489,8 +498,13 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 raise RegressionError(
                     "organisation migration must use fixture version three"
                 )
+        if query_mode == "organisation-query" and positive_or_zero_field(
+            workload, "fixture_version", "budget.workload"
+        ) != 3:
+            raise RegressionError(
+                "identifier-aware organisation query workload must use fixture version three"
+            )
         if query_mode in (
-            "organisation-query",
             "organisation-vocabulary",
             "bulk-tags",
             "bulk-remove",
@@ -515,6 +529,12 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                     raise RegressionError(
                         f"organisation workload {field} must be greater than zero"
                     )
+            if query_mode == "organisation-query" and positive_or_zero_field(
+                workload, "identifiers_per_book", "budget.workload"
+            ) == 0:
+                raise RegressionError(
+                    "organisation workload identifiers_per_book must be greater than zero"
+                )
         if query_mode == "organisation-vocabulary":
             if positive_or_zero_field(
                 workload, "matching_books", "budget.workload"
@@ -1472,8 +1492,8 @@ def evaluate_migration_result(
         raise RegressionError("migration library count does not match the budget")
     if positive_or_zero_field(result, "source_schema_version", context) != 5:
         raise RegressionError("migration source schema version is not five")
-    if positive_or_zero_field(result, "final_schema_version", context) != 11:
-        raise RegressionError("migration did not reach schema version eleven")
+    if positive_or_zero_field(result, "final_schema_version", context) != 12:
+        raise RegressionError("migration did not reach schema version twelve")
     warmup = positive_or_zero_field(result, "warmup_iterations", context)
     measured = positive_or_zero_field(result, "measured_iterations", context)
     if warmup != workload["warmup_iterations"] or measured != workload["measured_iterations"]:
@@ -1485,6 +1505,7 @@ def evaluate_migration_result(
         "initial_tags_and_saved_searches_empty",
         "schema_invariants_valid",
         "canonical_metadata_defaults_valid",
+        "default_identifier_types_valid",
         "duplicate_series_numbers_repaired",
         "failed_migration_rolled_back",
     ):
@@ -1564,6 +1585,7 @@ def evaluate_organisation_query_result(
         "series_memberships_series_index_book_idx",
         "series_memberships_series_number_uidx",
         "book_tags_tag_book_idx",
+        "book_identifiers_type_book_idx",
     }
     if not isinstance(plans, list) or {
         plan.get("required_index") for plan in plans if isinstance(plan, dict)
@@ -2443,6 +2465,7 @@ def expected_ui_book_detail_correctness(workload: dict[str, Any]) -> dict[str, A
         "rating_half_stars": 7,
         "contributor_count": 3,
         "tag_count": 2,
+        "identifier_count": 3,
         "asset_count": 2,
         "markers": [
             "bounded_first_page",
@@ -2450,6 +2473,7 @@ def expected_ui_book_detail_correctness(workload: dict[str, Any]) -> dict[str, A
             "complete_metadata_fixture",
             "publication_metadata_presented",
             "half_star_rating_presented",
+            "identifiers_presented",
             "multiple_assets_presented",
         ],
     }
@@ -3204,6 +3228,8 @@ def validate_organisation_query_seed_result(
         "tags_per_book": workload["tags_per_book"],
         "saved_searches": workload["saved_searches"],
     }
+    if "identifiers_per_book" in workload:
+        expected["identifiers_per_book"] = workload["identifiers_per_book"]
     for field, value in expected.items():
         if positive_or_zero_field(result, field, context) != value:
             raise RegressionError(f"organisation query seed {field} does not match the budget")

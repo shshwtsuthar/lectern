@@ -21,6 +21,7 @@
       "empty_initial_tags_and_saved_searches",
       "schema_invariants",
       "canonical_metadata_defaults",
+      "default_identifier_types",
       "duplicate_series_numbers_repaired",
       "failed_migration_preserves_version_five_database"
     ]

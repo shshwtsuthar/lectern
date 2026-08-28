@@ -293,6 +293,7 @@ fn edit_with_genres(book: &Book, genres: Vec<Genre>) -> BookEdit {
             .map(|tag| TagReference::Existing(tag.id))
             .collect(),
         genres,
+        identifiers: Vec::new(),
     }
 }
 
