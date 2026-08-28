@@ -1,7 +1,7 @@
 //! Lectern's native GPUI desktop application.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -23,10 +23,10 @@ use lectern_core::{
     AssetHealth, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId, BookRating,
     BookSummary, ImportSummary, LibraryQuery, LibraryService,
     organisation::{
-        BookSelection, BulkRemovalResult, Contributor, ContributorCredit, ContributorId,
-        ContributorRole, LibraryGeneration, NameKind, SelectionSnapshot, Series, SeriesId,
-        SeriesIndex, SeriesMembership, SeriesUsage, Tag, TagColor, TagId, TagUsage, identity_key,
-        normalize_name,
+        BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, Contributor,
+        ContributorCredit, ContributorId, ContributorRole, LibraryGeneration, NameKind,
+        SelectionSnapshot, SelectionTagUsage, Series, SeriesId, SeriesIndex, SeriesMembership,
+        SeriesUsage, Tag, TagColor, TagId, TagReference, TagUsage, identity_key, normalize_name,
     },
 };
 use lectern_service::{LibraryServiceError, SqliteLibraryService, default_database_path};
@@ -51,6 +51,8 @@ const TOP_BAR_HEIGHT_PX: f32 = 48.0;
 const SELECTION_BAR_HEIGHT_PX: f32 = 48.0;
 const BOTTOM_BAR_HEIGHT_PX: f32 = 24.0;
 const BULK_REMOVAL_DIALOG_WIDTH_PX: f32 = 460.0;
+const BULK_TAG_PANEL_WIDTH_PX: f32 = 420.0;
+const BULK_TAG_PAGE_SIZE: u32 = 100;
 const BOOK_DETAIL_PANEL_WIDTH_PX: f32 = 420.0;
 const THEME_DIALOG_WIDTH_PX: f32 = 400.0;
 const LIBRARY_PAGE_SIZE: u32 = 128;
@@ -72,21 +74,35 @@ gpui::actions!(
 /// Panics if GPUI cannot open the application window or benchmark output cannot be serialized and
 /// written.
 pub fn run(main_entry: Instant) {
-    let benchmark = env::var_os(BENCHMARK_OUTPUT_ENV).map(|path| BenchmarkRun {
-        output: PathBuf::from(path),
-        workload: match env::var(BENCHMARK_WORKLOAD_ENV).as_deref() {
+    let benchmark = env::var_os(BENCHMARK_OUTPUT_ENV).map(|path| {
+        let workload = match env::var(BENCHMARK_WORKLOAD_ENV).as_deref() {
             Ok("library-selection") => BenchmarkWorkload::LibrarySelection,
             Ok("book-detail") => BenchmarkWorkload::BookDetail,
+            Ok("bulk-tags") => BenchmarkWorkload::BulkTags,
             Ok(workload) => panic!("unsupported GPUI benchmark workload {workload:?}"),
             Err(env::VarError::NotPresent) => BenchmarkWorkload::EmptyLibraryAddBooks,
             Err(error) => panic!("read GPUI benchmark workload: {error}"),
-        },
-        main_entry,
-        initial_render: None,
-        action_started: None,
-        selection_painted: None,
-        detail_painted: None,
-        confirmation_started: None,
+        };
+        BenchmarkRun {
+            output: PathBuf::from(path),
+            workload,
+            main_entry,
+            initial_render: None,
+            action_started: None,
+            selection_painted: None,
+            detail_painted: None,
+            bulk_tag_config: (workload == BenchmarkWorkload::BulkTags)
+                .then(BulkTagBenchmarkConfig::from_environment),
+            bulk_tag_library_books: None,
+            bulk_tag_panels_painted: 0,
+            bulk_tag_completed: 0,
+            bulk_tag_forward_operations: 0,
+            bulk_tag_inverse_operations: 0,
+            bulk_tag_selection_samples_ns: Vec::new(),
+            bulk_tag_completion_samples_ns: Vec::new(),
+            bulk_tag_completion_started: None,
+            confirmation_started: None,
+        }
     });
 
     application()
@@ -140,6 +156,7 @@ struct LecternView {
     selection: GridSelection,
     selection_generation: u64,
     selection_pending: Option<PendingSelection>,
+    bulk_tags: Option<BulkTagEditor>,
     detail_editor: Option<BookDetailEditor>,
     detail_loading: Option<BookId>,
     removal_confirmation: Option<BulkRemovalConfirmation>,
@@ -172,6 +189,45 @@ impl Default for AppearanceSettings {
 struct PersistedAppearance {
     mode: String,
     accent: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BulkTagIntent {
+    Add,
+    Remove,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BulkTagOperation {
+    #[default]
+    Idle,
+    LoadingPage,
+    Applying,
+}
+
+#[derive(Clone)]
+struct PendingBulkTag {
+    name: String,
+    color: TagColor,
+}
+
+struct BulkTagEditor {
+    selection: BookSelection,
+    selected_books: u64,
+    input: Entity<InputState>,
+    page_offset: u64,
+    page: Vec<SelectionTagUsage>,
+    has_next_page: bool,
+    page_generation: u64,
+    intents: HashMap<TagId, BulkTagIntent>,
+    queued_tags: HashMap<TagId, TagUsage>,
+    new_tags: HashMap<String, PendingBulkTag>,
+    creation_name: Option<String>,
+    suggestions: Vec<TagUsage>,
+    suggestion_generation: u64,
+    suggestions_loading: bool,
+    operation: BulkTagOperation,
+    error: Option<SharedString>,
 }
 
 #[allow(
@@ -448,6 +504,19 @@ fn tag_search_input(window: &mut Window, cx: &mut Context<LecternView>) -> Entit
     state
 }
 
+fn bulk_tag_search_input(window: &mut Window, cx: &mut Context<LecternView>) -> Entity<InputState> {
+    let state = cx.new(|cx| InputState::new(window, cx).placeholder("Find or create a tag…"));
+    cx.subscribe(&state, |this, state, event: &InputEvent, cx| {
+        if matches!(event, InputEvent::Change) {
+            let query = state.read(cx).value().to_string();
+            this.request_bulk_tag_suggestions(query, cx);
+        }
+        cx.notify();
+    })
+    .detach();
+    state
+}
+
 fn series_search_input(window: &mut Window, cx: &mut Context<LecternView>) -> Entity<InputState> {
     let state = cx.new(|cx| InputState::new(window, cx).placeholder("Add or find a series…"));
     cx.subscribe(&state, |this, state, event: &InputEvent, cx| {
@@ -531,7 +600,10 @@ impl LecternView {
         database_path: PathBuf,
         appearance: AppearanceSettings,
     ) -> Self {
-        let library_state = if benchmark.is_some() {
+        let live_bulk_benchmark = benchmark
+            .as_ref()
+            .is_some_and(|benchmark| benchmark.workload == BenchmarkWorkload::BulkTags);
+        let library_state = if benchmark.is_some() && !live_bulk_benchmark {
             LibraryState::Ready
         } else {
             LibraryState::Loading
@@ -555,6 +627,7 @@ impl LecternView {
             selection: GridSelection::default(),
             selection_generation: 0,
             selection_pending: None,
+            bulk_tags: None,
             detail_editor: None,
             detail_loading: None,
             removal_confirmation: None,
@@ -578,6 +651,7 @@ impl LecternView {
                     self.start_benchmark_selection(window, cx);
                 }
                 BenchmarkWorkload::BookDetail => self.start_benchmark_book_detail(window, cx),
+                BenchmarkWorkload::BulkTags => self.start_benchmark_bulk_tags(window, cx),
             }
             return;
         }
@@ -623,6 +697,221 @@ impl LecternView {
         benchmark.confirmation_started = Some(Instant::now());
         cx.notify();
         cx.on_next_frame(window, Self::benchmark_confirmation_presented);
+    }
+
+    fn start_benchmark_bulk_tags(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = LibraryQuery {
+            search: "language:fr".to_owned(),
+            ..LibraryQuery::default()
+        };
+        self.query = query.clone();
+        self.library_state = LibraryState::Loading;
+        let database_path = self.database_path.clone();
+        let load = cx.background_executor().spawn(async move {
+            load_bulk_tag_benchmark_library(&database_path, &query)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = load.await;
+            this.update_in(cx, |this, window, cx| {
+                let (library_books, snapshot) = result
+                    .unwrap_or_else(|error| panic!("load bulk-tag benchmark library: {error}"));
+                let config = this
+                    .benchmark
+                    .as_ref()
+                    .and_then(|benchmark| benchmark.bulk_tag_config)
+                    .expect("bulk-tag benchmark configuration is present");
+                assert_eq!(library_books, config.library_books);
+                assert_eq!(snapshot.total, config.matching_books);
+                let benchmark = this
+                    .benchmark
+                    .as_mut()
+                    .expect("bulk-tag benchmark state is present");
+                benchmark.bulk_tag_library_books = Some(library_books);
+                this.apply_snapshot(snapshot);
+                this.library_state = LibraryState::Ready;
+                this.status = None;
+                cx.notify();
+                cx.on_next_frame(window, Self::benchmark_bulk_query_presented);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn benchmark_bulk_query_presented(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let config = self
+            .benchmark
+            .as_ref()
+            .and_then(|benchmark| benchmark.bulk_tag_config)
+            .expect("bulk-tag benchmark configuration is present");
+        assert_eq!(self.library_total, config.matching_books);
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.selection_pending = Some(PendingSelection::AllMatching);
+        self.benchmark
+            .as_mut()
+            .expect("bulk-tag benchmark state is present")
+            .action_started = Some(Instant::now());
+        cx.notify();
+        cx.on_next_frame(window, Self::benchmark_bulk_selection_busy_presented);
+    }
+
+    fn benchmark_bulk_selection_busy_presented(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(matches!(
+            self.selection_pending,
+            Some(PendingSelection::AllMatching)
+        ));
+        let benchmark = self
+            .benchmark
+            .as_mut()
+            .expect("bulk-tag benchmark state is present");
+        let selection_painted = benchmark
+            .action_started
+            .expect("bulk selection action started")
+            .elapsed();
+        if benchmark.bulk_tag_completed
+            >= benchmark
+                .bulk_tag_config
+                .expect("bulk-tag benchmark configuration is present")
+                .warmup_iterations
+        {
+            benchmark
+                .bulk_tag_selection_samples_ns
+                .push(duration_ns(selection_painted));
+        }
+        let database_path = self.database_path.clone();
+        let query = self.query.clone();
+        let resolved_query = query.clone();
+        let resolve = cx.background_executor().spawn(async move {
+            resolve_bulk_tag_benchmark_selection(&database_path, &query)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = resolve.await;
+            this.update_in(cx, |this, window, cx| {
+                let (snapshot, page) = result.unwrap_or_else(|error| {
+                    panic!("resolve bulk-tag benchmark selection: {error}")
+                });
+                let config = this
+                    .benchmark
+                    .as_ref()
+                    .and_then(|benchmark| benchmark.bulk_tag_config)
+                    .expect("bulk-tag benchmark configuration is present");
+                assert_eq!(snapshot.matching_books, config.matching_books);
+                this.selection_pending = None;
+                this.selection
+                    .install_all_matching(resolved_query, snapshot);
+                let selection = this
+                    .selection
+                    .descriptor()
+                    .expect("bulk benchmark selection descriptor is installed");
+                this.bulk_tags = Some(BulkTagEditor {
+                    selection,
+                    selected_books: this.selection.selected_count(),
+                    input: bulk_tag_search_input(window, cx),
+                    page_offset: 0,
+                    has_next_page: page.len()
+                        == usize::try_from(BULK_TAG_PAGE_SIZE)
+                            .expect("bulk tag page size fits usize"),
+                    page,
+                    page_generation: 0,
+                    intents: HashMap::new(),
+                    queued_tags: HashMap::new(),
+                    new_tags: HashMap::new(),
+                    creation_name: None,
+                    suggestions: Vec::new(),
+                    suggestion_generation: 0,
+                    suggestions_loading: false,
+                    operation: BulkTagOperation::Idle,
+                    error: None,
+                });
+                cx.notify();
+                cx.on_next_frame(window, Self::benchmark_bulk_panel_presented);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn benchmark_bulk_panel_presented(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let benchmark = self
+            .benchmark
+            .as_ref()
+            .expect("bulk-tag benchmark state is present");
+        let config = benchmark
+            .bulk_tag_config
+            .expect("bulk-tag benchmark configuration is present");
+        let forward = benchmark.bulk_tag_completed.is_multiple_of(2);
+        let edit = if forward {
+            BulkTagEdit {
+                add: vec![
+                    TagReference::Existing(config.added_a),
+                    TagReference::Existing(config.added_b),
+                ],
+                remove: vec![config.baseline],
+            }
+        } else {
+            BulkTagEdit {
+                add: vec![TagReference::Existing(config.baseline)],
+                remove: vec![config.added_a, config.added_b],
+            }
+        };
+        self.benchmark
+            .as_mut()
+            .expect("bulk-tag benchmark state is present")
+            .bulk_tag_panels_painted += 1;
+        self.dispatch_bulk_tag_edit(edit, window, cx);
+    }
+
+    fn benchmark_bulk_completion_presented(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let finished = {
+            let benchmark = self
+                .benchmark
+                .as_mut()
+                .expect("bulk-tag benchmark state is present");
+            let config = benchmark
+                .bulk_tag_config
+                .expect("bulk-tag benchmark configuration is present");
+            let completion_painted = benchmark
+                .bulk_tag_completion_started
+                .take()
+                .expect("bulk-tag completion was observed")
+                .elapsed();
+            if benchmark.bulk_tag_completed >= config.warmup_iterations {
+                benchmark
+                    .bulk_tag_completion_samples_ns
+                    .push(duration_ns(completion_painted));
+            }
+            benchmark.bulk_tag_completed += 1;
+            benchmark.bulk_tag_completed == config.warmup_iterations + config.measured_iterations
+        };
+
+        if finished {
+            self.benchmark
+                .take()
+                .expect("bulk-tag benchmark state is present")
+                .finish_bulk_tags(
+                    self.library_total,
+                    self.books.len(),
+                    self.selection.selected_count() == 0,
+                    self.bulk_tags.is_none(),
+                );
+            cx.quit();
+        } else {
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(1))
+                    .await;
+                _ = this.update_in(cx, |this, window, cx| {
+                    this.benchmark_bulk_query_presented(window, cx);
+                });
+            })
+            .detach();
+        }
     }
 
     fn start_benchmark_book_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -716,7 +1005,11 @@ impl LecternView {
     }
 
     fn start_add_books(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.removing || self.selection_pending.is_some() {
+        if self.busy
+            || self.removing
+            || self.selection_pending.is_some()
+            || self.bulk_tags.is_some()
+        {
             return;
         }
         self.busy = true;
@@ -816,7 +1109,7 @@ impl LecternView {
     }
 
     fn begin_selection(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.removing {
+        if self.busy || self.removing || self.bulk_tags.is_some() {
             return;
         }
         self.selection.begin_explicit();
@@ -887,7 +1180,10 @@ impl LecternView {
     }
 
     fn clear_selection_action(&mut self, cx: &mut Context<Self>) {
-        if self.removing || (!self.selection.is_active() && self.selection_pending.is_none()) {
+        if self.removing
+            || self.bulk_tags.is_some()
+            || (!self.selection.is_active() && self.selection_pending.is_none())
+        {
             return;
         }
         self.clear_selection();
@@ -896,7 +1192,11 @@ impl LecternView {
     }
 
     fn toggle_book(&mut self, id: BookId, index: usize, cx: &mut Context<Self>) {
-        if self.busy || self.removing || self.selection_pending.is_some() {
+        if self.busy
+            || self.removing
+            || self.selection_pending.is_some()
+            || self.bulk_tags.is_some()
+        {
             return;
         }
         self.selection_generation = self.selection_generation.wrapping_add(1);
@@ -923,7 +1223,7 @@ impl LecternView {
     }
 
     fn open_book_detail(&mut self, id: BookId, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.removing || self.detail_loading.is_some() {
+        if self.busy || self.removing || self.detail_loading.is_some() || self.bulk_tags.is_some() {
             return;
         }
         if let Some(editor) = &self.detail_editor {
@@ -1827,7 +2127,11 @@ impl LecternView {
     }
 
     fn select_range_to(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.removing || self.selection_pending.is_some() {
+        if self.busy
+            || self.removing
+            || self.selection_pending.is_some()
+            || self.bulk_tags.is_some()
+        {
             return;
         }
         let Some(anchor) = self.selection.anchor else {
@@ -1883,6 +2187,7 @@ impl LecternView {
             || self.library_total == 0
             || self.selection_pending.is_some()
             || self.selection.is_every_matching()
+            || self.bulk_tags.is_some()
         {
             return;
         }
@@ -1925,8 +2230,365 @@ impl LecternView {
         .detach();
     }
 
+    fn request_bulk_tags(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy
+            || self.removing
+            || self.selection_pending.is_some()
+            || self.bulk_tags.is_some()
+        {
+            return;
+        }
+        if self
+            .detail_editor
+            .as_ref()
+            .is_some_and(|editor| editor.dirty)
+        {
+            self.status = Some(
+                "Save or reset the current Book details before editing tags in bulk."
+                    .to_owned()
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(selection) = self.selection.descriptor() else {
+            return;
+        };
+        let selected_books = self.selection.selected_count();
+        if selected_books == 0 {
+            return;
+        }
+        self.detail_editor = None;
+        self.detail_loading = None;
+        self.bulk_tags = Some(BulkTagEditor {
+            selection,
+            selected_books,
+            input: bulk_tag_search_input(window, cx),
+            page_offset: 0,
+            page: Vec::new(),
+            has_next_page: false,
+            page_generation: 0,
+            intents: HashMap::new(),
+            queued_tags: HashMap::new(),
+            new_tags: HashMap::new(),
+            creation_name: None,
+            suggestions: Vec::new(),
+            suggestion_generation: 0,
+            suggestions_loading: false,
+            operation: BulkTagOperation::Idle,
+            error: None,
+        });
+        self.load_bulk_tag_page(0, cx);
+    }
+
+    fn close_bulk_tags(&mut self, cx: &mut Context<Self>) {
+        if self
+            .bulk_tags
+            .as_ref()
+            .is_some_and(|editor| editor.operation == BulkTagOperation::Applying)
+        {
+            return;
+        }
+        self.bulk_tags = None;
+        cx.notify();
+    }
+
+    fn load_bulk_tag_page(&mut self, offset: u64, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.bulk_tags else {
+            return;
+        };
+        if editor.operation == BulkTagOperation::Applying {
+            return;
+        }
+        editor.page_generation = editor.page_generation.wrapping_add(1);
+        let generation = editor.page_generation;
+        let selection = editor.selection.clone();
+        editor.operation = BulkTagOperation::LoadingPage;
+        editor.error = None;
+        let database_path = self.database_path.clone();
+        let load = cx.background_executor().spawn(async move {
+            let mut service =
+                SqliteLibraryService::open(&database_path).map_err(|error| error.to_string())?;
+            service
+                .selection_tag_usage(&selection, offset, BULK_TAG_PAGE_SIZE)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                let Some(editor) = &mut this.bulk_tags else {
+                    return;
+                };
+                if editor.page_generation != generation {
+                    return;
+                }
+                editor.operation = BulkTagOperation::Idle;
+                match result {
+                    Ok(page) => {
+                        editor.has_next_page = page.len()
+                            == usize::try_from(BULK_TAG_PAGE_SIZE)
+                                .expect("bulk tag page size fits usize");
+                        editor.page_offset = offset;
+                        editor.page = page;
+                        editor.error = None;
+                    }
+                    Err(error) => {
+                        editor.page.clear();
+                        editor.has_next_page = false;
+                        editor.error = Some(error.into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn request_bulk_tag_suggestions(&mut self, query: String, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.bulk_tags else {
+            return;
+        };
+        if editor.operation == BulkTagOperation::Applying {
+            return;
+        }
+        editor.suggestion_generation = editor.suggestion_generation.wrapping_add(1);
+        let generation = editor.suggestion_generation;
+        editor.suggestions_loading = true;
+        editor.creation_name = None;
+        let mut selected = editor
+            .page
+            .iter()
+            .map(|usage| usage.usage.tag.id)
+            .chain(editor.queued_tags.keys().copied())
+            .collect::<Vec<_>>();
+        selected.sort_unstable();
+        selected.dedup();
+        let database_path = self.database_path.clone();
+        let load = cx.background_executor().spawn(async move {
+            let mut service =
+                SqliteLibraryService::open(&database_path).map_err(|error| error.to_string())?;
+            service
+                .autocomplete_tags(query.trim(), &selected, 50)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                let Some(editor) = &mut this.bulk_tags else {
+                    return;
+                };
+                if editor.suggestion_generation != generation {
+                    return;
+                }
+                editor.suggestions_loading = false;
+                match result {
+                    Ok(suggestions) => {
+                        editor.suggestions = suggestions;
+                        editor.error = None;
+                    }
+                    Err(error) => editor.error = Some(error.into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn queue_existing_bulk_tag(
+        &mut self,
+        usage: &TagUsage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = &mut self.bulk_tags else {
+            return;
+        };
+        if editor.operation == BulkTagOperation::Applying {
+            return;
+        }
+        editor.queued_tags.insert(usage.tag.id, usage.clone());
+        editor.intents.insert(usage.tag.id, BulkTagIntent::Add);
+        editor.creation_name = None;
+        editor.suggestions.clear();
+        editor
+            .input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    fn begin_bulk_tag_creation(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.bulk_tags else {
+            return;
+        };
+        match normalize_name(NameKind::Tag, name) {
+            Ok(name) => {
+                editor.creation_name = Some(name);
+                editor.error = None;
+            }
+            Err(error) => editor.error = Some(error.to_string().into()),
+        }
+        cx.notify();
+    }
+
+    fn queue_new_bulk_tag(&mut self, color: TagColor, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.bulk_tags else {
+            return;
+        };
+        if editor.operation == BulkTagOperation::Applying {
+            return;
+        }
+        let Some(name) = editor.creation_name.take() else {
+            return;
+        };
+        editor
+            .new_tags
+            .insert(identity_key(&name), PendingBulkTag { name, color });
+        editor.suggestions.clear();
+        editor
+            .input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    fn set_bulk_tag_intent(
+        &mut self,
+        tag: TagId,
+        intent: Option<BulkTagIntent>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = &mut self.bulk_tags else {
+            return;
+        };
+        if editor.operation == BulkTagOperation::Applying {
+            return;
+        }
+        if let Some(intent) = intent {
+            editor.intents.insert(tag, intent);
+        } else {
+            editor.intents.remove(&tag);
+        }
+        editor.error = None;
+        cx.notify();
+    }
+
+    fn remove_new_bulk_tag(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.bulk_tags else {
+            return;
+        };
+        if editor.operation != BulkTagOperation::Applying {
+            editor.new_tags.remove(key);
+            editor.error = None;
+            cx.notify();
+        }
+    }
+
+    fn apply_bulk_tag_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &self.bulk_tags else {
+            return;
+        };
+        if editor.operation != BulkTagOperation::Idle {
+            return;
+        }
+        let edit = build_bulk_tag_edit(&editor.intents, &editor.new_tags);
+        if edit.add.is_empty() && edit.remove.is_empty() {
+            return;
+        }
+        self.dispatch_bulk_tag_edit(edit, window, cx);
+    }
+
+    fn dispatch_bulk_tag_edit(
+        &mut self,
+        edit: BulkTagEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = &mut self.bulk_tags else {
+            return;
+        };
+        if editor.operation != BulkTagOperation::Idle {
+            return;
+        }
+        let selection = editor.selection.clone();
+        editor.operation = BulkTagOperation::Applying;
+        editor.error = None;
+        editor
+            .input
+            .update(cx, |state, cx| state.set_disabled(true, cx));
+        self.status = Some("Applying tag changes…".into());
+        cx.notify();
+        let database_path = self.database_path.clone();
+        let query = self.query.clone();
+        let apply = cx.background_executor().spawn(async move {
+            apply_bulk_tags_and_load_library(&database_path, &selection, &edit, &query)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = apply.await;
+            this.update_in(cx, |this, window, cx| {
+                let Some(editor) = &mut this.bulk_tags else {
+                    return;
+                };
+                editor.operation = BulkTagOperation::Idle;
+                match result {
+                    Ok(completion) => {
+                        if let Some(benchmark) = &mut this.benchmark
+                            && benchmark.workload == BenchmarkWorkload::BulkTags
+                        {
+                            let config = benchmark
+                                .bulk_tag_config
+                                .expect("bulk-tag benchmark configuration is present");
+                            let forward = benchmark.bulk_tag_completed.is_multiple_of(2);
+                            let (expected_added, expected_removed) = if forward {
+                                (config.matching_books * 2, config.matching_books)
+                            } else {
+                                (config.matching_books, config.matching_books * 2)
+                            };
+                            assert_eq!(completion.result.books_matched, config.matching_books);
+                            assert_eq!(completion.result.relationships_added, expected_added);
+                            assert_eq!(completion.result.relationships_removed, expected_removed);
+                            assert_eq!(completion.result.tags_created, 0);
+                            if forward {
+                                benchmark.bulk_tag_forward_operations += 1;
+                            } else {
+                                benchmark.bulk_tag_inverse_operations += 1;
+                            }
+                            benchmark.bulk_tag_completion_started = Some(Instant::now());
+                        }
+                        this.apply_snapshot(completion.snapshot);
+                        this.status = Some(bulk_tag_result_status(completion.result).into());
+                        this.clear_selection();
+                        this.bulk_tags = None;
+                        if this.benchmark.as_ref().is_some_and(|benchmark| {
+                            benchmark.workload == BenchmarkWorkload::BulkTags
+                        }) {
+                            cx.on_next_frame(window, Self::benchmark_bulk_completion_presented);
+                        }
+                    }
+                    Err(error) => {
+                        editor.error = Some(error.into());
+                        editor
+                            .input
+                            .update(cx, |state, cx| state.set_disabled(false, cx));
+                        this.status = Some("Could not apply tag changes.".into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn request_bulk_removal(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.removing || self.selection_pending.is_some() {
+        if self.busy
+            || self.removing
+            || self.selection_pending.is_some()
+            || self.bulk_tags.is_some()
+        {
             return;
         }
         let Some(selection) = self.selection.descriptor() else {
@@ -2030,7 +2692,12 @@ impl LecternView {
         Button::new(id, button_label)
             .variant(ButtonVariant::Primary)
             .leading_icon(TablerIcon::Upload)
-            .disabled(self.busy || self.removing || self.selection_pending.is_some())
+            .disabled(
+                self.busy
+                    || self.removing
+                    || self.selection_pending.is_some()
+                    || self.bulk_tags.is_some(),
+            )
             .on_click(cx.listener(|this, _, window, cx| {
                 this.start_add_books(window, cx);
             }))
@@ -2038,7 +2705,15 @@ impl LecternView {
 
     fn selection_bar(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> gpui::Div {
         let selected_books = self.selection.selected_count();
-        let label = if self.removing {
+        let label = if self
+            .bulk_tags
+            .as_ref()
+            .is_some_and(|editor| editor.operation == BulkTagOperation::Applying)
+        {
+            format!("Applying tags to {selected_books} selected books…")
+        } else if self.bulk_tags.is_some() {
+            format!("Editing tags for {selected_books} selected books")
+        } else if self.removing {
             format!(
                 "Removing {selected_books} selected {}…",
                 pluralize_book(selected_books)
@@ -2069,11 +2744,28 @@ impl LecternView {
                     .flex()
                     .items_center()
                     .gap(theme.spacing.small)
+                    .child(
+                        Button::new("edit-selection-tags", "Edit tags")
+                            .variant(ButtonVariant::Primary)
+                            .disabled(
+                                selected_books == 0
+                                    || self.busy
+                                    || self.removing
+                                    || self.selection_pending.is_some()
+                                    || self.bulk_tags.is_some(),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.request_bulk_tags(window, cx);
+                            })),
+                    )
                     .when(!self.selection.is_every_matching(), |actions| {
                         actions.child(
                             Button::new("select-all-matching", "Select all matching")
                                 .disabled(
-                                    self.busy || self.removing || self.selection_pending.is_some(),
+                                    self.busy
+                                        || self.removing
+                                        || self.selection_pending.is_some()
+                                        || self.bulk_tags.is_some(),
                                 )
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.select_all_matching(window, cx);
@@ -2082,7 +2774,7 @@ impl LecternView {
                     })
                     .child(
                         Button::new("clear-selection", "Clear selection")
-                            .disabled(self.removing)
+                            .disabled(self.removing || self.bulk_tags.is_some())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.clear_selection_action(cx);
                             })),
@@ -2094,7 +2786,8 @@ impl LecternView {
                                 selected_books == 0
                                     || self.busy
                                     || self.removing
-                                    || self.selection_pending.is_some(),
+                                    || self.selection_pending.is_some()
+                                    || self.bulk_tags.is_some(),
                             )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.request_bulk_removal(cx);
@@ -2480,7 +3173,10 @@ impl LecternView {
             }
         );
         let selection_active = self.selection.is_active();
-        let selection_locked = self.busy || self.removing || self.selection_pending.is_some();
+        let selection_locked = self.busy
+            || self.removing
+            || self.selection_pending.is_some()
+            || self.bulk_tags.is_some();
         let detail_book = self
             .detail_editor
             .as_ref()
@@ -2553,6 +3249,9 @@ impl LecternView {
                                 },
                             ),
                     )
+                    .when_some(self.bulk_tags.as_ref(), |body, editor| {
+                        body.child(bulk_tag_panel(editor, theme, cx))
+                    })
                     .when_some(self.detail_editor.as_ref(), |body, editor| {
                         body.child(book_detail_panel(editor, theme, cx))
                     }),
@@ -2801,6 +3500,11 @@ struct RemovalCompletion {
     snapshot: Result<LibrarySnapshot, LibraryServiceError>,
 }
 
+struct BulkTagCompletion {
+    result: BulkTagResult,
+    snapshot: LibrarySnapshot,
+}
+
 fn load_library_snapshot(path: &Path) -> Result<LibrarySnapshot, LibraryServiceError> {
     let mut service = SqliteLibraryService::open(path)?;
     load_library_snapshot_from(&mut service)
@@ -2814,7 +3518,14 @@ fn load_book(path: &Path, id: BookId) -> Result<Option<Book>, LibraryServiceErro
 fn load_library_snapshot_from(
     service: &mut SqliteLibraryService,
 ) -> Result<LibrarySnapshot, LibraryServiceError> {
-    let page = service.query_library_page(&LibraryQuery::default(), 0, LIBRARY_PAGE_SIZE)?;
+    load_library_snapshot_for_query_from(service, &LibraryQuery::default())
+}
+
+fn load_library_snapshot_for_query_from(
+    service: &mut SqliteLibraryService,
+    query: &LibraryQuery,
+) -> Result<LibrarySnapshot, LibraryServiceError> {
+    let page = service.query_library_page(query, 0, LIBRARY_PAGE_SIZE)?;
     let mut books = Vec::with_capacity(page.books.len());
     for summary in page.books {
         let cover = if summary.has_cover {
@@ -2828,6 +3539,18 @@ fn load_library_snapshot_from(
         total: page.total,
         books,
     })
+}
+
+fn apply_bulk_tags_and_load_library(
+    path: &Path,
+    selection: &BookSelection,
+    edit: &BulkTagEdit,
+    query: &LibraryQuery,
+) -> Result<BulkTagCompletion, LibraryServiceError> {
+    let mut service = SqliteLibraryService::open(path)?;
+    let result = service.apply_bulk_tags(selection, edit)?;
+    let snapshot = load_library_snapshot_for_query_from(&mut service, query)?;
+    Ok(BulkTagCompletion { result, snapshot })
 }
 
 fn import_books_and_load_library(
@@ -2846,6 +3569,27 @@ fn resolve_selection_snapshot(
 ) -> Result<SelectionSnapshot, LibraryServiceError> {
     let mut service = SqliteLibraryService::open(path)?;
     service.selection_snapshot(query)
+}
+
+fn load_bulk_tag_benchmark_library(
+    path: &Path,
+    query: &LibraryQuery,
+) -> Result<(u64, LibrarySnapshot), LibraryServiceError> {
+    let mut service = SqliteLibraryService::open(path)?;
+    let library_books = service.stats()?.books;
+    let snapshot = load_library_snapshot_for_query_from(&mut service, query)?;
+    Ok((library_books, snapshot))
+}
+
+fn resolve_bulk_tag_benchmark_selection(
+    path: &Path,
+    query: &LibraryQuery,
+) -> Result<(SelectionSnapshot, Vec<SelectionTagUsage>), LibraryServiceError> {
+    let mut service = SqliteLibraryService::open(path)?;
+    let snapshot = service.selection_snapshot(query)?;
+    let selection = BookSelection::all_matching(query.clone(), snapshot.generation, Vec::new());
+    let page = service.selection_tag_usage(&selection, 0, BULK_TAG_PAGE_SIZE)?;
+    Ok((snapshot, page))
 }
 
 fn resolve_selection_range(
@@ -3017,6 +3761,507 @@ const fn detail_library_item_index(contributor_count: usize) -> usize {
 
 const fn detail_item_count(contributor_count: usize) -> usize {
     detail_library_item_index(contributor_count) + 1
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the function declares one cohesive, paged bulk-tag side-panel hierarchy"
+)]
+fn bulk_tag_panel(
+    editor: &BulkTagEditor,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::Div {
+    let applying = editor.operation == BulkTagOperation::Applying;
+    let loading_page = editor.operation == BulkTagOperation::LoadingPage;
+    let page_ids = editor
+        .page
+        .iter()
+        .map(|usage| usage.usage.tag.id)
+        .collect::<HashSet<_>>();
+    let queued_rows = editor
+        .queued_tags
+        .values()
+        .filter(|usage| !page_ids.contains(&usage.tag.id))
+        .map(|usage| {
+            bulk_tag_existing_row(
+                &usage.tag,
+                "None",
+                editor.intents.get(&usage.tag.id).copied(),
+                applying,
+                theme,
+                cx,
+            )
+        })
+        .collect::<Vec<_>>();
+    let page_rows = editor
+        .page
+        .iter()
+        .map(|usage| {
+            bulk_tag_existing_row(
+                &usage.usage.tag,
+                bulk_tag_observed_state(usage.selected_books, editor.selected_books),
+                editor.intents.get(&usage.usage.tag.id).copied(),
+                applying,
+                theme,
+                cx,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut new_tags = editor.new_tags.iter().collect::<Vec<_>>();
+    new_tags.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    let new_rows = new_tags
+        .into_iter()
+        .map(|(key, tag)| bulk_tag_new_row(key, tag, applying, theme, cx))
+        .collect::<Vec<_>>();
+    let search = bulk_tag_search(editor, applying, theme, cx);
+    let has_changes = !editor.intents.is_empty() || !editor.new_tags.is_empty();
+    let previous = editor
+        .page_offset
+        .saturating_sub(u64::from(BULK_TAG_PAGE_SIZE));
+    let next = editor.page_offset + u64::from(BULK_TAG_PAGE_SIZE);
+
+    div()
+        .w(px(BULK_TAG_PANEL_WIDTH_PX))
+        .h_full()
+        .flex_none()
+        .border_l(theme.border.thin)
+        .border_color(theme.border.muted)
+        .bg(theme.surface.background)
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .h(px(TOP_BAR_HEIGHT_PX))
+                .flex_none()
+                .px(theme.spacing.large)
+                .py(theme.spacing.small)
+                .border_b(theme.border.thin)
+                .border_color(theme.border.muted)
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .font_weight(theme.typography.title_weight)
+                        .text_size(theme.typography.title_size)
+                        .child("Bulk tags"),
+                )
+                .child(
+                    Button::new("close-bulk-tags", "Close")
+                        .size(ButtonSize::Small)
+                        .disabled(applying)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_bulk_tags(cx);
+                        })),
+                ),
+        )
+        .child(
+            div()
+                .id("bulk-tag-panel-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .px(theme.spacing.large)
+                        .py(theme.spacing.large)
+                        .flex()
+                        .flex_col()
+                        .gap(theme.spacing.small)
+                        .child(
+                            div()
+                                .font_weight(theme.typography.button_weight)
+                                .child(format!("{} target books", editor.selected_books)),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme.surface.muted_foreground)
+                                .child("Only tag relationships change. Book files and other metadata are untouched."),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(theme.spacing.large)
+                        .py(theme.spacing.large)
+                        .border_t(theme.border.thin)
+                        .border_color(theme.border.muted)
+                        .flex()
+                        .flex_col()
+                        .gap(theme.spacing.medium)
+                        .child(
+                            div()
+                                .font_weight(theme.typography.button_weight)
+                                .child("Find or create a tag"),
+                        )
+                        .child(search),
+                )
+                .child(
+                    div()
+                        .px(theme.spacing.large)
+                        .py(theme.spacing.large)
+                        .border_t(theme.border.thin)
+                        .border_color(theme.border.muted)
+                        .flex()
+                        .flex_col()
+                        .gap(theme.spacing.medium)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .font_weight(theme.typography.button_weight)
+                                        .child("Tags on the target books"),
+                                )
+                                .when(loading_page, |heading| {
+                                    heading.child(
+                                        div()
+                                            .text_color(theme.surface.muted_foreground)
+                                            .child("Loading…"),
+                                    )
+                                }),
+                        )
+                        .when_some(editor.error.clone(), |section, error| {
+                            section.child(detail_error_text(error, theme))
+                        })
+                        .when(
+                            !loading_page
+                                && page_rows.is_empty()
+                                && queued_rows.is_empty()
+                                && new_rows.is_empty(),
+                            |section| {
+                                section.child(
+                                    div()
+                                        .text_color(theme.surface.muted_foreground)
+                                        .child("No tags are assigned to these books yet."),
+                                )
+                            },
+                        )
+                        .children(page_rows)
+                        .children(queued_rows)
+                        .children(new_rows),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .px(theme.spacing.large)
+                .py(theme.spacing.small)
+                .border_t(theme.border.thin)
+                .border_color(theme.border.muted)
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(theme.spacing.small)
+                        .child(
+                            Button::new("bulk-tags-previous", "Previous")
+                                .size(ButtonSize::Small)
+                                .disabled(
+                                    applying || loading_page || editor.page_offset == 0,
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.load_bulk_tag_page(previous, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme.surface.muted_foreground)
+                                .child(format!(
+                                    "Page {}",
+                                    editor.page_offset / u64::from(BULK_TAG_PAGE_SIZE) + 1
+                                )),
+                        )
+                        .child(
+                            Button::new("bulk-tags-next", "Next")
+                                .size(ButtonSize::Small)
+                                .disabled(applying || loading_page || !editor.has_next_page)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.load_bulk_tag_page(next, cx);
+                                })),
+                        ),
+                )
+                .child(
+                    Button::new(
+                        "apply-bulk-tags",
+                        if applying {
+                            "Applying…"
+                        } else {
+                            "Apply tag changes"
+                        },
+                    )
+                    .size(ButtonSize::Small)
+                    .variant(ButtonVariant::Primary)
+                    .disabled(applying || loading_page || !has_changes)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.apply_bulk_tag_changes(window, cx);
+                    })),
+                ),
+        )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the bounded search and inline color chooser form one cohesive editor section"
+)]
+fn bulk_tag_search(
+    editor: &BulkTagEditor,
+    applying: bool,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    if let Some(name) = &editor.creation_name {
+        let colors = TagColor::ALL.into_iter().map(|color| {
+            ActionListItem::new(
+                format!("bulk-create-tag-color-{}", color.as_str()),
+                color.to_string(),
+            )
+            .leading_color(tag_color(theme, color))
+            .disabled(applying)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.queue_new_bulk_tag(color, window, cx);
+            }))
+        });
+        return div()
+            .flex()
+            .flex_col()
+            .gap(theme.spacing.small)
+            .child(
+                div()
+                    .text_color(theme.surface.muted_foreground)
+                    .child(format!("Create “{name}” · Pick a color")),
+            )
+            .children(colors)
+            .child(
+                Button::new("cancel-bulk-tag-creation", "Back")
+                    .size(ButtonSize::Small)
+                    .disabled(applying)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(editor) = &mut this.bulk_tags {
+                            editor.creation_name = None;
+                            cx.notify();
+                        }
+                    })),
+            )
+            .into_any_element();
+    }
+
+    let query = editor.input.read(cx).value().to_string();
+    let mut known_keys = editor
+        .page
+        .iter()
+        .map(|usage| identity_key(&usage.usage.tag.name))
+        .chain(
+            editor
+                .queued_tags
+                .values()
+                .map(|usage| identity_key(&usage.tag.name)),
+        )
+        .chain(editor.new_tags.keys().cloned())
+        .collect::<HashSet<_>>();
+    let suggestions = editor
+        .suggestions
+        .iter()
+        .filter(|usage| known_keys.insert(identity_key(&usage.tag.name)))
+        .take(8)
+        .map(|usage| {
+            let suggestion = usage.clone();
+            ActionListItem::new(
+                format!("bulk-tag-suggestion-{}", usage.tag.id.value()),
+                format!("{} · {} books", usage.tag.name, usage.books),
+            )
+            .leading_color(tag_color(theme, usage.tag.color))
+            .disabled(applying)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.queue_existing_bulk_tag(&suggestion, window, cx);
+            }))
+        })
+        .collect::<Vec<_>>();
+    let normalized = normalize_name(NameKind::Tag, &query).ok();
+    let exact_match = normalized.as_ref().is_some_and(|name| {
+        let key = identity_key(name);
+        known_keys.contains(&key)
+            || editor
+                .suggestions
+                .iter()
+                .any(|usage| identity_key(&usage.tag.name) == key)
+    });
+    let create_name = normalized.filter(|_| !exact_match);
+    div()
+        .flex()
+        .flex_col()
+        .gap(theme.spacing.small)
+        .child(TextInput::new(
+            "bulk-tag-input",
+            "Find or create a tag",
+            &editor.input,
+        ))
+        .when(editor.suggestions_loading, |content| {
+            content.child(
+                div()
+                    .text_color(theme.surface.muted_foreground)
+                    .child("Finding tags…"),
+            )
+        })
+        .when(!editor.suggestions_loading, |content| {
+            content.children(suggestions)
+        })
+        .when_some(create_name, |content, name| {
+            let action_name = name.clone();
+            content.child(
+                ActionListItem::new("create-bulk-tag", format!("+  Create and add: “{name}”"))
+                    .disabled(applying)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.begin_bulk_tag_creation(&action_name, cx);
+                    })),
+            )
+        })
+        .into_any_element()
+}
+
+fn bulk_tag_existing_row(
+    tag: &Tag,
+    observed: &'static str,
+    intent: Option<BulkTagIntent>,
+    disabled: bool,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let tag_id = tag.id;
+    let unchanged = Button::new(
+        format!("bulk-tag-{}-unchanged", tag.id.value()),
+        "Unchanged",
+    )
+    .size(ButtonSize::Small)
+    .disabled(disabled);
+    let unchanged = if intent.is_none() {
+        unchanged.variant(ButtonVariant::Primary)
+    } else {
+        unchanged
+    };
+    let add = Button::new(format!("bulk-tag-{}-add", tag.id.value()), "Add to all")
+        .size(ButtonSize::Small)
+        .disabled(disabled);
+    let add = if intent == Some(BulkTagIntent::Add) {
+        add.variant(ButtonVariant::Primary)
+    } else {
+        add
+    };
+    let remove = Button::new(
+        format!("bulk-tag-{}-remove", tag.id.value()),
+        "Remove from all",
+    )
+    .size(ButtonSize::Small)
+    .disabled(disabled);
+    let remove = if intent == Some(BulkTagIntent::Remove) {
+        remove.variant(ButtonVariant::Primary)
+    } else {
+        remove
+    };
+
+    div()
+        .py(theme.spacing.medium)
+        .border_b(theme.border.thin)
+        .border_color(theme.border.muted)
+        .flex()
+        .flex_col()
+        .gap(theme.spacing.small)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(theme.spacing.small)
+                .child(
+                    div()
+                        .size(px(8.))
+                        .rounded_full()
+                        .bg(tag_color(theme, tag.color)),
+                )
+                .child(
+                    div()
+                        .font_weight(theme.typography.button_weight)
+                        .child(tag.name.clone()),
+                )
+                .child(
+                    div()
+                        .text_color(theme.surface.muted_foreground)
+                        .child(format!("· {observed}")),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(theme.spacing.small)
+                .child(unchanged.on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_bulk_tag_intent(tag_id, None, cx);
+                })))
+                .child(add.on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_bulk_tag_intent(tag_id, Some(BulkTagIntent::Add), cx);
+                })))
+                .child(remove.on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_bulk_tag_intent(tag_id, Some(BulkTagIntent::Remove), cx);
+                }))),
+        )
+        .into_any_element()
+}
+
+fn bulk_tag_new_row(
+    key: &str,
+    tag: &PendingBulkTag,
+    disabled: bool,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let remove_key = key.to_owned();
+    div()
+        .py(theme.spacing.medium)
+        .border_b(theme.border.thin)
+        .border_color(theme.border.muted)
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(theme.spacing.small)
+                .child(
+                    div()
+                        .size(px(8.))
+                        .rounded_full()
+                        .bg(tag_color(theme, tag.color)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .font_weight(theme.typography.button_weight)
+                                .child(tag.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme.surface.muted_foreground)
+                                .child("New · Add to all"),
+                        ),
+                ),
+        )
+        .child(
+            Button::new(format!("remove-new-bulk-tag-{key}"), "Remove")
+                .size(ButtonSize::Small)
+                .disabled(disabled)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.remove_new_bulk_tag(&remove_key, cx);
+                })),
+        )
+        .into_any_element()
 }
 
 fn book_detail_panel(
@@ -4410,6 +5655,58 @@ fn selection_status(selection: &GridSelection) -> String {
     }
 }
 
+fn bulk_tag_observed_state(selected_books: u64, target_books: u64) -> &'static str {
+    if selected_books == 0 {
+        "None"
+    } else if selected_books == target_books {
+        "All"
+    } else {
+        "Some"
+    }
+}
+
+fn build_bulk_tag_edit(
+    intents: &HashMap<TagId, BulkTagIntent>,
+    new_tags: &HashMap<String, PendingBulkTag>,
+) -> BulkTagEdit {
+    let mut intents = intents
+        .iter()
+        .map(|(tag, intent)| (*tag, *intent))
+        .collect::<Vec<_>>();
+    intents.sort_unstable_by_key(|(tag, _)| *tag);
+    let mut add = intents
+        .iter()
+        .filter_map(|(tag, intent)| {
+            (*intent == BulkTagIntent::Add).then_some(TagReference::Existing(*tag))
+        })
+        .collect::<Vec<_>>();
+    let remove = intents
+        .into_iter()
+        .filter_map(|(tag, intent)| (intent == BulkTagIntent::Remove).then_some(tag))
+        .collect::<Vec<_>>();
+    let mut pending = new_tags.iter().collect::<Vec<_>>();
+    pending.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    add.extend(
+        pending
+            .into_iter()
+            .map(|(_, tag)| TagReference::NewColored {
+                name: tag.name.clone(),
+                color: tag.color,
+            }),
+    );
+    BulkTagEdit { add, remove }
+}
+
+fn bulk_tag_result_status(result: BulkTagResult) -> String {
+    format!(
+        "Updated {} books · {} tag links added · {} removed · {} tags created",
+        result.books_matched,
+        result.relationships_added,
+        result.relationships_removed,
+        result.tags_created,
+    )
+}
+
 fn pluralize_book(count: u64) -> &'static str {
     if count == 1 { "book" } else { "books" }
 }
@@ -4570,6 +5867,42 @@ mod selection_tests {
     }
 
     #[test]
+    fn bulk_tag_edit_is_disjoint_stable_and_preserves_new_tag_colors() {
+        let added = TagId::new(8);
+        let removed = TagId::new(3);
+        let intents = HashMap::from([
+            (added, BulkTagIntent::Add),
+            (removed, BulkTagIntent::Remove),
+        ]);
+        let new_tags = HashMap::from([(
+            "future reads".to_owned(),
+            PendingBulkTag {
+                name: "Future Reads".to_owned(),
+                color: TagColor::Lilac,
+            },
+        )]);
+
+        let edit = build_bulk_tag_edit(&intents, &new_tags);
+
+        assert_eq!(
+            edit,
+            BulkTagEdit {
+                add: vec![
+                    TagReference::Existing(added),
+                    TagReference::NewColored {
+                        name: "Future Reads".to_owned(),
+                        color: TagColor::Lilac,
+                    },
+                ],
+                remove: vec![removed],
+            }
+        );
+        assert_eq!(bulk_tag_observed_state(0, 10), "None");
+        assert_eq!(bulk_tag_observed_state(4, 10), "Some");
+        assert_eq!(bulk_tag_observed_state(10, 10), "All");
+    }
+
+    #[test]
     fn asset_format_detection_is_case_insensitive_and_closed() {
         assert_eq!(
             book_format_for_path(Path::new("/library/book.EPUB")),
@@ -4589,6 +5922,50 @@ enum BenchmarkWorkload {
     EmptyLibraryAddBooks,
     LibrarySelection,
     BookDetail,
+    BulkTags,
+}
+
+#[derive(Clone, Copy)]
+struct BulkTagBenchmarkConfig {
+    library_books: u64,
+    matching_books: u64,
+    baseline: TagId,
+    added_a: TagId,
+    added_b: TagId,
+    warmup_iterations: usize,
+    measured_iterations: usize,
+}
+
+impl BulkTagBenchmarkConfig {
+    fn from_environment() -> Self {
+        Self {
+            library_books: benchmark_u64_env("LECTERN_BENCHMARK_LIBRARY_BOOKS"),
+            matching_books: benchmark_u64_env("LECTERN_BENCHMARK_MATCHING_BOOKS"),
+            baseline: benchmark_tag_id_env("LECTERN_BENCHMARK_BULK_BASELINE_TAG_ID"),
+            added_a: benchmark_tag_id_env("LECTERN_BENCHMARK_BULK_ADD_TAG_A_ID"),
+            added_b: benchmark_tag_id_env("LECTERN_BENCHMARK_BULK_ADD_TAG_B_ID"),
+            warmup_iterations: benchmark_usize_env("LECTERN_BENCHMARK_BULK_WARMUP_ITERATIONS"),
+            measured_iterations: benchmark_usize_env("LECTERN_BENCHMARK_BULK_ITERATIONS"),
+        }
+    }
+}
+
+fn benchmark_u64_env(name: &str) -> u64 {
+    let value = env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+    let parsed = value
+        .parse::<u64>()
+        .unwrap_or_else(|_| panic!("{name} expects a positive integer, got {value:?}"));
+    assert!(parsed > 0, "{name} expects a positive integer");
+    parsed
+}
+
+fn benchmark_tag_id_env(name: &str) -> TagId {
+    let value = benchmark_u64_env(name);
+    TagId::new(i64::try_from(value).unwrap_or_else(|_| panic!("{name} exceeds i64")))
+}
+
+fn benchmark_usize_env(name: &str) -> usize {
+    usize::try_from(benchmark_u64_env(name)).unwrap_or_else(|_| panic!("{name} exceeds usize"))
 }
 
 struct BenchmarkRun {
@@ -4599,6 +5976,15 @@ struct BenchmarkRun {
     action_started: Option<Instant>,
     selection_painted: Option<Duration>,
     detail_painted: Option<Duration>,
+    bulk_tag_config: Option<BulkTagBenchmarkConfig>,
+    bulk_tag_library_books: Option<u64>,
+    bulk_tag_panels_painted: usize,
+    bulk_tag_completed: usize,
+    bulk_tag_forward_operations: usize,
+    bulk_tag_inverse_operations: usize,
+    bulk_tag_selection_samples_ns: Vec<u64>,
+    bulk_tag_completion_samples_ns: Vec<u64>,
+    bulk_tag_completion_started: Option<Instant>,
     confirmation_started: Option<Instant>,
 }
 
@@ -4691,6 +6077,81 @@ impl BenchmarkRun {
         });
     }
 
+    fn finish_bulk_tags(
+        self,
+        refreshed_total: u64,
+        rendered_books: usize,
+        selection_cleared: bool,
+        panel_closed: bool,
+    ) {
+        assert_eq!(
+            self.workload,
+            BenchmarkWorkload::BulkTags,
+            "bulk-tag completion belongs to the bulk-tag benchmark"
+        );
+        let config = self
+            .bulk_tag_config
+            .expect("bulk-tag benchmark configuration is present");
+        let total_iterations = config.warmup_iterations + config.measured_iterations;
+        assert_eq!(self.bulk_tag_completed, total_iterations);
+        assert_eq!(
+            self.bulk_tag_forward_operations + self.bulk_tag_inverse_operations,
+            total_iterations
+        );
+        assert!(
+            self.bulk_tag_forward_operations
+                .abs_diff(self.bulk_tag_inverse_operations)
+                <= 1
+        );
+        assert_eq!(
+            self.bulk_tag_selection_samples_ns.len(),
+            config.measured_iterations
+        );
+        assert_eq!(
+            self.bulk_tag_completion_samples_ns.len(),
+            config.measured_iterations
+        );
+        assert_eq!(refreshed_total, config.matching_books);
+        assert_eq!(
+            self.bulk_tag_library_books,
+            Some(config.library_books),
+            "bulk benchmark must reconcile the complete library"
+        );
+        assert_eq!(self.bulk_tag_panels_painted, total_iterations);
+        assert!(selection_cleared);
+        assert!(panel_closed);
+        let sample = UiBulkTagBenchmarkSample {
+            schema_version: 1,
+            workload: "bulk-tags",
+            warmup_iterations: config.warmup_iterations,
+            measured_iterations: config.measured_iterations,
+            library_books: config.library_books,
+            matching_books: config.matching_books,
+            rendered_books,
+            forward_operations: self.bulk_tag_forward_operations,
+            inverse_operations: self.bulk_tag_inverse_operations,
+            selection_samples_ns: self.bulk_tag_selection_samples_ns,
+            completion_samples_ns: self.bulk_tag_completion_samples_ns,
+            peak_rss_bytes: peak_rss_bytes(),
+            markers: vec![
+                "selection_busy_state_presented",
+                "compact_all_matching_descriptor",
+                "bulk_tag_panel_presented",
+                "atomic_apply_completed",
+                "selection_cleared_after_success",
+                "refreshed_grid_presented",
+            ],
+        };
+        let json =
+            serde_json::to_vec_pretty(&sample).expect("serialize GPUI bulk-tag benchmark sample");
+        fs::write(&self.output, json).unwrap_or_else(|error| {
+            panic!(
+                "write GPUI bulk-tag benchmark sample {}: {error}",
+                self.output.display()
+            )
+        });
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "the benchmark correctness artifact keeps every observed field explicit"
@@ -4754,6 +6215,10 @@ fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).expect("benchmark duration fits u64 nanoseconds")
+}
+
 #[cfg(target_os = "linux")]
 fn peak_rss_bytes() -> Option<u64> {
     let status = fs::read_to_string("/proc/self/status").ok()?;
@@ -4808,6 +6273,23 @@ struct UiSelectionBenchmarkCorrectness {
     library_total: u64,
     rendered_books: usize,
     selected_books: u64,
+    markers: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct UiBulkTagBenchmarkSample {
+    schema_version: u32,
+    workload: &'static str,
+    warmup_iterations: usize,
+    measured_iterations: usize,
+    library_books: u64,
+    matching_books: u64,
+    rendered_books: usize,
+    forward_operations: usize,
+    inverse_operations: usize,
+    selection_samples_ns: Vec<u64>,
+    completion_samples_ns: Vec<u64>,
+    peak_rss_bytes: Option<u64>,
     markers: Vec<&'static str>,
 }
 

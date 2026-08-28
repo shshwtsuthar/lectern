@@ -2286,55 +2286,139 @@ def run_bulk_tag_desktop(
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         raise RegressionError("bulk-tag compositor measurements require an active display")
     tag_ids = resolve_bulk_tag_ids(database)
-    environment = os.environ.copy()
-    if environment.get("DISPLAY"):
-        environment.pop("WAYLAND_DISPLAY", None)
-        environment["WINIT_UNIX_BACKEND"] = "x11"
-    environment.update(
-        {
-            "LECTERN_DATA_DIR": str(database.parent),
-            "LECTERN_BENCHMARK_OUTPUT": str(output),
-            "LECTERN_BENCHMARK_IDLE_SECONDS": "0.5",
-            "LECTERN_BENCHMARK_SCROLL_SECONDS": "0",
-            "LECTERN_BENCHMARK_SCROLL_WARMUP_SECONDS": "0",
-            "LECTERN_BENCHMARK_SORT_ITERATIONS": "0",
-            "LECTERN_BENCHMARK_ASSET_ACTION_ITERATIONS": "0",
-            "LECTERN_BENCHMARK_EDITOR_WARMUP_ITERATIONS": "0",
-            "LECTERN_BENCHMARK_EDITOR_ITERATIONS": "0",
-            "LECTERN_BENCHMARK_SELECTION_WARMUP_ITERATIONS": str(
-                workload["warmup_iterations"]
-            ),
-            "LECTERN_BENCHMARK_SELECTION_ITERATIONS": str(
-                workload["compositor_samples"]
-            ),
-            "LECTERN_BENCHMARK_BULK_WARMUP_ITERATIONS": str(
-                workload["warmup_iterations"]
-            ),
-            "LECTERN_BENCHMARK_BULK_ITERATIONS": str(
-                workload["compositor_samples"]
-            ),
-            "LECTERN_BENCHMARK_BULK_BASELINE_TAG_ID": str(tag_ids["Bulk baseline"]),
-            "LECTERN_BENCHMARK_BULK_ADD_TAG_A_ID": str(tag_ids["Bulk added A 000"]),
-            "LECTERN_BENCHMARK_BULK_ADD_TAG_B_ID": str(tag_ids["Bulk added B 000"]),
-            "LECTERN_BENCHMARK_TIMEOUT_SECONDS": "240",
-            "WGPU_BACKEND": environment.get("WGPU_BACKEND", "vulkan"),
-        }
-    )
     run_command(
         [
             "cargo",
-            "run",
+            "build",
             "--release",
             "--locked",
             "-p",
             "lectern-desktop",
             "--bin",
-            "lectern",
+            "lectern-gpui",
         ],
         commands,
-        environment=environment,
-        timeout_seconds=270,
+        timeout_seconds=1_800,
     )
+    target_directory = pathlib.Path(
+        os.environ.get("CARGO_TARGET_DIR", str(REPOSITORY / "target"))
+    )
+    if not target_directory.is_absolute():
+        target_directory = REPOSITORY / target_directory
+    executable = target_directory / "release/lectern-gpui"
+    if sys.platform == "win32":
+        executable = executable.with_suffix(".exe")
+    if not executable.is_file():
+        raise RegressionError(f"release GPUI executable is missing: {executable}")
+
+    warmup = workload["warmup_iterations"]
+    measured = workload["compositor_samples"]
+    sample_path = output.parent / "bulk-tag-gpui-raw.json"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "LECTERN_DATA_DIR": str(database.parent),
+            "LECTERN_GPUI_BENCHMARK_OUTPUT": str(sample_path),
+            "LECTERN_GPUI_BENCHMARK_WORKLOAD": "bulk-tags",
+            "LECTERN_BENCHMARK_LIBRARY_BOOKS": str(workload["books"]),
+            "LECTERN_BENCHMARK_MATCHING_BOOKS": str(workload["matching_books"]),
+            "LECTERN_BENCHMARK_BULK_WARMUP_ITERATIONS": str(warmup),
+            "LECTERN_BENCHMARK_BULK_ITERATIONS": str(measured),
+            "LECTERN_BENCHMARK_BULK_BASELINE_TAG_ID": str(tag_ids["Bulk baseline"]),
+            "LECTERN_BENCHMARK_BULK_ADD_TAG_A_ID": str(
+                tag_ids["Bulk added A 000"]
+            ),
+            "LECTERN_BENCHMARK_BULK_ADD_TAG_B_ID": str(
+                tag_ids["Bulk added B 000"]
+            ),
+        }
+    )
+    run_command(
+        [str(executable)],
+        commands,
+        environment=environment,
+        timeout_seconds=300,
+    )
+    sample = read_json(sample_path)
+    validate_bulk_tag_gpui_sample(sample, sample_path, workload)
+    peak_rss = sample.get("peak_rss_bytes")
+    result = {
+        "schema_version": 1,
+        "kind": "lectern-gpui-bulk-tags-performance",
+        "library_books": workload["books"],
+        "matching_books": workload["matching_books"],
+        "warmup_iterations": warmup,
+        "measured_iterations": measured,
+        "forward_operations": sample["forward_operations"],
+        "inverse_operations": sample["inverse_operations"],
+        "raw_samples": [str(sample_path)],
+        "correctness": sample["markers"],
+        "scenarios": [
+            ui_scenario(
+                "selection_dispatch_to_busy_paint",
+                sample["selection_samples_ns"],
+                peak_rss,
+            ),
+            ui_scenario(
+                "completion_to_refreshed_grid_paint",
+                sample["completion_samples_ns"],
+                peak_rss,
+            ),
+        ],
+    }
+    write_json(output, result)
+
+
+def validate_bulk_tag_gpui_sample(
+    sample: dict[str, Any],
+    path: pathlib.Path,
+    workload: dict[str, Any],
+) -> None:
+    context = f"bulk-tag GPUI sample {path.name}"
+    if sample.get("schema_version") != 1 or sample.get("workload") != "bulk-tags":
+        raise RegressionError(f"{context} identity is invalid")
+    expected_fields = {
+        "library_books": workload["books"],
+        "matching_books": workload["matching_books"],
+        "rendered_books": workload["page_size"],
+        "warmup_iterations": workload["warmup_iterations"],
+        "measured_iterations": workload["compositor_samples"],
+    }
+    for field, expected in expected_fields.items():
+        if positive_or_zero_field(sample, field, context) != expected:
+            raise RegressionError(f"{context} {field} did not reconcile")
+    total_operations = workload["warmup_iterations"] + workload["compositor_samples"]
+    forward = positive_or_zero_field(sample, "forward_operations", context)
+    inverse = positive_or_zero_field(sample, "inverse_operations", context)
+    if forward + inverse != total_operations or abs(forward - inverse) > 1:
+        raise RegressionError(f"{context} forward/inverse operations did not reconcile")
+    for field in ("selection_samples_ns", "completion_samples_ns"):
+        samples = sample.get(field)
+        if (
+            not isinstance(samples, list)
+            or len(samples) != workload["compositor_samples"]
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in samples
+            )
+        ):
+            raise RegressionError(f"{context} {field} must retain measured samples")
+    peak_rss = sample.get("peak_rss_bytes")
+    if peak_rss is not None and positive_or_zero_field(
+        sample, "peak_rss_bytes", context
+    ) == 0:
+        raise RegressionError(f"{context} peak RSS must be positive when present")
+    expected_markers = {
+        "selection_busy_state_presented",
+        "compact_all_matching_descriptor",
+        "bulk_tag_panel_presented",
+        "atomic_apply_completed",
+        "selection_cleared_after_success",
+        "refreshed_grid_presented",
+    }
+    markers = sample.get("markers")
+    if not isinstance(markers, list) or set(markers) != expected_markers:
+        raise RegressionError(f"{context} correctness markers did not reconcile")
 
 
 def resolve_bulk_tag_ids(database: pathlib.Path) -> dict[str, int]:
@@ -2354,86 +2438,83 @@ def evaluate_bulk_tag_desktop_result(
 ) -> list[dict[str, Any]]:
     workload = budget["workload"]
     samples = workload["compositor_samples"]
-    if result.get("kind") != "desktop" or result.get("status") != "completed":
-        raise RegressionError(
-            f"bulk-tag desktop benchmark failed: {result.get('error')}"
-        )
-    if positive_or_zero_field(result, "schema_version", "desktop result") < 6:
-        raise RegressionError("bulk-tag desktop result schema is too old")
-    library = object_field(result, "library", "desktop result")
-    if positive_or_zero_field(library, "books", "desktop library") != workload["books"]:
-        raise RegressionError("bulk-tag desktop library count did not reconcile")
-
-    selection = object_field(result, "selection_interactions", "desktop result")
-    if positive_or_zero_field(selection, "measured_iterations", "desktop selection") != samples:
-        raise RegressionError("desktop selection sample configuration did not reconcile")
-    if positive_or_zero_field(selection, "matching_books", "desktop selection") != workload["books"]:
-        raise RegressionError("desktop selection count did not reconcile")
-    selection_samples = positive_samples(selection, "desktop selection", samples)
-    selection_latency = object_field(selection, "latency", "desktop selection")
-    selection_p95_ns = positive_or_zero_field(
-        selection_latency, "p95_ns", "desktop selection latency"
-    )
-    if selection_p95_ns == 0 or selection.get("passed") is not True:
-        raise RegressionError("desktop selection endpoint exceeded its absolute budget")
-
-    bulk = object_field(result, "bulk_tag_interactions", "desktop result")
-    if positive_or_zero_field(bulk, "measured_iterations", "desktop bulk tags") != samples:
-        raise RegressionError("desktop bulk-tag sample configuration did not reconcile")
-    if positive_or_zero_field(bulk, "matching_books", "desktop bulk tags") != workload["matching_books"]:
-        raise RegressionError("desktop bulk-tag target count did not reconcile")
-    total_operations = workload["warmup_iterations"] + samples
-    forward = positive_or_zero_field(bulk, "forward_operations", "desktop bulk tags")
-    inverse = positive_or_zero_field(bulk, "inverse_operations", "desktop bulk tags")
-    if forward + inverse != total_operations or abs(forward - inverse) > 1:
-        raise RegressionError("desktop bulk-tag forward/inverse operations did not reconcile")
-    expected_bulk_counts = {
-        "forward_expected_relationships_added": (
-            workload["matching_books"] * workload["tags_added"]
-        ),
-        "forward_expected_relationships_removed": (
-            workload["matching_books"] * workload["tags_removed"]
-        ),
-        "inverse_expected_relationships_added": (
-            workload["matching_books"] * workload["tags_removed"]
-        ),
-        "inverse_expected_relationships_removed": (
-            workload["matching_books"] * workload["tags_added"]
-        ),
+    context = "GPUI bulk-tag result"
+    if result.get("kind") != "lectern-gpui-bulk-tags-performance":
+        raise RegressionError(f"{context} kind is invalid")
+    expected_fields = {
+        "library_books": workload["books"],
+        "matching_books": workload["matching_books"],
+        "warmup_iterations": workload["warmup_iterations"],
+        "measured_iterations": samples,
     }
-    for field, expected in expected_bulk_counts.items():
-        if positive_or_zero_field(bulk, field, "desktop bulk tags") != expected:
-            raise RegressionError(f"desktop bulk-tag {field} did not reconcile")
-    bulk_samples = positive_samples(bulk, "desktop bulk tags", samples)
-    bulk_latency = object_field(bulk, "latency", "desktop bulk tags")
-    bulk_p95_ns = positive_or_zero_field(
-        bulk_latency, "p95_ns", "desktop bulk-tag latency"
-    )
-    if bulk_p95_ns == 0 or bulk.get("passed") is not True:
-        raise RegressionError("desktop bulk-tag endpoint exceeded its absolute budget")
-
-    endpoints = (
-        (
-            "selection_dispatch_to_busy_paint",
-            selection_p95_ns,
-            selection_samples,
-        ),
-        (
-            "completion_to_refreshed_grid_paint",
-            bulk_p95_ns,
-            bulk_samples,
-        ),
-    )
+    for field, expected in expected_fields.items():
+        if positive_or_zero_field(result, field, context) != expected:
+            raise RegressionError(f"{context} {field} did not reconcile")
+    total_operations = workload["warmup_iterations"] + samples
+    forward = positive_or_zero_field(result, "forward_operations", context)
+    inverse = positive_or_zero_field(result, "inverse_operations", context)
+    if forward + inverse != total_operations or abs(forward - inverse) > 1:
+        raise RegressionError(f"{context} forward/inverse operations did not reconcile")
+    raw_samples = result.get("raw_samples")
+    if (
+        not isinstance(raw_samples, list)
+        or len(raw_samples) != 1
+        or not all(isinstance(path, str) and path for path in raw_samples)
+    ):
+        raise RegressionError(f"{context} must retain the raw GPUI sample artifact")
+    expected_markers = {
+        "selection_busy_state_presented",
+        "compact_all_matching_descriptor",
+        "bulk_tag_panel_presented",
+        "atomic_apply_completed",
+        "selection_cleared_after_success",
+        "refreshed_grid_presented",
+    }
+    markers = result.get("correctness")
+    if not isinstance(markers, list) or set(markers) != expected_markers:
+        raise RegressionError(f"{context} correctness markers did not reconcile")
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or len(scenarios) != 2:
+        raise RegressionError(f"{context} must contain two compositor scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, scenario in enumerate(scenarios):
+        scenario_context = f"{context} scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{scenario_context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{scenario_context} name must be unique")
+        retained = positive_samples(scenario, scenario_context, samples)
+        p95_ms = positive_number_field(
+            object_field(scenario, "latency_ms", scenario_context),
+            "p95",
+            f"{scenario_context}.latency_ms",
+        )
+        if not math.isclose(
+            p95_ms,
+            nearest_rank_p95(retained) / 1_000_000,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise RegressionError(f"{scenario_context} p95 does not match samples")
+        by_name[name] = scenario
+    expected_names = {
+        "selection_dispatch_to_busy_paint",
+        "completion_to_refreshed_grid_paint",
+    }
+    if set(by_name) != expected_names:
+        raise RegressionError(f"{context} scenario names are invalid")
     decisions = []
-    for name, p95_ns, retained_samples in endpoints:
+    for name in sorted(expected_names):
+        scenario = by_name[name]
+        p95_ms = float(scenario["latency_ms"]["p95"])
         maximum_ms = float(budget["budgets"][name]["max_p95_ms"])
-        p95_ms = p95_ns / 1_000_000
         decisions.append(
             {
                 "name": name,
                 "p95_ms": p95_ms,
                 "max_p95_ms": maximum_ms,
-                "sample_count": len(retained_samples),
+                "sample_count": samples,
                 "passed": p95_ms <= maximum_ms,
             }
         )

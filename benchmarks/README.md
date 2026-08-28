@@ -72,8 +72,9 @@ includes the indexed conflict/self-exclusion lookup used by the side-panel Book 
 v1 budgets remain checked in as historical pre-uniqueness contracts. The bulk-tag gate in
 [`bulk-tags-regression-v2.json`](bulk-tags-regression-v2.json) selects 10,000 matching books without
 materializing them, applies and reverses an atomic tag edit, checks exact relationship and memory
-results, and retains 40 native compositor samples for both dispatch and completion-to-painted-grid.
-It requires an active X11 or Wayland display; CI runs it under an isolated X11 display.
+results, and drives one optimized `lectern-gpui` process to retain 40 native compositor samples for
+both dispatch and completion-to-painted-grid. It requires an active X11 or Wayland display; CI runs
+it under an isolated X11 display.
 
 The bulk-removal gate in
 [`bulk-remove-regression-v2.json`](bulk-remove-regression-v2.json) resolves a compact query-backed

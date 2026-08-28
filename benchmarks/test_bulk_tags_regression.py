@@ -53,41 +53,39 @@ def valid_storage_result() -> dict:
 def valid_desktop_result() -> dict:
     workload = checked_in_budget()["workload"]
     samples = workload["compositor_samples"]
-    latency = {
-        "count": samples,
-        "min_ns": 1_000_000,
-        "mean_ns": 1_000_000,
-        "p50_ns": 1_000_000,
-        "p95_ns": 1_000_000,
-        "p99_ns": 1_000_000,
-        "max_ns": 1_000_000,
-    }
+    markers = [
+        "selection_busy_state_presented",
+        "compact_all_matching_descriptor",
+        "bulk_tag_panel_presented",
+        "atomic_apply_completed",
+        "selection_cleared_after_success",
+        "refreshed_grid_presented",
+    ]
     return {
-        "schema_version": 6,
-        "kind": "desktop",
-        "status": "completed",
-        "error": None,
-        "library": {"books": workload["books"]},
-        "selection_interactions": {
-            "measured_iterations": samples,
-            "matching_books": workload["books"],
-            "latency": latency,
-            "samples_ns": [1_000_000] * samples,
-            "passed": True,
-        },
-        "bulk_tag_interactions": {
-            "measured_iterations": samples,
-            "matching_books": workload["matching_books"],
-            "forward_operations": 25,
-            "inverse_operations": 25,
-            "forward_expected_relationships_added": 20_000,
-            "forward_expected_relationships_removed": 10_000,
-            "inverse_expected_relationships_added": 10_000,
-            "inverse_expected_relationships_removed": 20_000,
-            "latency": latency,
-            "samples_ns": [1_000_000] * samples,
-            "passed": True,
-        },
+        "schema_version": 1,
+        "kind": "lectern-gpui-bulk-tags-performance",
+        "library_books": workload["books"],
+        "matching_books": workload["matching_books"],
+        "warmup_iterations": workload["warmup_iterations"],
+        "measured_iterations": samples,
+        "forward_operations": 25,
+        "inverse_operations": 25,
+        "raw_samples": ["bulk-tag-gpui-raw.json"],
+        "correctness": markers,
+        "scenarios": [
+            {
+                "name": "selection_dispatch_to_busy_paint",
+                "latency_ms": {"p95": 1.0},
+                "samples_ns": [1_000_000] * samples,
+                "peak_rss_bytes": 1024,
+            },
+            {
+                "name": "completion_to_refreshed_grid_paint",
+                "latency_ms": {"p95": 1.0},
+                "samples_ns": [1_000_000] * samples,
+                "peak_rss_bytes": 1024,
+            },
+        ],
     }
 
 
@@ -111,7 +109,7 @@ class BulkTagRegressionContractTests(unittest.TestCase):
             REGRESSION.evaluate_bulk_tag_result(storage, checked_in_budget())
 
         desktop = valid_desktop_result()
-        desktop["bulk_tag_interactions"]["samples_ns"].pop()
+        desktop["scenarios"][1]["samples_ns"].pop()
         with self.assertRaisesRegex(REGRESSION.RegressionError, "sample count"):
             REGRESSION.evaluate_bulk_tag_desktop_result(
                 desktop, checked_in_budget()

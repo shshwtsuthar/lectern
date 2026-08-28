@@ -131,8 +131,9 @@ the exploratory harness. When that workload is not yet stable enough to gate, re
 after raw results and add or improve deterministic coverage rather than claiming an exemption.
 The compositor-backed desktop workload checks title, author, and recently-added sort-to-first-
 painted-frame p95 against a 50 ms product budget while retaining all interaction samples.
-The bulk-tag suite additionally requires a native display and checks selection dispatch and durable
-completion through their next painted frames; CI supplies an isolated X11 display for this gate.
+The bulk-tag suite additionally drives one optimized GPUI process on a native display through 10
+warmups and 40 retained samples. It checks selection dispatch and durable completion through their
+next painted frames; CI supplies an isolated X11 display for this gate.
 
 ## Merge gate
 
