@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, ClickEvent, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce,
-    SharedString, StatefulInteractiveElement, Styled, Window, prelude::FluentBuilder as _,
+    App, ClickEvent, ElementId, InteractiveElement, IntoElement, ParentElement, Rems, RenderOnce,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _,
     relative, rems, svg,
 };
 use gpui_base::Button as BaseButton;
@@ -44,6 +44,8 @@ pub struct Button {
     size: ButtonSize,
     leading_icon: Option<TablerIcon>,
     full_width: bool,
+    width: Option<Rems>,
+    truncate_label: bool,
     disabled: bool,
     on_click: Option<ClickHandler>,
 }
@@ -58,6 +60,8 @@ impl Button {
             size: ButtonSize::default(),
             leading_icon: None,
             full_width: false,
+            width: None,
+            truncate_label: false,
             disabled: false,
             on_click: None,
         }
@@ -88,6 +92,20 @@ impl Button {
     #[must_use]
     pub const fn full_width(mut self) -> Self {
         self.full_width = true;
+        self
+    }
+
+    /// Sets a fixed control width.
+    #[must_use]
+    pub const fn width(mut self, width: Rems) -> Self {
+        self.width = Some(width);
+        self
+    }
+
+    /// Truncates an overflowing label with an ellipsis.
+    #[must_use]
+    pub const fn truncate_label(mut self) -> Self {
+        self.truncate_label = true;
         self
     }
 
@@ -141,14 +159,18 @@ impl RenderOnce for Button {
         };
         let disabled = self.disabled;
         let on_click = self.on_click;
+        let label = self.label;
+        let truncate_label = self.truncate_label;
 
         BaseButton::new(self.id)
-            .accessibility_label(self.label.clone())
+            .accessibility_label(label.clone())
             .disabled(disabled)
             .h(height)
             .px(padding)
             .gap(gap)
+            .when_some(self.width, |button, width| button.w(width))
             .when(self.full_width, |button| button.w_full().justify_start())
+            .when(truncate_label, |button| button.overflow_hidden())
             .border(theme.button.border_width)
             .border_color(colors.border)
             .rounded(theme.button.radius)
@@ -195,7 +217,10 @@ impl RenderOnce for Button {
                         .text_color(icon_color),
                 )
             })
-            .child(self.label)
+            .when(truncate_label, |button| {
+                button.child(div().min_w_0().truncate().child(label.clone()))
+            })
+            .when(!truncate_label, |button| button.child(label))
             .when_some(on_click, |button, handler| {
                 button.on_click(move |event, window, cx| handler(event, window, cx))
             })

@@ -3069,7 +3069,58 @@ fn book_detail_panel(
             .flex_1()
             .min_h_0(),
         )
+        .child(book_detail_action_bar(editor, theme, cx))
         .into_any_element()
+}
+
+fn book_detail_action_bar(
+    editor: &BookDetailEditor,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::Div {
+    let editing_busy = editor.operation != DetailOperation::Idle;
+    div()
+        .flex_none()
+        .h(px(TOP_BAR_HEIGHT_PX))
+        .px(theme.spacing.large)
+        .py(theme.spacing.small)
+        .border_t(theme.border.thin)
+        .border_color(theme.border.muted)
+        .flex()
+        .items_center()
+        .justify_end()
+        .gap(theme.spacing.small)
+        .child(
+            Button::new(
+                "save-book-detail",
+                if editor.operation == DetailOperation::Saving {
+                    "Saving…"
+                } else {
+                    "Save"
+                },
+            )
+            .size(ButtonSize::Small)
+            .variant(ButtonVariant::Primary)
+            .disabled(
+                !editor.dirty
+                    || editing_busy
+                    || matches!(
+                        editor.series_index_availability,
+                        SeriesIndexAvailability::Checking | SeriesIndexAvailability::Conflict
+                    ),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.save_book_detail(window, cx);
+            })),
+        )
+        .child(
+            Button::new("reset-book-detail", "Reset")
+                .size(ButtonSize::Small)
+                .disabled(!editor.dirty || editing_busy)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.reset_book_detail(window, cx);
+                })),
+        )
 }
 
 impl LecternView {
@@ -3158,7 +3209,7 @@ impl LecternView {
         let content = if item == DETAIL_INFORMATION_ITEM {
             detail_information_item(editor, &theme, cx)
         } else if item == DETAIL_PUBLICATION_ITEM {
-            detail_publication_item(editor, &theme, cx)
+            detail_publication_item(editor, &theme)
         } else if item == DETAIL_FILES_ITEM {
             detail_files_item(editor, &theme, cx)
         } else if item == DETAIL_SERIES_ITEM {
@@ -3322,7 +3373,7 @@ fn metadata_error_section(error: &str) -> DetailErrorSection {
         DetailErrorSection::Series
     } else if error.contains("tag") {
         DetailErrorSection::Tags
-    } else if error.contains("publication date") || error.contains("rating") {
+    } else if error.contains("publication date") {
         DetailErrorSection::Publication
     } else {
         DetailErrorSection::Information
@@ -3350,66 +3401,10 @@ fn detail_information_item(
     theme: &PrimerTheme,
     cx: &mut Context<LecternView>,
 ) -> gpui::AnyElement {
-    let editing_busy = editor.operation != DetailOperation::Idle;
     div()
         .flex()
         .flex_col()
         .gap(theme.spacing.large)
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(theme.spacing.medium)
-                .child(detail_section_heading("Book information", theme))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(theme.spacing.small)
-                        .when(editor.dirty, |row| {
-                            row.child(
-                                div()
-                                    .text_color(theme.surface.muted_foreground)
-                                    .child("Unsaved"),
-                            )
-                        })
-                        .child(
-                            Button::new(
-                                "save-book-detail",
-                                if editor.operation == DetailOperation::Saving {
-                                    "Saving…"
-                                } else {
-                                    "Save"
-                                },
-                            )
-                            .size(ButtonSize::Small)
-                            .variant(ButtonVariant::Primary)
-                            .disabled(
-                                !editor.dirty
-                                    || editing_busy
-                                    || matches!(
-                                        editor.series_index_availability,
-                                        SeriesIndexAvailability::Checking
-                                            | SeriesIndexAvailability::Conflict
-                                    ),
-                            )
-                            .on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    this.save_book_detail(window, cx);
-                                },
-                            )),
-                        )
-                        .child(
-                            Button::new("reset-book-detail", "Reset")
-                                .size(ButtonSize::Small)
-                                .disabled(!editor.dirty || editing_busy)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.reset_book_detail(window, cx);
-                                })),
-                        ),
-                ),
-        )
         .child(detail_field_container("Title", theme).child(TextInput::new(
             "detail-title",
             "Book title",
@@ -3432,6 +3427,7 @@ fn detail_information_item(
                 .height(rems(6.)),
             ),
         )
+        .child(detail_rating_field(editor, theme, cx))
         .when_some(
             detail_error(editor, DetailErrorSection::Information),
             |content, error| content.child(detail_error_text(error, theme)),
@@ -3439,16 +3435,7 @@ fn detail_information_item(
         .into_any_element()
 }
 
-fn detail_publication_item(
-    editor: &BookDetailEditor,
-    theme: &PrimerTheme,
-    cx: &mut Context<LecternView>,
-) -> gpui::AnyElement {
-    let rating_label = if editor.rating == BookRating::default() {
-        "Unrated".to_owned()
-    } else {
-        format!("{} of 5", editor.rating)
-    };
+fn detail_publication_item(editor: &BookDetailEditor, theme: &PrimerTheme) -> gpui::AnyElement {
     div()
         .flex()
         .flex_col()
@@ -3485,41 +3472,51 @@ fn detail_publication_item(
                         )),
                 ),
         )
-        .child(
-            detail_field_container("Rating", theme).child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(theme.spacing.medium)
-                    .child(
-                        StarRating::new("detail-rating", editor.rating.half_stars())
-                            .disabled(editor.operation != DetailOperation::Idle)
-                            .on_change(cx.listener(|this, half_stars, _, cx| {
-                                this.set_detail_rating(*half_stars, cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.surface.muted_foreground)
-                            .child(rating_label),
-                    )
-                    .when(editor.rating != BookRating::default(), |row| {
-                        row.child(
-                            Button::new("clear-detail-rating", "Clear")
-                                .size(ButtonSize::Small)
-                                .disabled(editor.operation != DetailOperation::Idle)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.set_detail_rating(0, cx);
-                                })),
-                        )
-                    }),
-            ),
-        )
         .when_some(
             detail_error(editor, DetailErrorSection::Publication),
             |content, error| content.child(detail_error_text(error, theme)),
         )
         .into_any_element()
+}
+
+fn detail_rating_field(
+    editor: &BookDetailEditor,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::Div {
+    let rating_label = if editor.rating == BookRating::default() {
+        "Unrated".to_owned()
+    } else {
+        format!("{} of 5", editor.rating)
+    };
+    detail_field_container("Rating", theme).child(
+        div()
+            .flex()
+            .items_center()
+            .gap(theme.spacing.medium)
+            .child(
+                StarRating::new("detail-rating", editor.rating.half_stars())
+                    .disabled(editor.operation != DetailOperation::Idle)
+                    .on_change(cx.listener(|this, half_stars, _, cx| {
+                        this.set_detail_rating(*half_stars, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .text_color(theme.surface.muted_foreground)
+                    .child(rating_label),
+            )
+            .when(editor.rating != BookRating::default(), |row| {
+                row.child(
+                    Button::new("clear-detail-rating", "Clear")
+                        .size(ButtonSize::Small)
+                        .disabled(editor.operation != DetailOperation::Idle)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_detail_rating(0, cx);
+                        })),
+                )
+            }),
+    )
 }
 
 fn detail_contributor_footer(
@@ -4111,6 +4108,8 @@ fn contributor_role_picker(
             format!("{} ▾", field.role),
         )
         .size(ButtonSize::Medium)
+        .width(rems(10.))
+        .truncate_label()
         .disabled(editing_busy),
         div().flex().flex_col().children(role_options),
     )
@@ -4188,6 +4187,7 @@ fn contributor_field_row(
                 .child(
                     Button::new(format!("contributor-{row_id}-remove"), "Remove")
                         .size(ButtonSize::Small)
+                        .width(rems(10.))
                         .disabled(editing_busy)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.remove_detail_contributor(row_id, cx);
