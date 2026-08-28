@@ -111,9 +111,10 @@ python3 benchmarks/performance_regression.py \
 
 It retains 40 measured fresh-process samples after 5 warmups for the same 50,000-book projection
 and bounded 128-card first page. The representative detail fixture includes ordered contributor
-roles, a series index, multiple tags, publication date, a 3.5-star rating, ordinary publication
-metadata, and both EPUB and PDF assets. It verifies the complete panel markers while gating
-populated first paint, book-selection-to-painted-sidebar p95, and peak RSS.
+roles, a series index, multiple tags, three identifiers (including two ISBNs), publication date, a
+3.5-star rating, ordinary publication metadata, and both EPUB and PDF assets. It verifies the
+complete panel markers while gating populated first paint, book-selection-to-painted-sidebar p95,
+and peak RSS.
 
 The normalized organisation v2 fixture replaces the historical duplicate series-number
 distribution with deterministic unique exact numbers at the same 50,000-book, 2,500-series scale.

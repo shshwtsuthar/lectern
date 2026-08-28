@@ -2043,6 +2043,7 @@ def expected_ui_book_detail_correctness(workload: dict[str, Any]) -> dict[str, A
         "rating_half_stars": 7,
         "contributor_count": 3,
         "tag_count": 2,
+        "identifier_count": 3,
         "asset_count": 2,
         "markers": [
             "bounded_first_page",
@@ -2050,6 +2051,7 @@ def expected_ui_book_detail_correctness(workload: dict[str, Any]) -> dict[str, A
             "complete_metadata_fixture",
             "publication_metadata_presented",
             "half_star_rating_presented",
+            "identifiers_presented",
             "multiple_assets_presented",
         ],
     }

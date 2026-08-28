@@ -20,6 +20,7 @@
       "complete_metadata_fixture",
       "publication_metadata_presented",
       "half_star_rating_presented",
+      "identifiers_presented",
       "multiple_assets_presented"
     ]
   },

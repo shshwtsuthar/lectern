@@ -140,6 +140,17 @@ and disabled stars use their own theme-resolved values. Do not use tag-palette A
 color literal merely because gold stars are conventional. The numeric value remains visible beside
 the stars so rating state never depends on color or fill alone.
 
+## Book identifiers
+
+Book identifiers form their own flush side-panel section. Show every assigned type and value as a
+compact text row with a nearby Remove action; identifiers are metadata, not colored tags or rounded
+pills. Repeated values of the same type remain separate rows.
+
+Adding an identifier uses progressive disclosure in one anchored menu: first choose a stored type
+or create a normalized custom type, then assign its value. Keep the type vocabulary bounded and
+searchable, preserve the exact value apart from surrounding whitespace, and never make users choose
+from format-specific book columns.
+
 ## Subtle surface separators
 
 Use a thin, low-contrast border when adjacent application regions need a persistent boundary but
