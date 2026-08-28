@@ -15,8 +15,8 @@ use gpui::{
 };
 use gpui_base::{
     AlertDialog, AlertDialogBackdrop, AlertDialogDescription, AlertDialogPopup, AlertDialogTitle,
-    Checkbox, CheckboxState,
-    input::{InputEvent, InputState, TextareaState},
+    Checkbox, CheckboxState, active_focus_trap,
+    input::{Escape as InputEscape, InputEvent, InputState, TextareaState},
 };
 use gpui_platform::application;
 use lectern_core::{
@@ -62,10 +62,88 @@ gpui::actions!(
     [
         /// Select every book in the current library projection.
         SelectAllBooks,
-        /// Leave multi-book selection mode.
-        ClearBookSelection
+        /// Dismiss the topmost transient surface or leave multi-book selection mode.
+        DismissActiveSurface,
+        /// Move keyboard focus to the next available control.
+        FocusNextControl,
+        /// Move keyboard focus to the previous available control.
+        FocusPreviousControl
     ]
 );
+
+const KEYBOARD_CONTEXT: &str = "LecternLibrary";
+const INPUT_CONTEXT: &str = "Input";
+const MAX_FOCUS_TRAP_STOPS: usize = 128;
+
+fn install_keyboard_shortcuts(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-a", SelectAllBooks, Some(KEYBOARD_CONTEXT)),
+        KeyBinding::new("ctrl-a", SelectAllBooks, Some(KEYBOARD_CONTEXT)),
+        KeyBinding::new("escape", DismissActiveSurface, Some(KEYBOARD_CONTEXT)),
+        KeyBinding::new("tab", FocusNextControl, Some(KEYBOARD_CONTEXT)),
+        KeyBinding::new("shift-tab", FocusPreviousControl, Some(KEYBOARD_CONTEXT)),
+        // gpui-base reserves Tab for indentation in its Input context. Lectern inputs are form
+        // controls, so override that binding after gpui-base initialization to traverse controls.
+        KeyBinding::new("tab", FocusNextControl, Some(INPUT_CONTEXT)),
+        KeyBinding::new("shift-tab", FocusPreviousControl, Some(INPUT_CONTEXT)),
+    ]);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DismissTarget {
+    ThemeDialog,
+    BulkRemovalDialog,
+    DetailRemovalConfirmation,
+    BulkTags,
+    BookDetail,
+    Selection,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DismissibleSurfaces {
+    theme_dialog: bool,
+    bulk_removal_dialog: bool,
+    detail_removal_confirmation: bool,
+    bulk_tags: bool,
+    book_detail: bool,
+}
+
+fn topmost_dismiss_target(surfaces: DismissibleSurfaces) -> DismissTarget {
+    if surfaces.theme_dialog {
+        DismissTarget::ThemeDialog
+    } else if surfaces.bulk_removal_dialog {
+        DismissTarget::BulkRemovalDialog
+    } else if surfaces.detail_removal_confirmation {
+        DismissTarget::DetailRemovalConfirmation
+    } else if surfaces.bulk_tags {
+        DismissTarget::BulkTags
+    } else if surfaces.book_detail {
+        DismissTarget::BookDetail
+    } else {
+        DismissTarget::Selection
+    }
+}
+
+fn cycle_keyboard_focus(window: &mut Window, cx: &mut App, forward: bool) {
+    let cycle = |window: &mut Window, cx: &mut App| {
+        if forward {
+            window.focus_next(cx);
+        } else {
+            window.focus_prev(cx);
+        }
+    };
+    let Some(trap) = active_focus_trap(window, cx) else {
+        cycle(window, cx);
+        return;
+    };
+    let initial = window.focused(cx);
+    for _ in 0..MAX_FOCUS_TRAP_STOPS {
+        cycle(window, cx);
+        if trap.contains_focused(window, cx) || window.focused(cx) == initial {
+            return;
+        }
+    }
+}
 
 /// Runs Lectern's native GPUI desktop application.
 ///
@@ -110,11 +188,7 @@ pub fn run(main_entry: Instant) {
         .run(move |cx: &mut App| {
             gpui_base::init(cx);
             install_fonts(cx).expect("install bundled Lectern fonts");
-            cx.bind_keys([
-                KeyBinding::new("cmd-a", SelectAllBooks, Some("LecternLibrary")),
-                KeyBinding::new("ctrl-a", SelectAllBooks, Some("LecternLibrary")),
-                KeyBinding::new("escape", ClearBookSelection, Some("LecternLibrary")),
-            ]);
+            install_keyboard_shortcuts(cx);
             let database_path = default_database_path();
             let appearance = load_appearance(&database_path);
             install_theme(
@@ -1189,6 +1263,27 @@ impl LecternView {
         self.clear_selection();
         self.status = Some("Selection cleared.".into());
         cx.notify();
+    }
+
+    fn dismiss_active_surface(&mut self, cx: &mut Context<Self>) {
+        let target = topmost_dismiss_target(DismissibleSurfaces {
+            theme_dialog: self.theme_dialog_open,
+            bulk_removal_dialog: self.removal_confirmation.is_some(),
+            detail_removal_confirmation: self
+                .detail_editor
+                .as_ref()
+                .is_some_and(|editor| editor.remove_confirmation),
+            bulk_tags: self.bulk_tags.is_some(),
+            book_detail: self.detail_editor.is_some() || self.detail_loading.is_some(),
+        });
+        match target {
+            DismissTarget::ThemeDialog => self.close_theme_dialog(cx),
+            DismissTarget::BulkRemovalDialog => self.cancel_bulk_removal(cx),
+            DismissTarget::DetailRemovalConfirmation => self.cancel_detail_removal(cx),
+            DismissTarget::BulkTags => self.close_bulk_tags(cx),
+            DismissTarget::BookDetail => self.close_book_detail(cx),
+            DismissTarget::Selection => self.clear_selection_action(cx),
+        }
     }
 
     fn toggle_book(&mut self, id: BookId, index: usize, cx: &mut Context<Self>) {
@@ -2809,6 +2904,7 @@ impl LecternView {
 
         AlertDialog::new(cx)
             .open(true)
+            .close_on_escape(true)
             .on_open_change(move |open, _, _, cx| {
                 if !open {
                     _ = close_entity.update(cx, LecternView::cancel_bulk_removal);
@@ -2956,6 +3052,7 @@ impl LecternView {
 
         AlertDialog::new(cx)
             .open(true)
+            .close_on_escape(true)
             .on_open_change(move |open, _, _, cx| {
                 if !open {
                     _ = close_entity.update(cx, LecternView::close_theme_dialog);
@@ -3305,12 +3402,21 @@ impl Render for LecternView {
             .text_color(theme.surface.foreground)
             .flex()
             .flex_col()
-            .key_context("LecternLibrary")
+            .key_context(KEYBOARD_CONTEXT)
             .on_action(cx.listener(|this, _: &SelectAllBooks, window, cx| {
                 this.select_all_matching(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ClearBookSelection, _, cx| {
-                this.clear_selection_action(cx);
+            .on_action(cx.listener(|this, _: &DismissActiveSurface, _, cx| {
+                this.dismiss_active_surface(cx);
+            }))
+            .on_action(cx.listener(|this, _: &InputEscape, _, cx| {
+                this.dismiss_active_surface(cx);
+            }))
+            .on_action(cx.listener(|_, _: &FocusNextControl, window, cx| {
+                cycle_keyboard_focus(window, cx, true);
+            }))
+            .on_action(cx.listener(|_, _: &FocusPreviousControl, window, cx| {
+                cycle_keyboard_focus(window, cx, false);
             }))
             .child(
                 div()
@@ -5811,6 +5917,35 @@ fn benchmark_book_detail() -> Book {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+
+    #[test]
+    fn escape_dismisses_the_topmost_surface_first() {
+        let mut surfaces = DismissibleSurfaces {
+            theme_dialog: true,
+            bulk_removal_dialog: true,
+            detail_removal_confirmation: true,
+            bulk_tags: true,
+            book_detail: true,
+        };
+
+        assert_eq!(topmost_dismiss_target(surfaces), DismissTarget::ThemeDialog);
+        surfaces.theme_dialog = false;
+        assert_eq!(
+            topmost_dismiss_target(surfaces),
+            DismissTarget::BulkRemovalDialog
+        );
+        surfaces.bulk_removal_dialog = false;
+        assert_eq!(
+            topmost_dismiss_target(surfaces),
+            DismissTarget::DetailRemovalConfirmation
+        );
+        surfaces.detail_removal_confirmation = false;
+        assert_eq!(topmost_dismiss_target(surfaces), DismissTarget::BulkTags);
+        surfaces.bulk_tags = false;
+        assert_eq!(topmost_dismiss_target(surfaces), DismissTarget::BookDetail);
+        surfaces.book_detail = false;
+        assert_eq!(topmost_dismiss_target(surfaces), DismissTarget::Selection);
+    }
 
     #[test]
     fn explicit_selection_toggles_and_builds_a_canonical_descriptor() {
