@@ -277,6 +277,25 @@ pub struct ButtonTheme {
     pub border_width: Rems,
 }
 
+/// Compact binary-control colors resolved for the selected Lectern accent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SwitchTheme {
+    /// Track background while unchecked.
+    pub unchecked_background: Hsla,
+    /// Track background while an unchecked switch is hovered.
+    pub unchecked_hover_background: Hsla,
+    /// Track background while checked.
+    pub checked_background: Hsla,
+    /// Track background while a checked switch is hovered.
+    pub checked_hover_background: Hsla,
+    /// Track background while interaction is unavailable.
+    pub disabled_background: Hsla,
+    /// Movable thumb surface.
+    pub thumb: Hsla,
+    /// Movable thumb surface while interaction is unavailable.
+    pub disabled_thumb: Hsla,
+}
+
 /// Text-entry colors and geometry shared by single- and multi-line fields.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InputTheme {
@@ -376,6 +395,8 @@ pub struct PrimerTheme {
     pub rating: RatingTheme,
     /// Button colors and geometry.
     pub button: ButtonTheme,
+    /// Compact binary-control colors.
+    pub switch: SwitchTheme,
     /// Text-entry colors and geometry.
     pub input: InputTheme,
     /// Focus-visible ring.
@@ -589,6 +610,15 @@ impl PrimerTheme {
                 radius: rems(common::BORDER_RADIUS_MEDIUM),
                 border_width: rems(common::BORDER_WIDTH_THIN),
             },
+            switch: SwitchTheme {
+                unchecked_background: color(choose!(CONTROL_BORDER_REST)),
+                unchecked_hover_background: color(choose!(CONTROL_FG_PLACEHOLDER)),
+                checked_background: color(primary.background),
+                checked_hover_background: color(primary.hover_background),
+                disabled_background: color(choose!(CONTROL_BG_DISABLED)),
+                thumb: color(choose!(BG_COLOR_DEFAULT)),
+                disabled_thumb: color(choose!(CONTROL_FG_DISABLED)),
+            },
             input: InputTheme {
                 background: color(choose!(CONTROL_BG_REST)),
                 disabled_background: color(choose!(CONTROL_BG_DISABLED)),
@@ -696,6 +726,16 @@ mod tests {
         assert_eq!(light.rating.filled, light.button.primary.background);
         assert_eq!(dark.rating.filled, dark.button.primary.background);
         assert_eq!(light.rating.empty, rgba(light::CONTROL_BORDER_REST).into());
+        assert_eq!(
+            light.switch.checked_background,
+            light.button.primary.background
+        );
+        assert_eq!(
+            dark.switch.checked_background,
+            dark.button.primary.background
+        );
+        assert_eq!(light.switch.thumb, light.surface.background);
+        assert_eq!(dark.switch.thumb, dark.surface.background);
 
         for accent in AccentColor::ALL {
             let themed = PrimerTheme::with_accent(ColorMode::Dark, accent);
