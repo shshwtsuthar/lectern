@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use gpui::{App, FontWeight, Global, Hsla, Rems, rems, rgba};
+use gpui::{App, FontWeight, Global, Hsla, Rems, hsla, rems, rgba};
 
 use crate::{
     brand::{
@@ -296,6 +296,17 @@ pub struct SwitchTheme {
     pub disabled_thumb: Hsla,
 }
 
+/// Lighting and construction colors for restrained physical book-cover rendering.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BookCoverTheme {
+    /// Warm paper visible behind the front cover.
+    pub page_block: Hsla,
+    /// Very narrow grounding shadow at the contact point.
+    pub contact_shadow: Hsla,
+    /// Wider cast shadow following the common upper-left light direction.
+    pub cast_shadow: Hsla,
+}
+
 /// Text-entry colors and geometry shared by single- and multi-line fields.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InputTheme {
@@ -397,6 +408,8 @@ pub struct PrimerTheme {
     pub button: ButtonTheme,
     /// Compact binary-control colors.
     pub switch: SwitchTheme,
+    /// Physical book-cover lighting and construction colors.
+    pub book_cover: BookCoverTheme,
     /// Text-entry colors and geometry.
     pub input: InputTheme,
     /// Focus-visible ring.
@@ -619,6 +632,17 @@ impl PrimerTheme {
                 thumb: color(choose!(BG_COLOR_DEFAULT)),
                 disabled_thumb: color(choose!(CONTROL_FG_DISABLED)),
             },
+            book_cover: BookCoverTheme {
+                page_block: rgba(0xe9e3_d6ff).into(),
+                contact_shadow: match mode {
+                    ColorMode::Light => hsla(0., 0., 0., 0.20),
+                    ColorMode::Dark => hsla(0., 0., 0., 0.38),
+                },
+                cast_shadow: match mode {
+                    ColorMode::Light => hsla(0., 0., 0., 0.12),
+                    ColorMode::Dark => hsla(0., 0., 0., 0.30),
+                },
+            },
             input: InputTheme {
                 background: color(choose!(CONTROL_BG_REST)),
                 disabled_background: color(choose!(CONTROL_BG_DISABLED)),
@@ -736,6 +760,11 @@ mod tests {
         );
         assert_eq!(light.switch.thumb, light.surface.background);
         assert_eq!(dark.switch.thumb, dark.surface.background);
+        assert_eq!(light.book_cover.page_block, dark.book_cover.page_block);
+        assert!(
+            dark.book_cover.cast_shadow.a > light.book_cover.cast_shadow.a,
+            "the cast shadow must remain visible on the dark library surface"
+        );
 
         for accent in AccentColor::ALL {
             let themed = PrimerTheme::with_accent(ColorMode::Dark, accent);

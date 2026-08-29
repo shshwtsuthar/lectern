@@ -79,6 +79,10 @@
       "budget": "benchmarks/ui-selection-regression-v1.json"
     },
     {
+      "name": "ui-material-covers-v1",
+      "budget": "benchmarks/ui-material-covers-regression-v1.json"
+    },
+    {
       "name": "ui-book-detail-v2",
       "budget": "benchmarks/ui-book-detail-regression-v2.json"
     }

@@ -88,6 +88,7 @@ def main(arguments: list[str]) -> int:
         if mode in (
             "ui-bootstrap",
             "ui-selection",
+            "ui-material-covers",
             "ui-book-detail",
             "ui-genres",
             "ui-virtual-library",
@@ -99,6 +100,11 @@ def main(arguments: list[str]) -> int:
             elif mode == "ui-selection":
                 ui_result = run_ui_selection(query_output, output, workload, commands)
                 decisions = evaluate_ui_selection_result(ui_result, budget)
+            elif mode == "ui-material-covers":
+                ui_result = run_ui_material_covers(
+                    query_output, output, workload, commands
+                )
+                decisions = evaluate_ui_material_covers_result(ui_result, budget)
             elif mode == "ui-book-detail":
                 ui_result = run_ui_book_detail(query_output, output, workload, commands)
                 decisions = evaluate_ui_book_detail_result(ui_result, budget)
@@ -419,6 +425,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "maintenance",
         "ui-bootstrap",
         "ui-selection",
+        "ui-material-covers",
         "ui-book-detail",
         "ui-genres",
         "ui-virtual-library",
@@ -429,11 +436,19 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             "'organisation-migration', 'organisation-query', "
             "'organisation-vocabulary', 'bulk-tags', 'bulk-remove', 'saved-searches', 'genres', 'maintenance', "
             "'virtual-libraries', "
-            "'ui-bootstrap', 'ui-selection', 'ui-book-detail', 'ui-genres', or 'ui-virtual-library'"
+            "'ui-bootstrap', 'ui-selection', 'ui-material-covers', 'ui-book-detail', "
+            "'ui-genres', or 'ui-virtual-library'"
         )
     if (
         query_mode
-        in ("ui-bootstrap", "ui-selection", "ui-book-detail", "ui-genres", "ui-virtual-library")
+        in (
+            "ui-bootstrap",
+            "ui-selection",
+            "ui-material-covers",
+            "ui-book-detail",
+            "ui-genres",
+            "ui-virtual-library",
+        )
     ) != (
         budget["kind"] == UI_CONFIGURATION_KIND
     ):
@@ -575,11 +590,21 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                     raise RegressionError(
                         f"bulk removal workload {field} must be greater than zero"
                     )
-        if query_mode in ("ui-selection", "ui-book-detail", "ui-genres", "ui-virtual-library"):
+        if query_mode in (
+            "ui-selection",
+            "ui-material-covers",
+            "ui-book-detail",
+            "ui-genres",
+            "ui-virtual-library",
+        ):
             if positive_or_zero_field(workload, "page_size", "budget.workload") == 0:
                 raise RegressionError(
                     "populated UI workload page_size must be greater than zero"
                 )
+        if query_mode == "ui-material-covers" and workload["cover_every"] != 1:
+            raise RegressionError(
+                "material-cover UI workload must cover every rendered book"
+            )
         if query_mode == "ui-book-detail" and positive_or_zero_field(
             workload, "fixture_version", "budget.workload"
         ) != 2:
@@ -679,6 +704,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         if query_mode in (
             "ui-bootstrap",
             "ui-selection",
+            "ui-material-covers",
             "ui-book-detail",
             "ui-genres",
             "ui-virtual-library",
@@ -2103,6 +2129,96 @@ def run_ui_selection(
     return result
 
 
+def run_ui_material_covers(
+    output: pathlib.Path,
+    artifact_directory: pathlib.Path,
+    workload: dict[str, Any],
+    commands: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Measure a covered GPUI grid and the flat-to-material compositor transition."""
+
+    run_command(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "lectern-desktop",
+            "--bin",
+            "lectern-gpui",
+        ],
+        commands,
+        timeout_seconds=1_800,
+    )
+    target_directory = pathlib.Path(
+        os.environ.get("CARGO_TARGET_DIR", str(REPOSITORY / "target"))
+    )
+    if not target_directory.is_absolute():
+        target_directory = REPOSITORY / target_directory
+    executable = target_directory / "release/lectern-gpui"
+    if sys.platform == "win32":
+        executable = executable.with_suffix(".exe")
+    if not executable.is_file():
+        raise RegressionError(f"release GPUI executable is missing: {executable}")
+
+    warmup = workload["warmup_iterations"]
+    measured = workload["measured_iterations"]
+    samples_directory = artifact_directory / "ui-samples"
+    samples_directory.mkdir()
+    measured_samples: list[dict[str, Any]] = []
+    raw_paths: list[str] = []
+    for index in range(warmup + measured):
+        phase = "warmup" if index < warmup else "measured"
+        phase_index = index if phase == "warmup" else index - warmup
+        sample_path = samples_directory / f"{phase}-{phase_index:03d}.json"
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "LECTERN_GPUI_BENCHMARK_OUTPUT": str(sample_path),
+                "LECTERN_GPUI_BENCHMARK_WORKLOAD": "material-covers",
+            }
+        )
+        run_command(
+            [str(executable)],
+            commands,
+            environment=environment,
+            timeout_seconds=15,
+        )
+        sample = read_json(sample_path)
+        validate_ui_material_covers_sample(sample, sample_path, workload)
+        raw_paths.append(str(sample_path))
+        if phase == "measured":
+            measured_samples.append(sample)
+
+    peak_samples = [
+        sample["peak_rss_bytes"]
+        for sample in measured_samples
+        if sample.get("peak_rss_bytes") is not None
+    ]
+    peak_rss = max(peak_samples) if peak_samples else None
+    scenarios = []
+    for name, field in (
+        ("covered_library_render", "initial_render_ms"),
+        ("material_toggle_to_painted_state", "toggle_to_paint_ms"),
+    ):
+        samples_ns = [
+            round(float(sample[field]) * 1_000_000) for sample in measured_samples
+        ]
+        scenarios.append(ui_scenario(name, samples_ns, peak_rss))
+    result = {
+        "kind": "lectern-ui-material-cover-performance",
+        "library_books": workload["books"],
+        "warmup_iterations": warmup,
+        "measured_iterations": measured,
+        "raw_samples": raw_paths,
+        "correctness": measured_samples[0]["correctness"],
+        "scenarios": scenarios,
+    }
+    write_json(output, result)
+    return result
+
+
 def run_ui_book_detail(
     output: pathlib.Path,
     artifact_directory: pathlib.Path,
@@ -2437,6 +2553,43 @@ def expected_ui_selection_correctness(workload: dict[str, Any]) -> dict[str, Any
     }
 
 
+def validate_ui_material_covers_sample(
+    sample: dict[str, Any], path: pathlib.Path, workload: dict[str, Any]
+) -> None:
+    context = f"UI material-cover sample {path.name}"
+    if sample.get("schema_version") != 1:
+        raise RegressionError(f"{context} schema_version must be 1")
+    if sample.get("workload") != "material-covers":
+        raise RegressionError(f"{context} workload identity is invalid")
+    for field in ("initial_render_ms", "toggle_to_paint_ms"):
+        positive_number_field(sample, field, context)
+    peak_rss = sample.get("peak_rss_bytes")
+    if peak_rss is not None and positive_or_zero_field(
+        sample, "peak_rss_bytes", context
+    ) == 0:
+        raise RegressionError(f"{context} peak_rss_bytes must be positive when present")
+    if sample.get("correctness") != expected_ui_material_covers_correctness(workload):
+        raise RegressionError(f"{context} correctness markers are invalid")
+
+
+def expected_ui_material_covers_correctness(
+    workload: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "library_total": workload["books"],
+        "rendered_books": workload["page_size"],
+        "rendered_covers": workload["page_size"],
+        "unique_covers": workload["page_size"],
+        "material_covers_enabled": True,
+        "markers": [
+            "bounded_covered_first_page",
+            "unique_cover_images",
+            "material_cover_stack_presented",
+            "top_bar_toggle_presented",
+        ],
+    }
+
+
 def validate_ui_book_detail_sample(
     sample: dict[str, Any], path: pathlib.Path, workload: dict[str, Any]
 ) -> None:
@@ -2700,6 +2853,81 @@ def evaluate_ui_selection_result(
     expected_names = set(workload["scenarios"])
     if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
         raise RegressionError("UI selection scenarios do not match the versioned budget")
+    decisions = []
+    for name in sorted(expected_names):
+        scenario = by_name[name]
+        scenario_budget = budget["budgets"][name]
+        p95_ms = float(scenario["latency_ms"]["p95"])
+        maximum_ms = float(scenario_budget["max_p95_ms"])
+        peak_rss = scenario.get("peak_rss_bytes")
+        maximum_rss = scenario_budget["max_peak_rss_bytes"]
+        memory_passed = peak_rss is None or peak_rss <= maximum_rss
+        decisions.append(
+            {
+                "name": name,
+                "p95_ms": p95_ms,
+                "max_p95_ms": maximum_ms,
+                "sample_count": measured,
+                "peak_rss_bytes": peak_rss,
+                "max_peak_rss_bytes": maximum_rss,
+                "passed": p95_ms <= maximum_ms and memory_passed,
+            }
+        )
+    return decisions
+
+
+def evaluate_ui_material_covers_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "UI material-cover result"
+    if result.get("kind") != "lectern-ui-material-cover-performance":
+        raise RegressionError(f"{context} kind is invalid")
+    if positive_or_zero_field(result, "library_books", context) != workload["books"]:
+        raise RegressionError(f"{context} library size does not match the budget")
+    if result.get("correctness") != expected_ui_material_covers_correctness(workload):
+        raise RegressionError(f"{context} correctness markers are invalid")
+    warmup = positive_or_zero_field(result, "warmup_iterations", context)
+    measured = positive_or_zero_field(result, "measured_iterations", context)
+    if warmup != workload["warmup_iterations"] or measured != workload["measured_iterations"]:
+        raise RegressionError(f"{context} iteration counts do not match the budget")
+    raw_samples = result.get("raw_samples")
+    if (
+        not isinstance(raw_samples, list)
+        or len(raw_samples) != warmup + measured
+        or not all(isinstance(path, str) and path for path in raw_samples)
+    ):
+        raise RegressionError(f"{context} must retain every raw sample path")
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError(f"{context} must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, scenario in enumerate(scenarios):
+        scenario_context = f"UI material-cover scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{scenario_context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{scenario_context}.name must be unique")
+        samples = positive_samples(scenario, scenario_context, measured)
+        p95_ms = positive_number_field(
+            object_field(scenario, "latency_ms", scenario_context),
+            "p95",
+            f"{scenario_context}.latency_ms",
+        )
+        expected_p95_ms = nearest_rank_p95(samples) / 1_000_000
+        if not math.isclose(p95_ms, expected_p95_ms, rel_tol=0.0, abs_tol=1e-9):
+            raise RegressionError(f"{scenario_context} p95 does not match retained samples")
+        peak_rss = scenario.get("peak_rss_bytes")
+        if peak_rss is not None and positive_or_zero_field(
+            scenario, "peak_rss_bytes", scenario_context
+        ) == 0:
+            raise RegressionError(f"{scenario_context} peak RSS must be positive")
+        by_name[name] = scenario
+
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("UI material-cover scenarios do not match the versioned budget")
     decisions = []
     for name in sorted(expected_names):
         scenario = by_name[name]

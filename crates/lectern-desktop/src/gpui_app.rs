@@ -15,9 +15,10 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, Context, Entity, Image, ImageFormat, KeyBinding, ListAlignment, ListState,
-    ObjectFit, Render, SharedString, StatefulInteractiveElement, StyledImage, Window, WindowBounds,
-    WindowDecorations, WindowOptions, div, img, list, prelude::*, px, relative, rems, size,
+    App, Bounds, BoxShadow, Context, Entity, Image, ImageFormat, KeyBinding, ListAlignment,
+    ListState, ObjectFit, Render, SharedString, StatefulInteractiveElement, StyledImage, Window,
+    WindowBounds, WindowDecorations, WindowOptions, div, img, list, prelude::*, px, relative, rems,
+    size,
 };
 use gpui_base::{
     AlertDialog, AlertDialogBackdrop, AlertDialogDescription, AlertDialogPopup, AlertDialogTitle,
@@ -45,8 +46,8 @@ use lectern_device::{
 use lectern_service::{LibraryServiceError, SqliteLibraryService, default_database_path};
 use lectern_ui::{
     AccentColor, ActionListItem, ActionMenu, Button, ButtonSize, ButtonVariant, ColorMode,
-    ColorSwatch, EntityChip, IconButton, LecternAssets, PrimerTheme, StarRating, TablerIcon,
-    TagChip, TextArea, TextInput, install_fonts, install_theme,
+    ColorSwatch, EntityChip, IconButton, LecternAssets, PrimerTheme, StarRating, Switch,
+    TablerIcon, TagChip, TextArea, TextInput, install_fonts, install_theme,
 };
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,9 @@ const WINDOW_HEIGHT_PX: f32 = 620.0;
 const EMPTY_LIBRARY_CONTENT_WIDTH_PX: f32 = 480.0;
 const BOOK_CARD_WIDTH_PX: f32 = 160.0;
 const BOOK_COVER_HEIGHT_PX: f32 = 216.0;
+const BOOK_COVER_CORNER_RADIUS_PX: f32 = 1.25;
+const BOOK_COVER_PAGE_BLOCK_PX: f32 = 2.0;
+const BOOK_COVER_HOVER_LIFT_PX: f32 = 2.0;
 const TOP_BAR_HEIGHT_PX: f32 = 48.0;
 const SELECTION_BAR_HEIGHT_PX: f32 = 48.0;
 const BOTTOM_BAR_HEIGHT_PX: f32 = 24.0;
@@ -205,6 +209,7 @@ pub fn run(main_entry: Instant) {
     let benchmark = env::var_os(BENCHMARK_OUTPUT_ENV).map(|path| {
         let workload = match env::var(BENCHMARK_WORKLOAD_ENV).as_deref() {
             Ok("library-selection") => BenchmarkWorkload::LibrarySelection,
+            Ok("material-covers") => BenchmarkWorkload::MaterialCovers,
             Ok("book-detail") => BenchmarkWorkload::BookDetail,
             Ok("genres") => BenchmarkWorkload::Genres,
             Ok("virtual-library") => BenchmarkWorkload::VirtualLibrary,
@@ -221,6 +226,7 @@ pub fn run(main_entry: Instant) {
             initial_render: None,
             action_started: None,
             selection_painted: None,
+            material_cover_painted: None,
             detail_painted: None,
             genre_picker_painted: None,
             virtual_library_dialog_painted: None,
@@ -293,6 +299,7 @@ struct LecternView {
     removal_confirmation: Option<BulkRemovalConfirmation>,
     appearance: AppearanceSettings,
     appearance_dirty: bool,
+    appearance_saving: bool,
     theme_dialog_open: bool,
     virtual_library_dialog: Option<VirtualLibraryDialogState>,
     removing: bool,
@@ -314,6 +321,7 @@ struct LecternView {
 struct AppearanceSettings {
     mode: ColorMode,
     accent: AccentColor,
+    material_covers: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -321,6 +329,7 @@ impl Default for AppearanceSettings {
         Self {
             mode: ColorMode::Light,
             accent: AccentColor::Mauve,
+            material_covers: true,
         }
     }
 }
@@ -329,6 +338,12 @@ impl Default for AppearanceSettings {
 struct PersistedAppearance {
     mode: String,
     accent: String,
+    #[serde(default = "default_material_covers")]
+    material_covers: bool,
+}
+
+const fn default_material_covers() -> bool {
+    true
 }
 
 struct VirtualLibraryDialogState {
@@ -875,7 +890,11 @@ fn load_appearance(database_path: &Path) -> AppearanceSettings {
     let Some(accent) = AccentColor::parse(&persisted.accent) else {
         return AppearanceSettings::default();
     };
-    AppearanceSettings { mode, accent }
+    AppearanceSettings {
+        mode,
+        accent,
+        material_covers: persisted.material_covers,
+    }
 }
 
 fn persist_appearance(database_path: &Path, appearance: AppearanceSettings) -> Result<(), String> {
@@ -888,6 +907,7 @@ fn persist_appearance(database_path: &Path, appearance: AppearanceSettings) -> R
     let bytes = serde_json::to_vec_pretty(&PersistedAppearance {
         mode: appearance.mode.as_str().to_owned(),
         accent: appearance.accent.as_str().to_owned(),
+        material_covers: appearance.material_covers,
     })
     .map_err(|error| error.to_string())?;
     fs::write(path, bytes).map_err(|error| error.to_string())
@@ -907,10 +927,14 @@ impl LecternView {
         } else {
             LibraryState::Loading
         };
+        let material_cover_benchmark = benchmark
+            .as_ref()
+            .is_some_and(|benchmark| benchmark.workload == BenchmarkWorkload::MaterialCovers);
         let populated_benchmark = benchmark.as_ref().is_some_and(|benchmark| {
             matches!(
                 benchmark.workload,
                 BenchmarkWorkload::LibrarySelection
+                    | BenchmarkWorkload::MaterialCovers
                     | BenchmarkWorkload::BookDetail
                     | BenchmarkWorkload::Genres
                     | BenchmarkWorkload::VirtualLibrary
@@ -925,7 +949,9 @@ impl LecternView {
             database_path,
             library_state,
             library_total: if populated_benchmark { 50_000 } else { 0 },
-            books: if populated_benchmark {
+            books: if material_cover_benchmark {
+                benchmark_material_cover_books()
+            } else if populated_benchmark {
                 benchmark_library_books()
             } else {
                 Vec::new()
@@ -938,8 +964,14 @@ impl LecternView {
             detail_editor: None,
             detail_loading: None,
             removal_confirmation: None,
-            appearance,
+            appearance: AppearanceSettings {
+                // The material-cover benchmark paints a covered flat grid first, then flips the
+                // same top-bar setting so its second sample isolates the compositor stack.
+                material_covers: !material_cover_benchmark && appearance.material_covers,
+                ..appearance
+            },
             appearance_dirty: false,
+            appearance_saving: false,
             theme_dialog_open: false,
             virtual_library_dialog: None,
             removing: false,
@@ -965,6 +997,9 @@ impl LecternView {
                 BenchmarkWorkload::EmptyLibraryAddBooks => self.start_add_books(window, cx),
                 BenchmarkWorkload::LibrarySelection => {
                     self.start_benchmark_selection(window, cx);
+                }
+                BenchmarkWorkload::MaterialCovers => {
+                    self.start_benchmark_material_covers(window, cx);
                 }
                 BenchmarkWorkload::BookDetail => self.start_benchmark_book_detail(window, cx),
                 BenchmarkWorkload::Genres => self.start_benchmark_genres(window, cx),
@@ -1058,6 +1093,54 @@ impl LecternView {
         self.selection.toggle(first, 0);
         cx.notify();
         cx.on_next_frame(window, Self::benchmark_selection_presented);
+    }
+
+    fn start_benchmark_material_covers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        assert!(!self.appearance.material_covers);
+        let benchmark = self
+            .benchmark
+            .as_mut()
+            .expect("material-cover benchmark state is present");
+        benchmark.action_started = Some(Instant::now());
+        self.appearance.material_covers = true;
+        cx.notify();
+        cx.on_next_frame(window, Self::benchmark_material_covers_presented);
+    }
+
+    fn benchmark_material_covers_presented(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rendered_covers = self
+            .books
+            .iter()
+            .filter(|book| book.cover.is_some())
+            .count();
+        let unique_covers = self
+            .books
+            .iter()
+            .filter_map(|book| book.cover.as_ref().map(|cover| cover.id()))
+            .collect::<HashSet<_>>()
+            .len();
+        let mut benchmark = self
+            .benchmark
+            .take()
+            .expect("material-cover benchmark state is present");
+        benchmark.material_cover_painted = Some(
+            benchmark
+                .action_started
+                .expect("material-cover benchmark action started")
+                .elapsed(),
+        );
+        benchmark.finish_material_covers(
+            self.library_total,
+            self.books.len(),
+            rendered_covers,
+            unique_covers,
+            self.appearance.material_covers,
+        );
+        cx.quit();
     }
 
     fn benchmark_selection_presented(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1694,26 +1777,34 @@ impl LecternView {
 
     fn close_theme_dialog(&mut self, cx: &mut Context<Self>) {
         self.theme_dialog_open = false;
-        if self.appearance_dirty {
-            self.appearance_dirty = false;
-            let database_path = self.database_path.clone();
-            let appearance = self.appearance;
-            let save = cx
-                .background_executor()
-                .spawn(async move { persist_appearance(&database_path, appearance) });
-            cx.spawn(async move |this, cx| {
-                let result = save.await;
-                this.update(cx, |this, cx| {
-                    if let Err(error) = result {
-                        this.status = Some(format!("Could not save appearance: {error}").into());
-                    }
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-        }
+        self.request_appearance_save(cx);
         cx.notify();
+    }
+
+    fn request_appearance_save(&mut self, cx: &mut Context<Self>) {
+        if !self.appearance_dirty || self.appearance_saving || self.benchmark.is_some() {
+            return;
+        }
+        self.appearance_dirty = false;
+        self.appearance_saving = true;
+        let database_path = self.database_path.clone();
+        let appearance = self.appearance;
+        let save = cx
+            .background_executor()
+            .spawn(async move { persist_appearance(&database_path, appearance) });
+        cx.spawn(async move |this, cx| {
+            let result = save.await;
+            this.update(cx, |this, cx| {
+                this.appearance_saving = false;
+                if let Err(error) = result {
+                    this.status = Some(format!("Could not save appearance: {error}").into());
+                }
+                this.request_appearance_save(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn open_virtual_library_dialog(
@@ -1874,6 +1965,16 @@ impl LecternView {
             },
             cx,
         );
+    }
+
+    fn set_material_covers(&mut self, material_covers: bool, cx: &mut Context<Self>) {
+        if self.appearance.material_covers == material_covers {
+            return;
+        }
+        self.appearance.material_covers = material_covers;
+        self.appearance_dirty = true;
+        self.request_appearance_save(cx);
+        cx.notify();
     }
 
     fn apply_appearance(&mut self, appearance: AppearanceSettings, cx: &mut Context<Self>) {
@@ -5453,6 +5554,7 @@ impl LecternView {
         selection_locked: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let material_cover_entity = cx.entity().downgrade();
         let device_buttons = self
             .devices
             .iter()
@@ -5501,6 +5603,15 @@ impl LecternView {
                     .items_center()
                     .gap(theme.spacing.small)
                     .children(device_buttons)
+                    .child(
+                        Switch::new("material-cover-switch", "Tactile covers")
+                            .checked(self.appearance.material_covers)
+                            .on_change(move |enabled, _, _, cx| {
+                                _ = material_cover_entity.update(cx, |this, cx| {
+                                    this.set_material_covers(enabled, cx);
+                                });
+                            }),
+                    )
                     .child(
                         IconButton::new(
                             "open-theme-dialog",
@@ -5561,6 +5672,13 @@ impl LecternView {
             .as_ref()
             .map(|editor| editor.original.id)
             .or(self.detail_loading);
+        let card_selection = if !selection_active {
+            BookCardSelection::Inactive
+        } else if selection_locked {
+            BookCardSelection::Locked
+        } else {
+            BookCardSelection::Interactive
+        };
         let cards = self
             .books
             .iter()
@@ -5569,10 +5687,12 @@ impl LecternView {
                 book_card(
                     book,
                     index,
-                    self.selection.contains(book.summary.id)
-                        || detail_book == Some(book.summary.id),
-                    selection_active,
-                    selection_locked,
+                    BookCardPresentation {
+                        selected: self.selection.contains(book.summary.id)
+                            || detail_book == Some(book.summary.id),
+                        selection: card_selection,
+                        material_covers: self.appearance.material_covers,
+                    },
                     theme,
                     cx,
                 )
@@ -8446,21 +8566,114 @@ fn asset_row(
         .into_any_element()
 }
 
+fn flat_book_cover(cover: &Arc<Image>) -> gpui::AnyElement {
+    img(Arc::clone(cover))
+        .w_full()
+        .h(px(BOOK_COVER_HEIGHT_PX))
+        .object_fit(ObjectFit::Cover)
+        .into_any_element()
+}
+
+fn material_cover_overlay_asset(id: BookId) -> &'static str {
+    if id.value().rem_euclid(2) == 0 {
+        "material/cover-overlay-a.svg"
+    } else {
+        "material/cover-overlay-b.svg"
+    }
+}
+
+fn material_book_cover(id: BookId, cover: &Arc<Image>, theme: &PrimerTheme) -> gpui::AnyElement {
+    let contact_shadow = theme.book_cover.contact_shadow;
+    let cast_shadow = theme.book_cover.cast_shadow;
+    let resting_shadows = vec![
+        BoxShadow::new(px(0.), px(1.), contact_shadow).blur_radius(px(2.)),
+        BoxShadow::new(px(2.), px(3.), cast_shadow)
+            .blur_radius(px(7.))
+            .spread_radius(px(-1.)),
+    ];
+    let raised_shadows = vec![
+        BoxShadow::new(px(0.), px(2.), contact_shadow).blur_radius(px(3.)),
+        BoxShadow::new(px(3.), px(6.), cast_shadow)
+            .blur_radius(px(9.))
+            .spread_radius(px(-1.)),
+    ];
+    let front = div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right(px(BOOK_COVER_PAGE_BLOCK_PX))
+        .bottom(px(BOOK_COVER_PAGE_BLOCK_PX))
+        .overflow_hidden()
+        .rounded(px(BOOK_COVER_CORNER_RADIUS_PX))
+        .child(
+            img(Arc::clone(cover))
+                .size_full()
+                .object_fit(ObjectFit::Cover),
+        )
+        .child(
+            img(material_cover_overlay_asset(id))
+                .absolute()
+                .inset_0()
+                .size_full()
+                .object_fit(ObjectFit::Fill),
+        );
+
+    div()
+        .id(format!("material-cover-{}", id.value()))
+        .w_full()
+        .h(px(BOOK_COVER_HEIGHT_PX))
+        .flex_none()
+        .relative()
+        .top(px(0.))
+        .rounded(px(BOOK_COVER_CORNER_RADIUS_PX))
+        .bg(theme.book_cover.page_block)
+        .shadow(resting_shadows)
+        .hover(move |style| {
+            style
+                .top(px(-BOOK_COVER_HOVER_LIFT_PX))
+                .shadow(raised_shadows)
+        })
+        .child(front)
+        .into_any_element()
+}
+
+#[derive(Clone, Copy)]
+enum BookCardSelection {
+    Inactive,
+    Interactive,
+    Locked,
+}
+
+impl BookCardSelection {
+    const fn active(self) -> bool {
+        !matches!(self, Self::Inactive)
+    }
+
+    const fn locked(self) -> bool {
+        matches!(self, Self::Locked)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BookCardPresentation {
+    selected: bool,
+    selection: BookCardSelection,
+    material_covers: bool,
+}
+
 fn book_card(
     book: &LibraryBook,
     index: usize,
-    selected: bool,
-    selection_active: bool,
-    selection_locked: bool,
+    presentation: BookCardPresentation,
     theme: &PrimerTheme,
     cx: &mut Context<LecternView>,
 ) -> gpui::AnyElement {
     let cover = if let Some(cover) = &book.cover {
-        img(Arc::clone(cover))
-            .w_full()
-            .h(px(BOOK_COVER_HEIGHT_PX))
-            .object_fit(ObjectFit::Cover)
-            .into_any_element()
+        if presentation.material_covers {
+            material_book_cover(book.summary.id, cover, theme)
+        } else {
+            flat_book_cover(cover)
+        }
     } else {
         div()
             .w_full()
@@ -8493,14 +8706,15 @@ fn book_card(
         .font_weight(theme.typography.body_weight)
         .line_height(relative(theme.typography.book_metadata_line_height))
         .relative()
-        .when(selected, |card| {
+        .when(presentation.selected, |card| {
             card.bg(theme.selection.background)
                 .border(theme.border.thin)
                 .border_color(theme.selection.border)
         })
-        .when(selection_active && !selection_locked, |card| {
-            card.cursor_pointer()
-        })
+        .when(
+            matches!(presentation.selection, BookCardSelection::Interactive),
+            |card| card.cursor_pointer(),
+        )
         .on_click(
             cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                 this.handle_book_click(book_id, index, event.modifiers(), window, cx);
@@ -8525,12 +8739,12 @@ fn book_card(
                 .child(authors),
         );
 
-    card.when(selection_active, |card| {
+    card.when(presentation.selection.active(), |card| {
         card.child(book_selection_checkbox(
             book,
             index,
-            selected,
-            selection_locked,
+            presentation.selected,
+            presentation.selection.locked(),
             theme,
             cx,
         ))
@@ -8723,6 +8937,118 @@ fn benchmark_library_books() -> Vec<LibraryBook> {
                 has_file_issue: false,
             },
             cover: None,
+        })
+        .collect()
+}
+
+fn benchmark_cover_bmp(index: u32) -> Vec<u8> {
+    const WIDTH: usize = 240;
+    const HEIGHT: usize = 324;
+    const HEADER_BYTES: usize = 54;
+    const BYTES_PER_PIXEL: usize = 3;
+    const COLORS: [[u8; 3]; 8] = [
+        [0x4d, 0x31, 0x57],
+        [0x23, 0x4f, 0x66],
+        [0x75, 0x42, 0x36],
+        [0x3f, 0x5d, 0x43],
+        [0x8a, 0x68, 0x30],
+        [0x34, 0x3c, 0x66],
+        [0x6d, 0x38, 0x59],
+        [0x5b, 0x49, 0x38],
+    ];
+    const CREAM: [u8; 3] = [0xf3, 0xea, 0xd8];
+    const INK: [u8; 3] = [0x11, 0x18, 0x27];
+
+    let pixel_bytes = WIDTH * HEIGHT * BYTES_PER_PIXEL;
+    let file_size = HEADER_BYTES + pixel_bytes;
+    let mut bytes = vec![0; file_size];
+    bytes[0..2].copy_from_slice(b"BM");
+    bytes[2..6].copy_from_slice(
+        &u32::try_from(file_size)
+            .expect("benchmark BMP fits u32")
+            .to_le_bytes(),
+    );
+    // BMP reserves these four bytes for applications. The fixture index gives every cover a
+    // stable, unique GPUI cache key without changing its decoded dimensions.
+    bytes[6..10].copy_from_slice(&index.to_le_bytes());
+    bytes[10..14].copy_from_slice(
+        &u32::try_from(HEADER_BYTES)
+            .expect("BMP header fits u32")
+            .to_le_bytes(),
+    );
+    bytes[14..18].copy_from_slice(&40_u32.to_le_bytes());
+    bytes[18..22].copy_from_slice(
+        &i32::try_from(WIDTH)
+            .expect("BMP width fits i32")
+            .to_le_bytes(),
+    );
+    bytes[22..26].copy_from_slice(
+        &i32::try_from(HEIGHT)
+            .expect("BMP height fits i32")
+            .to_le_bytes(),
+    );
+    bytes[26..28].copy_from_slice(&1_u16.to_le_bytes());
+    bytes[28..30].copy_from_slice(&24_u16.to_le_bytes());
+    bytes[34..38].copy_from_slice(
+        &u32::try_from(pixel_bytes)
+            .expect("BMP pixels fit u32")
+            .to_le_bytes(),
+    );
+
+    let fixture_index = usize::try_from(index).expect("benchmark index fits usize");
+    let base = COLORS[fixture_index % COLORS.len()];
+    let tint = [
+        u8::try_from((u16::from(base[0]) * 3 + u16::from(CREAM[0])) / 4)
+            .expect("blended channel fits u8"),
+        u8::try_from((u16::from(base[1]) * 3 + u16::from(CREAM[1])) / 4)
+            .expect("blended channel fits u8"),
+        u8::try_from((u16::from(base[2]) * 3 + u16::from(CREAM[2])) / 4)
+            .expect("blended channel fits u8"),
+    ];
+    let band_y = 42 + fixture_index % 5 * 10;
+    let radius = 30 + fixture_index % 14;
+    for y in 0..HEIGHT {
+        let stored_y = HEIGHT - 1 - y;
+        let row_offset = HEADER_BYTES + stored_y * WIDTH * BYTES_PER_PIXEL;
+        for x in 0..WIDTH {
+            let title_rule = (18..222).contains(&x) && (band_y..band_y + 4).contains(&y);
+            let title_block = (31..209).contains(&x) && (band_y + 16..band_y + 40).contains(&y);
+            let circle = x.abs_diff(WIDTH / 2).pow(2) + y.abs_diff(169).pow(2) <= radius.pow(2);
+            let lower_mark = y >= 236
+                && x.abs_diff(WIDTH / 2) <= (y - 236).min(58)
+                && x.abs_diff(WIDTH / 2) + y.saturating_sub(286) < 82;
+            let rgb = if title_rule || title_block {
+                CREAM
+            } else if lower_mark {
+                INK
+            } else if circle {
+                tint
+            } else {
+                base
+            };
+            let offset = row_offset + x * BYTES_PER_PIXEL;
+            bytes[offset..offset + BYTES_PER_PIXEL].copy_from_slice(&[rgb[2], rgb[1], rgb[0]]);
+        }
+    }
+    bytes
+}
+
+fn benchmark_material_cover_books() -> Vec<LibraryBook> {
+    (0..LIBRARY_PAGE_SIZE)
+        .map(|index| LibraryBook {
+            summary: BookSummary {
+                id: BookId::new(i64::from(index) + 1),
+                title: format!("Covered benchmark book {:03}", index + 1),
+                authors: format!("Benchmark author {:03}", index % 32 + 1),
+                series: None,
+                series_index: None,
+                has_cover: true,
+                has_file_issue: false,
+            },
+            cover: Some(Arc::new(Image::from_bytes(
+                ImageFormat::Bmp,
+                benchmark_cover_bmp(index),
+            ))),
         })
         .collect()
 }
@@ -9049,12 +9375,55 @@ mod selection_tests {
         assert_eq!(book_format_for_path(Path::new("/library/book.mobi")), None);
         assert_eq!(book_format_for_path(Path::new("/library/book")), None);
     }
+
+    #[test]
+    fn legacy_appearance_defaults_to_material_covers() {
+        let persisted: PersistedAppearance =
+            serde_json::from_str(r#"{"mode":"light","accent":"mauve"}"#)
+                .expect("legacy appearance is valid");
+
+        assert!(persisted.material_covers);
+    }
+
+    #[test]
+    fn material_cover_preference_round_trips_with_appearance() {
+        let directory = tempfile::tempdir().expect("temporary appearance directory");
+        let database_path = directory.path().join("library.sqlite3");
+        let expected = AppearanceSettings {
+            mode: ColorMode::Dark,
+            accent: AccentColor::Azure,
+            material_covers: false,
+        };
+
+        persist_appearance(&database_path, expected).expect("persist appearance");
+
+        assert_eq!(load_appearance(&database_path), expected);
+    }
+
+    #[test]
+    fn material_cover_benchmark_uses_a_full_page_of_unique_covers() {
+        let books = benchmark_material_cover_books();
+        let image_ids = books
+            .iter()
+            .map(|book| {
+                assert!(book.summary.has_cover);
+                book.cover.as_ref().expect("benchmark cover exists").id()
+            })
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            books.len(),
+            usize::try_from(LIBRARY_PAGE_SIZE).expect("page size fits usize")
+        );
+        assert_eq!(image_ids.len(), books.len());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BenchmarkWorkload {
     EmptyLibraryAddBooks,
     LibrarySelection,
+    MaterialCovers,
     BookDetail,
     Genres,
     VirtualLibrary,
@@ -9112,6 +9481,7 @@ struct BenchmarkRun {
     initial_render: Option<Duration>,
     action_started: Option<Instant>,
     selection_painted: Option<Duration>,
+    material_cover_painted: Option<Duration>,
     detail_painted: Option<Duration>,
     genre_picker_painted: Option<Duration>,
     virtual_library_dialog_painted: Option<Duration>,
@@ -9213,6 +9583,55 @@ impl BenchmarkRun {
         fs::write(&self.output, json).unwrap_or_else(|error| {
             panic!(
                 "write GPUI selection benchmark sample {}: {error}",
+                self.output.display()
+            )
+        });
+    }
+
+    fn finish_material_covers(
+        self,
+        library_total: u64,
+        rendered_books: usize,
+        rendered_covers: usize,
+        unique_covers: usize,
+        material_covers_enabled: bool,
+    ) {
+        assert_eq!(
+            self.workload,
+            BenchmarkWorkload::MaterialCovers,
+            "material-cover completion belongs to the material-cover benchmark"
+        );
+        assert_eq!(rendered_books, rendered_covers);
+        assert_eq!(rendered_covers, unique_covers);
+        assert!(material_covers_enabled);
+        let sample = UiMaterialCoverBenchmarkSample {
+            schema_version: 1,
+            workload: "material-covers",
+            initial_render_ms: millis(self.initial_render.expect("initial frame was measured")),
+            toggle_to_paint_ms: millis(
+                self.material_cover_painted
+                    .expect("material-cover state was presented"),
+            ),
+            peak_rss_bytes: peak_rss_bytes(),
+            correctness: UiMaterialCoverBenchmarkCorrectness {
+                library_total,
+                rendered_books,
+                rendered_covers,
+                unique_covers,
+                material_covers_enabled,
+                markers: vec![
+                    "bounded_covered_first_page",
+                    "unique_cover_images",
+                    "material_cover_stack_presented",
+                    "top_bar_toggle_presented",
+                ],
+            },
+        };
+        let json = serde_json::to_vec_pretty(&sample)
+            .expect("serialize GPUI material-cover benchmark sample");
+        fs::write(&self.output, json).unwrap_or_else(|error| {
+            panic!(
+                "write GPUI material-cover benchmark sample {}: {error}",
                 self.output.display()
             )
         });
@@ -9580,6 +9999,26 @@ struct UiSelectionBenchmarkCorrectness {
     library_total: u64,
     rendered_books: usize,
     selected_books: u64,
+    markers: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct UiMaterialCoverBenchmarkSample {
+    schema_version: u32,
+    workload: &'static str,
+    initial_render_ms: f64,
+    toggle_to_paint_ms: f64,
+    peak_rss_bytes: Option<u64>,
+    correctness: UiMaterialCoverBenchmarkCorrectness,
+}
+
+#[derive(Serialize)]
+struct UiMaterialCoverBenchmarkCorrectness {
+    library_total: u64,
+    rendered_books: usize,
+    rendered_covers: usize,
+    unique_covers: usize,
+    material_covers_enabled: bool,
     markers: Vec<&'static str>,
 }
 

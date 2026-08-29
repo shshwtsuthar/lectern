@@ -105,6 +105,20 @@ projection with a bounded 128-card first page. It verifies the compact selection
 exact confirmation copy while gating populated first paint, selection-to-painted-context, and
 confirmation-to-painted-modal p95 plus peak RSS.
 
+Book-cover image composition, cover material effects, cover hover elevation, and their theme tokens
+also require the native material-cover suite:
+
+```sh
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/ui-material-covers-regression-v1.json
+```
+
+The suite retains 40 measured fresh-process samples after 5 warmups for a deterministic 50,000-book
+projection whose bounded 128-card first page contains 128 distinct cover images. It first paints
+the flat covered grid, then enables the production material-cover setting and gates covered first
+paint, toggle-to-painted-material-state p95, and peak RSS while verifying the complete compositor
+stack and top-bar control markers.
+
 GPUI single-book selection, detail loading, metadata-editor layout, and book-asset presentation
 require the native book-detail suite:
 

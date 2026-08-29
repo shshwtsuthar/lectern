@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-ui-regression-budget",
+  "workload": {
+    "query_mode": "ui-material-covers",
+    "books": 50000,
+    "seed": 20260830,
+    "cover_every": 1,
+    "page_size": 128,
+    "warmup_iterations": 5,
+    "measured_iterations": 40,
+    "scenarios": [
+      "covered_library_render",
+      "material_toggle_to_painted_state"
+    ],
+    "correctness": [
+      "bounded_covered_first_page",
+      "unique_cover_images",
+      "material_cover_stack_presented",
+      "top_bar_toggle_presented"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 1.0
+  },
+  "budgets": {
+    "covered_library_render": {
+      "max_p95_ms": 500,
+      "max_peak_rss_bytes": 536870912
+    },
+    "material_toggle_to_painted_state": {
+      "max_p95_ms": 75,
+      "max_peak_rss_bytes": 536870912
+    }
+  }
+}

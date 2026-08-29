@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="158" height="214" viewBox="0 0 158 214">
+  <defs>
+    <linearGradient id="surface" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity=".026"/>
+      <stop offset=".48" stop-color="#fff" stop-opacity=".004"/>
+      <stop offset="1" stop-color="#000" stop-opacity=".034"/>
+    </linearGradient>
+    <linearGradient id="hinge" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="9" y2="0">
+      <stop offset="0" stop-color="#fff" stop-opacity=".09"/>
+      <stop offset=".16" stop-color="#000" stop-opacity=".06"/>
+      <stop offset=".43" stop-color="#000" stop-opacity=".105"/>
+      <stop offset=".63" stop-color="#fff" stop-opacity=".047"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <pattern id="grain" width="64" height="96" patternUnits="userSpaceOnUse">
+      <g fill="none" stroke="#fff" stroke-linecap="round" stroke-opacity=".022" stroke-width=".42">
+        <path d="M3 7l4.8.4M18 5l2.6-.3M37 9l6.1.5M51 4l3.2.2M9 21l3.8-.5M27 17l5.6.2M46 24l4.7-.4M57 18l2.4.3"/>
+        <path d="M4 39l2.9.4M16 34l6.4-.3M35 42l3.5.2M48 36l7.1.4M8 58l5.3-.2M26 53l2.7.4M39 61l6.8-.5M55 55l3.1.2"/>
+        <path d="M2 77l5.9-.3M19 72l3.2.5M31 82l4.8-.2M47 75l5.7.3M11 91l2.5-.4M27 89l6.2.3M51 92l4.3-.2"/>
+      </g>
+      <g fill="#000" fill-opacity=".016">
+        <circle cx="7" cy="13" r=".45"/><circle cx="23" cy="10" r=".32"/><circle cx="42" cy="18" r=".5"/><circle cx="59" cy="11" r=".28"/>
+        <circle cx="13" cy="29" r=".36"/><circle cx="31" cy="27" r=".52"/><circle cx="53" cy="31" r=".34"/>
+        <circle cx="5" cy="49" r=".3"/><circle cx="21" cy="45" r=".44"/><circle cx="44" cy="50" r=".31"/><circle cx="61" cy="43" r=".48"/>
+        <circle cx="15" cy="66" r=".5"/><circle cx="34" cy="69" r=".29"/><circle cx="50" cy="64" r=".4"/>
+        <circle cx="6" cy="86" r=".34"/><circle cx="25" cy="78" r=".46"/><circle cx="41" cy="88" r=".33"/><circle cx="58" cy="81" r=".51"/>
+      </g>
+    </pattern>
+  </defs>
+  <rect width="158" height="214" fill="url(#surface)"/>
+  <rect width="158" height="214" fill="url(#grain)"/>
+  <rect width="9" height="214" fill="url(#hinge)"/>
+  <path d="M.5 213.5H157.5V.5" fill="none" stroke="#000" stroke-opacity=".14"/>
+  <path d="M.5 213.5V.5H157.5" fill="none" stroke="#fff" stroke-opacity=".24"/>
+</svg>

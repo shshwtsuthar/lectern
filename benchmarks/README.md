@@ -106,6 +106,14 @@ and measures the initial populated-library paint, selection dispatch through the
 bar, and destructive-confirmation dispatch through its painted modal. The exact removal transaction
 and refreshed first page remain covered by `bulk-remove-regression-v2`.
 
+The GPUI material-cover workload in
+[`ui-material-covers-regression-v1.json`](ui-material-covers-regression-v1.json) uses a deterministic
+50,000-book projection with 128 distinct cover images on the bounded first page. Each fresh process
+first paints the covered flat grid, then enables the same material-cover setting exposed by the
+top-bar switch. It retains 40 measured samples after 5 warmups, verifies that every card has a
+unique cover and that the material stack is presented, and gates covered first paint,
+toggle-to-painted-material-state p95, and peak RSS.
+
 The GPUI book-detail workload in
 [`ui-book-detail-regression-v2.json`](ui-book-detail-regression-v2.json) paints the same bounded
 50,000-book projection, opens a representative single-book details panel, and verifies complete
@@ -160,6 +168,8 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/ui-bootstrap-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/ui-selection-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/ui-material-covers-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/ui-book-detail-regression-v2.json
 ```

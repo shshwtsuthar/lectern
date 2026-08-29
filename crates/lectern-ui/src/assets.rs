@@ -9,6 +9,8 @@ const EYE_ICON: &[u8] = include_bytes!("../assets/tabler/eye.svg");
 const PALETTE_ICON: &[u8] = include_bytes!("../assets/tabler/palette.svg");
 const UPLOAD_ICON: &[u8] = include_bytes!("../assets/tabler/upload.svg");
 const NEWSREADER_MEDIUM: &[u8] = include_bytes!("../assets/fonts/Newsreader_14pt-Medium.ttf");
+const COVER_OVERLAY_A: &[u8] = include_bytes!("../assets/material/cover-overlay-a.svg");
+const COVER_OVERLAY_B: &[u8] = include_bytes!("../assets/material/cover-overlay-b.svg");
 
 /// Static UI assets embedded in the Lectern executable.
 #[derive(Clone, Copy, Debug, Default)]
@@ -23,13 +25,22 @@ impl AssetSource for LecternAssets {
             "tabler/eye.svg" => Some(Cow::Borrowed(EYE_ICON)),
             "tabler/palette.svg" => Some(Cow::Borrowed(PALETTE_ICON)),
             "tabler/upload.svg" => Some(Cow::Borrowed(UPLOAD_ICON)),
+            "material/cover-overlay-a.svg" => Some(Cow::Borrowed(COVER_OVERLAY_A)),
+            "material/cover-overlay-b.svg" => Some(Cow::Borrowed(COVER_OVERLAY_B)),
             _ => None,
         })
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         Ok(match path.trim_matches('/') {
-            "" => vec![SharedString::new_static("tabler")],
+            "" => vec![
+                SharedString::new_static("material"),
+                SharedString::new_static("tabler"),
+            ],
+            "material" => vec![
+                SharedString::new_static("cover-overlay-a.svg"),
+                SharedString::new_static("cover-overlay-b.svg"),
+            ],
             "tabler" => vec![
                 SharedString::new_static("chevron-down.svg"),
                 SharedString::new_static("chevron-up.svg"),
@@ -63,6 +74,18 @@ mod tests {
         assert!(assets.load("tabler/device-tablet.svg").unwrap().is_some());
         assert!(assets.load("tabler/eye.svg").unwrap().is_some());
         assert!(assets.load("tabler/upload.svg").unwrap().is_some());
+        assert!(
+            assets
+                .load("material/cover-overlay-a.svg")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("material/cover-overlay-b.svg")
+                .unwrap()
+                .is_some()
+        );
         assert!(assets.load("tabler/brand-github.svg").unwrap().is_none());
     }
 
