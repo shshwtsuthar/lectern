@@ -153,6 +153,8 @@ Metadata-group and scoped-book browsing changes require the library-browse suite
 ```sh
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/library-browse-regression-v1.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/ui-library-browse-regression-v1.json
 ```
 
 It extends the version-three 50,000-book organisation fixture with all 28 fixed genres and 2,500
@@ -161,6 +163,12 @@ index, the first 128 books within representative virtual-library, genre, contrib
 scopes, and a deep scoped window without a recount. Correctness reconciles stable identities,
 counts, order, uniqueness, page bounds, and the four covering relationship indexes; each scenario
 has a 50 ms p95 budget and a 64 MiB peak-RSS-delta budget.
+
+The compositor companion retains 40 measured fresh-process samples after 5 warmups for Genres
+navigation to its tile index, Fantasy activation to a bounded scoped book page, and Tiles-to-Table
+presentation. Correctness reconciles Browse selection, group and book counts, breadcrumb, table
+columns, and query-backed selection scope; each interaction has a 50 ms p95 budget plus peak-RSS
+budget.
 
 GPUI virtual-library creation and single-book membership controls require the native
 virtual-library suite:

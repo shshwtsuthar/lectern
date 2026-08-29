@@ -21,13 +21,14 @@ use gpui::{
 };
 use gpui_base::{
     AlertDialog, AlertDialogBackdrop, AlertDialogDescription, AlertDialogPopup, AlertDialogTitle,
-    Checkbox, CheckboxState, active_focus_trap,
+    Button as BaseButton, Checkbox, CheckboxState, active_focus_trap,
     input::{Escape as InputEscape, InputEvent, InputState, TextareaState},
 };
 use gpui_platform::application;
 use lectern_core::{
     AssetHealth, AssetId, AssetStorage, Book, BookAsset, BookFormat, BookId, BookRating,
-    BookSummary, ImportSummary, LibraryQuery, LibraryService,
+    BookSummary, ImportSummary, LibraryGroup, LibraryGroupPage, LibraryGrouping, LibraryQuery,
+    LibraryScope, LibraryService,
     organisation::{
         BookIdentifier, BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, Contributor,
         ContributorCredit, ContributorId, ContributorRole, Genre, IdentifierType, IdentifierTypeId,
@@ -61,7 +62,11 @@ const WINDOW_HEIGHT_PX: f32 = 620.0;
 const EMPTY_LIBRARY_CONTENT_WIDTH_PX: f32 = 480.0;
 const BOOK_CARD_WIDTH_PX: f32 = 160.0;
 const BOOK_COVER_HEIGHT_PX: f32 = 216.0;
+const GROUP_TILE_WIDTH_PX: f32 = 224.0;
+const GROUP_TILE_HEIGHT_PX: f32 = 136.0;
+const BROWSE_SIDEBAR_WIDTH_PX: f32 = 184.0;
 const TOP_BAR_HEIGHT_PX: f32 = 48.0;
+const CONTENT_BAR_HEIGHT_PX: f32 = 48.0;
 const SELECTION_BAR_HEIGHT_PX: f32 = 48.0;
 const BOTTOM_BAR_HEIGHT_PX: f32 = 24.0;
 const BULK_REMOVAL_DIALOG_WIDTH_PX: f32 = 460.0;
@@ -72,6 +77,8 @@ const THEME_DIALOG_WIDTH_PX: f32 = 400.0;
 const VIRTUAL_LIBRARY_DIALOG_WIDTH_PX: f32 = 480.0;
 const DEVICE_DIALOG_WIDTH_PX: f32 = 640.0;
 const LIBRARY_PAGE_SIZE: u32 = 128;
+const LIBRARY_GROUP_PAGE_SIZE: u32 = 100;
+const BENCHMARK_BROWSE_SCOPED_BOOKS: u64 = 256;
 const DEVICE_VISIBLE_BOOK_LIMIT: usize = 128;
 const DEVICE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const DEVICE_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -206,6 +213,7 @@ pub fn run(main_entry: Instant) {
         let workload = match env::var(BENCHMARK_WORKLOAD_ENV).as_deref() {
             Ok("library-selection") => BenchmarkWorkload::LibrarySelection,
             Ok("book-detail") => BenchmarkWorkload::BookDetail,
+            Ok("library-browse") => BenchmarkWorkload::LibraryBrowse,
             Ok("genres") => BenchmarkWorkload::Genres,
             Ok("virtual-library") => BenchmarkWorkload::VirtualLibrary,
             Ok("bulk-tags") => BenchmarkWorkload::BulkTags,
@@ -222,6 +230,9 @@ pub fn run(main_entry: Instant) {
             action_started: None,
             selection_painted: None,
             detail_painted: None,
+            browse_group_index_painted: None,
+            browse_scoped_books_painted: None,
+            browse_table_painted: None,
             genre_picker_painted: None,
             virtual_library_dialog_painted: None,
             virtual_library_menu_painted: None,
@@ -281,8 +292,18 @@ pub fn run(main_entry: Instant) {
 struct LecternView {
     database_path: PathBuf,
     library_state: LibraryState,
+    catalog_loaded: bool,
+    catalog_total: u64,
     library_total: u64,
     books: Vec<LibraryBook>,
+    groups: Vec<LibraryGroup>,
+    group_total: u64,
+    route: BrowseRoute,
+    presentation: BrowsePresentation,
+    book_page_offset: u64,
+    group_page_offset: u64,
+    browse_generation: u64,
+    browse_error: Option<SharedString>,
     query: LibraryQuery,
     selection: GridSelection,
     selection_generation: u64,
@@ -912,6 +933,7 @@ impl LecternView {
                 benchmark.workload,
                 BenchmarkWorkload::LibrarySelection
                     | BenchmarkWorkload::BookDetail
+                    | BenchmarkWorkload::LibraryBrowse
                     | BenchmarkWorkload::Genres
                     | BenchmarkWorkload::VirtualLibrary
             )
@@ -924,12 +946,27 @@ impl LecternView {
         Self {
             database_path,
             library_state,
+            catalog_loaded: populated_benchmark,
+            catalog_total: if populated_benchmark { 50_000 } else { 0 },
             library_total: if populated_benchmark { 50_000 } else { 0 },
-            books: if populated_benchmark {
+            books: if benchmark
+                .as_ref()
+                .is_some_and(|benchmark| benchmark.workload == BenchmarkWorkload::LibraryBrowse)
+            {
+                benchmark_browse_books()
+            } else if populated_benchmark {
                 benchmark_library_books()
             } else {
                 Vec::new()
             },
+            groups: Vec::new(),
+            group_total: 0,
+            route: BrowseRoute::AllBooks,
+            presentation: BrowsePresentation::Tiles,
+            book_page_offset: 0,
+            group_page_offset: 0,
+            browse_generation: 0,
+            browse_error: None,
             query: LibraryQuery::default(),
             selection: GridSelection::default(),
             selection_generation: 0,
@@ -967,6 +1004,9 @@ impl LecternView {
                     self.start_benchmark_selection(window, cx);
                 }
                 BenchmarkWorkload::BookDetail => self.start_benchmark_book_detail(window, cx),
+                BenchmarkWorkload::LibraryBrowse => {
+                    self.start_benchmark_library_browse(window, cx);
+                }
                 BenchmarkWorkload::Genres => self.start_benchmark_genres(window, cx),
                 BenchmarkWorkload::VirtualLibrary => {
                     self.start_benchmark_virtual_library(window, cx);
@@ -1083,6 +1123,123 @@ impl LecternView {
         cx.on_next_frame(window, Self::benchmark_confirmation_presented);
     }
 
+    fn start_benchmark_library_browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.route = BrowseRoute::GroupIndex(LibraryGrouping::Genres);
+        self.presentation = BrowsePresentation::Tiles;
+        self.groups = benchmark_genre_groups();
+        self.group_total = u64::try_from(self.groups.len()).expect("genre catalog fits u64");
+        self.library_total = self.catalog_total;
+        let benchmark = self
+            .benchmark
+            .as_mut()
+            .expect("library-browse benchmark state is present");
+        benchmark.action_started = Some(Instant::now());
+        cx.notify();
+        cx.on_next_frame(window, Self::benchmark_group_index_presented);
+    }
+
+    fn benchmark_group_index_presented(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let group = self
+            .groups
+            .iter()
+            .find(|group| group.scope == LibraryScope::Genre(Genre::Fantasy))
+            .cloned()
+            .expect("benchmark genre index contains Fantasy");
+        let benchmark = self
+            .benchmark
+            .as_mut()
+            .expect("library-browse benchmark state is present");
+        benchmark.browse_group_index_painted = Some(
+            benchmark
+                .action_started
+                .expect("group-index action was started")
+                .elapsed(),
+        );
+        benchmark.action_started = Some(Instant::now());
+        self.route = BrowseRoute::Scoped {
+            grouping: LibraryGrouping::Genres,
+            group,
+        };
+        self.groups.clear();
+        self.group_total = 0;
+        self.library_total = BENCHMARK_BROWSE_SCOPED_BOOKS;
+        cx.notify();
+        cx.on_next_frame(window, Self::benchmark_scoped_books_presented);
+    }
+
+    fn benchmark_scoped_books_presented(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        assert_eq!(
+            self.books.len(),
+            usize::try_from(LIBRARY_PAGE_SIZE).expect("page size fits usize")
+        );
+        let benchmark = self
+            .benchmark
+            .as_mut()
+            .expect("library-browse benchmark state is present");
+        benchmark.browse_scoped_books_painted = Some(
+            benchmark
+                .action_started
+                .expect("scoped-books action was started")
+                .elapsed(),
+        );
+        benchmark.action_started = Some(Instant::now());
+        self.presentation = BrowsePresentation::Table;
+        for book in &mut self.books {
+            book.cover = None;
+        }
+        cx.notify();
+        cx.on_next_frame(window, Self::benchmark_book_table_presented);
+    }
+
+    fn benchmark_book_table_presented(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let (destination, breadcrumb, scope) = match &self.route {
+            BrowseRoute::Scoped { grouping, group } => {
+                (grouping.to_string(), group.name.clone(), group.scope)
+            }
+            _ => panic!("library-browse benchmark ends inside a scoped group"),
+        };
+        let generation = LibraryGeneration {
+            connection_changes: 17,
+            data_version: 23,
+        };
+        let mut selection = GridSelection::default();
+        selection.install_all_matching(
+            self.query.clone(),
+            scope,
+            SelectionSnapshot {
+                matching_books: self.library_total,
+                generation,
+            },
+        );
+        let scoped_selection_preserved = selection.descriptor()
+            == Some(BookSelection::all_matching_in_scope(
+                self.query.clone(),
+                scope,
+                generation,
+                Vec::new(),
+            ));
+        let mut benchmark = self
+            .benchmark
+            .take()
+            .expect("library-browse benchmark state is present");
+        benchmark.browse_table_painted = Some(
+            benchmark
+                .action_started
+                .expect("table action was started")
+                .elapsed(),
+        );
+        benchmark.finish_library_browse(
+            self.catalog_total,
+            Genre::ALL.len(),
+            self.library_total,
+            self.books.len(),
+            destination,
+            breadcrumb,
+            scoped_selection_preserved,
+        );
+        cx.quit();
+    }
+
     fn start_benchmark_bulk_tags(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let query = LibraryQuery {
             search: "language:fr".to_owned(),
@@ -1188,7 +1345,7 @@ impl LecternView {
                 assert_eq!(snapshot.matching_books, config.matching_books);
                 this.selection_pending = None;
                 this.selection
-                    .install_all_matching(resolved_query, snapshot);
+                    .install_all_matching(resolved_query, LibraryScope::All, snapshot);
                 let selection = this
                     .selection
                     .descriptor()
@@ -1543,20 +1700,46 @@ impl LecternView {
 
     fn load_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_selection();
+        self.route = BrowseRoute::AllBooks;
+        self.book_page_offset = 0;
+        self.group_page_offset = 0;
+        self.request_current_route_load(window, cx);
+    }
+
+    fn current_browse_request(&self) -> BrowseLoadRequest {
+        BrowseLoadRequest {
+            route: self.route.clone(),
+            query: self.query.clone(),
+            presentation: self.presentation,
+            book_page_offset: self.book_page_offset,
+            group_page_offset: self.group_page_offset,
+        }
+    }
+
+    fn request_current_route_load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.library_state = LibraryState::Loading;
+        self.browse_error = None;
+        self.books.clear();
+        self.groups.clear();
+        let generation = self.browse_generation.wrapping_add(1);
+        self.browse_generation = generation;
         let database_path = self.database_path.clone();
+        let request = self.current_browse_request();
         let load = cx.background_executor().spawn(async move {
-            load_library_snapshot(&database_path).map_err(|error| error.to_string())
+            load_browse_snapshot(&database_path, &request).map_err(|error| error.to_string())
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
+                if this.browse_generation != generation {
+                    return;
+                }
                 this.library_state = LibraryState::Ready;
+                this.catalog_loaded = true;
                 match result {
-                    Ok(snapshot) => this.apply_snapshot(snapshot),
+                    Ok(snapshot) => this.apply_browse_snapshot(snapshot),
                     Err(error) => {
-                        this.library_total = 0;
-                        this.books.clear();
+                        this.browse_error = Some(error.clone().into());
                         this.status = Some(format!("Could not open the library: {error}").into());
                     }
                 }
@@ -1565,6 +1748,148 @@ impl LecternView {
             .ok();
         })
         .detach();
+    }
+
+    fn apply_browse_snapshot(&mut self, snapshot: BrowseSnapshot) {
+        self.browse_error = None;
+        self.catalog_total = snapshot.catalog_total;
+        match snapshot.content {
+            BrowseContentSnapshot::Books(snapshot) => {
+                self.group_total = 0;
+                self.groups.clear();
+                self.apply_snapshot(snapshot);
+            }
+            BrowseContentSnapshot::Groups(page) => {
+                self.library_total = snapshot.catalog_total;
+                self.books.clear();
+                self.group_total = page.total;
+                self.group_page_offset = page.offset;
+                self.groups = page.groups;
+            }
+        }
+    }
+
+    fn route_change_blocked(&mut self, cx: &mut Context<Self>) -> bool {
+        if self
+            .detail_editor
+            .as_ref()
+            .is_some_and(|editor| editor.dirty)
+        {
+            self.status = Some("Save or reset the open book before changing views.".into());
+            cx.notify();
+            return true;
+        }
+        if self.route_change_is_busy() {
+            self.status =
+                Some("Finish the current library operation before changing views.".into());
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    fn navigate_to_all_books(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.route, BrowseRoute::AllBooks) || self.route_change_blocked(cx) {
+            return;
+        }
+        self.install_route(BrowseRoute::AllBooks, window, cx);
+    }
+
+    fn navigate_to_grouping(
+        &mut self,
+        grouping: LibraryGrouping,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.route == BrowseRoute::GroupIndex(grouping) || self.route_change_blocked(cx) {
+            return;
+        }
+        self.install_route(BrowseRoute::GroupIndex(grouping), window, cx);
+    }
+
+    fn open_library_group(
+        &mut self,
+        grouping: LibraryGrouping,
+        group: LibraryGroup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.route_change_blocked(cx) {
+            return;
+        }
+        self.install_route(BrowseRoute::Scoped { grouping, group }, window, cx);
+    }
+
+    fn install_route(&mut self, route: BrowseRoute, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_selection();
+        self.detail_editor = None;
+        self.detail_loading = None;
+        self.route = route;
+        self.book_page_offset = 0;
+        self.group_page_offset = 0;
+        self.status = None;
+        self.request_current_route_load(window, cx);
+    }
+
+    fn set_browse_presentation(
+        &mut self,
+        presentation: BrowsePresentation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.presentation == presentation
+            || self.route_change_is_busy()
+            || matches!(self.library_state, LibraryState::Loading)
+        {
+            return;
+        }
+        self.presentation = presentation;
+        if presentation == BrowsePresentation::Table {
+            for book in &mut self.books {
+                book.cover = None;
+            }
+            cx.notify();
+        } else if self.route.shows_books()
+            && self
+                .books
+                .iter()
+                .any(|book| book.summary.has_cover && book.cover.is_none())
+        {
+            self.request_current_route_load(window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn change_browse_page(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.route_change_is_busy() || matches!(self.library_state, LibraryState::Loading) {
+            return;
+        }
+        let (offset, page_size, total) = if self.route.shows_books() {
+            (
+                &mut self.book_page_offset,
+                u64::from(LIBRARY_PAGE_SIZE),
+                self.library_total,
+            )
+        } else {
+            (
+                &mut self.group_page_offset,
+                u64::from(LIBRARY_GROUP_PAGE_SIZE),
+                self.group_total,
+            )
+        };
+        let next = if forward {
+            offset
+                .saturating_add(page_size)
+                .min(total.saturating_sub(1) / page_size * page_size)
+        } else {
+            offset.saturating_sub(page_size)
+        };
+        if next == *offset {
+            return;
+        }
+        *offset = next;
+        self.request_current_route_load(window, cx);
     }
 
     fn start_add_books(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1627,8 +1952,10 @@ impl LecternView {
 
     fn import_books(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let database_path = self.database_path.clone();
+        let request = self.current_browse_request();
         let import = cx.background_executor().spawn(async move {
-            import_books_and_load_library(&database_path, &paths).map_err(|error| error.to_string())
+            import_books_and_load_library(&database_path, &paths, &request)
+                .map_err(|error| error.to_string())
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = import.await;
@@ -1638,7 +1965,7 @@ impl LecternView {
                 match result {
                     Ok((summary, snapshot)) => {
                         this.clear_selection();
-                        this.apply_snapshot(snapshot);
+                        this.apply_browse_snapshot(snapshot);
                         this.status = import_status(&summary);
                     }
                     Err(error) => {
@@ -1654,6 +1981,7 @@ impl LecternView {
 
     fn apply_snapshot(&mut self, snapshot: LibrarySnapshot) {
         self.library_total = snapshot.total;
+        self.book_page_offset = snapshot.offset;
         self.books = snapshot
             .books
             .into_iter()
@@ -1679,6 +2007,7 @@ impl LecternView {
             || self.device_resolving
             || self.active_device_transfer.is_some()
             || self.bulk_tags.is_some()
+            || !self.route.shows_books()
         {
             return;
         }
@@ -1763,7 +2092,7 @@ impl LecternView {
         cx.notify();
     }
 
-    fn create_virtual_library(&mut self, cx: &mut Context<Self>) {
+    fn create_virtual_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dialog) = &mut self.virtual_library_dialog else {
             return;
         };
@@ -1794,17 +2123,22 @@ impl LecternView {
             .update(cx, |state, cx| state.set_disabled(true, cx));
 
         let database_path = self.database_path.clone();
+        let request = self.current_browse_request();
         let create = cx.background_executor().spawn(async move {
             let mut service =
                 SqliteLibraryService::open(&database_path).map_err(|error| error.to_string())?;
-            service
+            let library = service
                 .create_virtual_library(&name, Some(&description), icon, book)
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            let snapshot = load_browse_snapshot_from(&mut service, &request)
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((library, snapshot))
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = create.await;
-            this.update(cx, |this, cx| match result {
-                Ok(library) => {
+            this.update_in(cx, |this, _window, cx| match result {
+                Ok((library, snapshot)) => {
+                    this.apply_browse_snapshot(snapshot);
                     if let Some(book) = book
                         && let Some(editor) = &mut this.detail_editor
                         && editor.original.id == book
@@ -1932,7 +2266,7 @@ impl LecternView {
         }
     }
 
-    fn toggle_book(&mut self, id: BookId, index: usize, cx: &mut Context<Self>) {
+    fn toggle_book(&mut self, id: BookId, index: u64, cx: &mut Context<Self>) {
         if self.busy
             || self.removing
             || self.device_resolving
@@ -1951,7 +2285,7 @@ impl LecternView {
     fn handle_book_click(
         &mut self,
         id: BookId,
-        index: usize,
+        index: u64,
         modifiers: gpui::Modifiers,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2669,7 +3003,16 @@ impl LecternView {
         cx.notify();
     }
 
-    fn toggle_detail_virtual_library(&mut self, library: &VirtualLibrary, cx: &mut Context<Self>) {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "membership persistence, scoped refresh, and editor reconciliation form one atomic interaction"
+    )]
+    fn toggle_detail_virtual_library(
+        &mut self,
+        library: &VirtualLibrary,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (book, included) = {
             let Some(editor) = &mut self.detail_editor else {
                 return;
@@ -2688,16 +3031,24 @@ impl LecternView {
         };
         let library_id = library.id;
         let database_path = self.database_path.clone();
+        let request = self.current_browse_request();
         let update = cx.background_executor().spawn(async move {
             let mut service =
                 SqliteLibraryService::open(&database_path).map_err(|error| error.to_string())?;
-            service
+            let membership = service
                 .set_book_virtual_library_membership(book, library_id, included)
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            let snapshot = load_browse_snapshot_from(&mut service, &request)
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((membership, snapshot))
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = update.await;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, _window, cx| {
+                let result = result.map(|(membership, snapshot)| {
+                    this.apply_browse_snapshot(snapshot);
+                    membership
+                });
                 let Some(editor) = &mut this.detail_editor else {
                     return;
                 };
@@ -3052,9 +3403,10 @@ impl LecternView {
 
         let id = edit.id;
         let database_path = self.database_path.clone();
+        let request = self.current_browse_request();
         let save = cx
             .background_executor()
-            .spawn(async move { save_book_and_load_library(&database_path, &edit) });
+            .spawn(async move { save_book_and_load_library(&database_path, &edit, &request) });
         cx.spawn_in(window, async move |this, cx| {
             let result = save.await;
             this.update_in(cx, |this, window, cx| {
@@ -3067,7 +3419,7 @@ impl LecternView {
                 }
                 match result {
                     Ok((book, snapshot)) => {
-                        this.apply_snapshot(snapshot);
+                        this.apply_browse_snapshot(snapshot);
                         this.detail_editor = Some(BookDetailEditor::new(book, window, cx));
                         this.status = Some("Book details saved.".into());
                     }
@@ -3141,9 +3493,10 @@ impl LecternView {
         };
         self.status = Some("Adding book assets…".into());
         let database_path = self.database_path.clone();
-        let attach = cx
-            .background_executor()
-            .spawn(async move { attach_assets_and_load_library(&database_path, id, &paths) });
+        let request = self.current_browse_request();
+        let attach = cx.background_executor().spawn(async move {
+            attach_assets_and_load_library(&database_path, id, &paths, &request)
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = attach.await;
             this.update_in(cx, |this, window, cx| {
@@ -3156,7 +3509,7 @@ impl LecternView {
                 }
                 match result {
                     Ok(completion) => {
-                        this.apply_snapshot(completion.snapshot);
+                        this.apply_browse_snapshot(completion.snapshot);
                         this.detail_editor =
                             Some(BookDetailEditor::new(completion.book, window, cx));
                         this.status = Some(completion.message.into());
@@ -3198,9 +3551,10 @@ impl LecternView {
         self.status = Some("Removing book asset…".into());
         cx.notify();
         let database_path = self.database_path.clone();
-        let detach = cx
-            .background_executor()
-            .spawn(async move { detach_asset_and_load_library(&database_path, id, asset) });
+        let request = self.current_browse_request();
+        let detach = cx.background_executor().spawn(async move {
+            detach_asset_and_load_library(&database_path, id, asset, &request)
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = detach.await;
             this.update_in(cx, |this, window, cx| {
@@ -3213,7 +3567,7 @@ impl LecternView {
                 }
                 match result {
                     Ok((book, snapshot)) => {
-                        this.apply_snapshot(snapshot);
+                        this.apply_browse_snapshot(snapshot);
                         this.detail_editor = Some(BookDetailEditor::new(book, window, cx));
                         this.status = Some("Book asset removed.".into());
                     }
@@ -3283,16 +3637,17 @@ impl LecternView {
         self.status = Some("Removing book from the library…".into());
         cx.notify();
         let database_path = self.database_path.clone();
+        let request = self.current_browse_request();
         let remove = cx
             .background_executor()
-            .spawn(async move { remove_book_and_load_library(&database_path, id) });
+            .spawn(async move { remove_book_and_load_library(&database_path, id, &request) });
         cx.spawn_in(window, async move |this, cx| {
             let result = remove.await;
             this.update(cx, |this, cx| {
                 this.removing = false;
                 match result {
                     Ok((removed, snapshot)) => {
-                        this.apply_snapshot(snapshot);
+                        this.apply_browse_snapshot(snapshot);
                         this.detail_editor = None;
                         this.status = Some(if removed {
                             "Removed the book from the library; book files were kept.".into()
@@ -3319,7 +3674,7 @@ impl LecternView {
         .detach();
     }
 
-    fn select_range_to(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_range_to(&mut self, index: u64, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy
             || self.removing
             || self.device_resolving
@@ -3334,7 +3689,7 @@ impl LecternView {
         };
         let offset = anchor.index.min(index);
         let length = anchor.index.max(index).saturating_sub(offset) + 1;
-        let (Ok(offset), Ok(limit)) = (u64::try_from(offset), u32::try_from(length)) else {
+        let Ok(limit) = u32::try_from(length) else {
             self.status = Some("Selection range exceeds this platform's supported size.".into());
             cx.notify();
             return;
@@ -3347,8 +3702,9 @@ impl LecternView {
 
         let database_path = self.database_path.clone();
         let query = self.query.clone();
+        let scope = self.route.scope();
         let resolve = cx.background_executor().spawn(async move {
-            resolve_selection_range(&database_path, &query, offset, limit)
+            resolve_selection_range(&database_path, &query, scope, offset, limit)
                 .map_err(|error| error.to_string())
         });
         cx.spawn_in(window, async move |this, cx| {
@@ -3382,6 +3738,7 @@ impl LecternView {
             || self.device_resolving
             || self.active_device_transfer.is_some()
             || self.library_total == 0
+            || !self.route.shows_books()
             || self.selection_pending.is_some()
             || self.selection.is_every_matching()
             || self.bulk_tags.is_some()
@@ -3396,9 +3753,11 @@ impl LecternView {
 
         let database_path = self.database_path.clone();
         let query = self.query.clone();
+        let scope = self.route.scope();
         let resolved_query = query.clone();
         let resolve = cx.background_executor().spawn(async move {
-            resolve_selection_snapshot(&database_path, &query).map_err(|error| error.to_string())
+            resolve_selection_snapshot(&database_path, &query, scope)
+                .map_err(|error| error.to_string())
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = resolve.await;
@@ -3412,7 +3771,7 @@ impl LecternView {
                 match result {
                     Ok(snapshot) => {
                         this.selection
-                            .install_all_matching(resolved_query, snapshot);
+                            .install_all_matching(resolved_query, scope, snapshot);
                         this.status = None;
                     }
                     Err(error) => {
@@ -3720,9 +4079,9 @@ impl LecternView {
         self.status = Some("Applying tag changes…".into());
         cx.notify();
         let database_path = self.database_path.clone();
-        let query = self.query.clone();
+        let request = self.current_browse_request();
         let apply = cx.background_executor().spawn(async move {
-            apply_bulk_tags_and_load_library(&database_path, &selection, &edit, &query)
+            apply_bulk_tags_and_load_library(&database_path, &selection, &edit, &request)
                 .map_err(|error| error.to_string())
         });
         cx.spawn_in(window, async move |this, cx| {
@@ -3757,7 +4116,7 @@ impl LecternView {
                             }
                             benchmark.bulk_tag_completion_started = Some(Instant::now());
                         }
-                        this.apply_snapshot(completion.snapshot);
+                        this.apply_browse_snapshot(completion.snapshot);
                         this.status = Some(bulk_tag_result_status(completion.result).into());
                         this.clear_selection();
                         this.bulk_tags = None;
@@ -3843,8 +4202,9 @@ impl LecternView {
         cx.notify();
 
         let database_path = self.database_path.clone();
+        let request = self.current_browse_request();
         let remove = cx.background_executor().spawn(async move {
-            remove_books_and_load_library(&database_path, &confirmation.selection)
+            remove_books_and_load_library(&database_path, &confirmation.selection, &request)
                 .map_err(|error| error.to_string())
         });
         cx.spawn_in(window, async move |this, cx| {
@@ -3861,12 +4221,10 @@ impl LecternView {
                         );
                         match completion.snapshot {
                             Ok(snapshot) => {
-                                this.apply_snapshot(snapshot);
+                                this.apply_browse_snapshot(snapshot);
                                 this.status = Some(status.into());
                             }
                             Err(error) => {
-                                this.library_total = 0;
-                                this.books.clear();
                                 this.status = Some(
                                     format!("{status} Could not refresh the library: {error}")
                                         .into(),
@@ -5227,8 +5585,8 @@ impl LecternView {
                                         .variant(ButtonVariant::Primary)
                                         .disabled(dialog.saving)
                                         .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.create_virtual_library(cx);
+                                            cx.listener(|this, _, window, cx| {
+                                                this.create_virtual_library(window, cx);
                                             }),
                                         ),
                                     ),
@@ -5526,7 +5884,9 @@ impl LecternView {
                     )
                     .child(
                         Button::new("begin-selection", "Select books")
-                            .disabled(selection_active || selection_locked)
+                            .disabled(
+                                selection_active || selection_locked || !self.route.shows_books(),
+                            )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.begin_selection(cx);
                             })),
@@ -5535,27 +5895,429 @@ impl LecternView {
             )
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one declarative render tree keeps the three fixed library regions auditable"
-    )]
-    fn library_view(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> gpui::Div {
-        let book_count = format!(
-            "{} {}",
-            self.library_total,
-            if self.library_total == 1 {
-                "book"
-            } else {
-                "books"
-            }
-        );
-        let selection_active = self.selection.is_active();
-        let selection_locked = self.busy
+    fn browse_sidebar(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> gpui::Div {
+        let locked = self.route_change_is_busy();
+        let all_books = ActionListItem::new("browse-all-books", "All books")
+            .selected(matches!(self.route, BrowseRoute::AllBooks))
+            .disabled(locked)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.navigate_to_all_books(window, cx);
+            }));
+        let groupings = LibraryGrouping::ALL
+            .into_iter()
+            .map(|grouping| {
+                ActionListItem::new(
+                    format!("browse-{}", grouping_slug(grouping)),
+                    grouping.to_string(),
+                )
+                .selected(self.route.grouping() == Some(grouping))
+                .disabled(locked)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.navigate_to_grouping(grouping, window, cx);
+                }))
+            })
+            .collect::<Vec<_>>();
+        div()
+            .flex_none()
+            .w(px(BROWSE_SIDEBAR_WIDTH_PX))
+            .min_h_0()
+            .bg(theme.surface.background)
+            .border_r(theme.border.thin)
+            .border_color(theme.border.muted)
+            .p(theme.spacing.small)
+            .flex()
+            .flex_col()
+            .gap(theme.spacing.small)
+            .child(
+                div()
+                    .px(theme.spacing.medium)
+                    .pt(theme.spacing.small)
+                    .text_color(theme.surface.muted_foreground)
+                    .text_size(theme.typography.body_size)
+                    .font_weight(theme.typography.button_weight)
+                    .child("Browse"),
+            )
+            .child(all_books)
+            .children(groupings)
+    }
+
+    fn route_change_is_busy(&self) -> bool {
+        self.busy
             || self.removing
             || self.device_resolving
             || self.active_device_transfer.is_some()
             || self.selection_pending.is_some()
-            || self.bulk_tags.is_some();
+            || self.bulk_tags.is_some()
+            || self.detail_loading.is_some()
+            || self.detail_editor.as_ref().is_some_and(|editor| {
+                editor.operation != DetailOperation::Idle || editor.virtual_library_busy
+            })
+    }
+
+    fn browse_breadcrumb(
+        &self,
+        view_locked: bool,
+        theme: &PrimerTheme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match &self.route {
+            BrowseRoute::AllBooks => div()
+                .min_w_0()
+                .truncate()
+                .font_weight(theme.typography.title_weight)
+                .child("All books")
+                .into_any_element(),
+            BrowseRoute::GroupIndex(grouping) => div()
+                .min_w_0()
+                .truncate()
+                .font_weight(theme.typography.title_weight)
+                .child(grouping.to_string())
+                .into_any_element(),
+            BrowseRoute::Scoped { grouping, group } => {
+                let grouping = *grouping;
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(theme.spacing.small)
+                    .child(
+                        Button::new(
+                            format!("back-to-{}", grouping_slug(grouping)),
+                            format!("‹ {grouping}"),
+                        )
+                        .size(ButtonSize::Small)
+                        .disabled(view_locked)
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.navigate_to_grouping(grouping, window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(theme.typography.title_weight)
+                            .child(group.name.clone()),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn content_bar(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> gpui::Div {
+        let (offset, shown, total) = if self.route.shows_books() {
+            (self.book_page_offset, self.books.len(), self.library_total)
+        } else {
+            (self.group_page_offset, self.groups.len(), self.group_total)
+        };
+        let loading = matches!(self.library_state, LibraryState::Loading);
+        let view_locked = loading || self.route_change_is_busy();
+        let previous_disabled = loading || offset == 0;
+        let next_disabled =
+            loading || offset.saturating_add(u64::try_from(shown).unwrap_or(u64::MAX)) >= total;
+        let page_label = page_range_label(offset, shown, total);
+        let breadcrumb = self.browse_breadcrumb(view_locked, theme, cx);
+        let tiles_label = if self.presentation == BrowsePresentation::Tiles {
+            "✓ Tiles"
+        } else {
+            "Tiles"
+        };
+        let table_label = if self.presentation == BrowsePresentation::Table {
+            "✓ Table"
+        } else {
+            "Table"
+        };
+        div()
+            .flex_none()
+            .h(px(CONTENT_BAR_HEIGHT_PX))
+            .px(theme.spacing.large)
+            .py(theme.spacing.small)
+            .border_b(theme.border.thin)
+            .border_color(theme.border.muted)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(theme.spacing.medium)
+            .child(div().min_w_0().flex_1().child(breadcrumb))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(theme.spacing.small)
+                    .child(
+                        Button::new("show-tiles", tiles_label)
+                            .size(ButtonSize::Small)
+                            .disabled(view_locked)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.set_browse_presentation(BrowsePresentation::Tiles, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("show-table", table_label)
+                            .size(ButtonSize::Small)
+                            .disabled(view_locked)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.set_browse_presentation(BrowsePresentation::Table, window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .w(theme.border.thin)
+                            .h(theme.spacing.large)
+                            .bg(theme.border.muted),
+                    )
+                    .child(
+                        div()
+                            .w(px(112.0))
+                            .text_center()
+                            .text_color(theme.surface.muted_foreground)
+                            .text_size(theme.typography.body_size)
+                            .child(page_label),
+                    )
+                    .child(
+                        Button::new("browse-previous-page", "Previous")
+                            .size(ButtonSize::Small)
+                            .disabled(previous_disabled)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.change_browse_page(false, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("browse-next-page", "Next")
+                            .size(ButtonSize::Small)
+                            .disabled(next_disabled)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.change_browse_page(true, window, cx);
+                            })),
+                    ),
+            )
+    }
+
+    fn browse_content(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if matches!(self.library_state, LibraryState::Loading) {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(theme.surface.muted_foreground)
+                .text_size(theme.typography.body_size)
+                .child(format!("Loading {}…", route_loading_label(&self.route)))
+                .into_any_element();
+        }
+        if let Some(error) = &self.browse_error {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(EMPTY_LIBRARY_CONTENT_WIDTH_PX))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .text_center()
+                        .gap(theme.spacing.medium)
+                        .child(
+                            div()
+                                .text_size(theme.typography.title_size)
+                                .font_weight(theme.typography.title_weight)
+                                .child(format!(
+                                    "Could not load {}",
+                                    route_loading_label(&self.route)
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme.surface.muted_foreground)
+                                .text_size(theme.typography.body_size)
+                                .child(error.clone()),
+                        )
+                        .child(
+                            Button::new("retry-browse-load", "Retry")
+                                .size(ButtonSize::Small)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.request_current_route_load(window, cx);
+                                })),
+                        ),
+                )
+                .into_any_element();
+        }
+        match &self.route {
+            BrowseRoute::GroupIndex(grouping) => self.group_index_content(*grouping, theme, cx),
+            BrowseRoute::AllBooks | BrowseRoute::Scoped { .. } => {
+                self.book_index_content(theme, cx)
+            }
+        }
+    }
+
+    fn group_index_content(
+        &self,
+        grouping: LibraryGrouping,
+        theme: &PrimerTheme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if self.groups.is_empty() {
+            let empty = div()
+                .w(px(EMPTY_LIBRARY_CONTENT_WIDTH_PX))
+                .flex()
+                .flex_col()
+                .items_center()
+                .text_center()
+                .gap(theme.spacing.medium)
+                .child(
+                    div()
+                        .text_size(theme.typography.title_size)
+                        .font_weight(theme.typography.title_weight)
+                        .child(format!("No {} yet", grouping.to_string().to_lowercase())),
+                )
+                .child(
+                    div()
+                        .text_color(theme.surface.muted_foreground)
+                        .text_size(theme.typography.body_size)
+                        .child(grouping_empty_explanation(grouping)),
+                )
+                .when(grouping == LibraryGrouping::VirtualLibraries, |empty| {
+                    empty.child(
+                        div().mt(theme.spacing.small).child(
+                            Button::new("empty-create-virtual-library", "Create Virtual Library")
+                                .size(ButtonSize::Small)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_virtual_library_dialog(
+                                        String::new(),
+                                        None,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        ),
+                    )
+                });
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(empty)
+                .into_any_element();
+        }
+        let content = match self.presentation {
+            BrowsePresentation::Tiles => self.group_tiles(grouping, theme, cx),
+            BrowsePresentation::Table => self.group_table(grouping, theme, cx),
+        };
+        div()
+            .id("group-index-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .bg(theme.surface.muted_background)
+            .p(theme.spacing.extra_large)
+            .child(content)
+            .into_any_element()
+    }
+
+    fn group_tiles(
+        &self,
+        grouping: LibraryGrouping,
+        theme: &PrimerTheme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let tiles = self
+            .groups
+            .iter()
+            .cloned()
+            .map(|group| group_tile(grouping, group, theme, cx))
+            .collect::<Vec<_>>();
+        div()
+            .flex()
+            .flex_wrap()
+            .items_start()
+            .gap(theme.spacing.extra_large)
+            .children(tiles)
+    }
+
+    fn group_table(
+        &self,
+        grouping: LibraryGrouping,
+        theme: &PrimerTheme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let rows = self
+            .groups
+            .iter()
+            .cloned()
+            .map(|group| group_table_row(grouping, group, theme, cx))
+            .collect::<Vec<_>>();
+        div()
+            .w_full()
+            .border(theme.border.thin)
+            .border_color(theme.border.muted)
+            .rounded(theme.button.radius)
+            .overflow_hidden()
+            .bg(theme.surface.background)
+            .child(group_table_header(grouping, theme))
+            .children(rows)
+    }
+
+    fn book_index_content(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.books.is_empty() {
+            let (heading, explanation) = match &self.route {
+                BrowseRoute::Scoped { group, .. } => (
+                    format!("“{}” has no books", group.name),
+                    "Books assigned to this group will appear here.".to_owned(),
+                ),
+                _ => (
+                    "No books match this view".to_owned(),
+                    "Change the active search or filters to see more books.".to_owned(),
+                ),
+            };
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(EMPTY_LIBRARY_CONTENT_WIDTH_PX))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .text_center()
+                        .gap(theme.spacing.medium)
+                        .child(
+                            div()
+                                .text_size(theme.typography.title_size)
+                                .font_weight(theme.typography.title_weight)
+                                .child(heading),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme.surface.muted_foreground)
+                                .text_size(theme.typography.body_size)
+                                .child(explanation),
+                        ),
+                )
+                .into_any_element();
+        }
+        let content = match self.presentation {
+            BrowsePresentation::Tiles => self.book_tiles(theme, cx),
+            BrowsePresentation::Table => self.book_table(theme, cx),
+        };
+        div()
+            .id("book-index-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .bg(theme.surface.muted_background)
+            .p(theme.spacing.extra_large)
+            .child(content)
+            .into_any_element()
+    }
+
+    fn book_tiles(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> gpui::Div {
+        let selection_active = self.selection.is_active();
+        let selection_locked = self.route_change_is_busy();
         let detail_book = self
             .detail_editor
             .as_ref()
@@ -5566,6 +6328,9 @@ impl LecternView {
             .iter()
             .enumerate()
             .map(|(index, book)| {
+                let index = self
+                    .book_page_offset
+                    .saturating_add(u64::try_from(index).unwrap_or(u64::MAX));
                 book_card(
                     book,
                     index,
@@ -5578,6 +6343,82 @@ impl LecternView {
                 )
             })
             .collect::<Vec<_>>();
+        div()
+            .flex()
+            .flex_wrap()
+            .items_start()
+            .gap(theme.spacing.extra_large)
+            .children(cards)
+    }
+
+    fn book_table(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> gpui::Div {
+        let selection_active = self.selection.is_active();
+        let selection_locked = self.route_change_is_busy();
+        let detail_book = self
+            .detail_editor
+            .as_ref()
+            .map(|editor| editor.original.id)
+            .or(self.detail_loading);
+        let rows = self
+            .books
+            .iter()
+            .enumerate()
+            .map(|(index, book)| {
+                let index = self
+                    .book_page_offset
+                    .saturating_add(u64::try_from(index).unwrap_or(u64::MAX));
+                book_table_row(
+                    book,
+                    index,
+                    self.selection.contains(book.summary.id)
+                        || detail_book == Some(book.summary.id),
+                    selection_active,
+                    selection_locked,
+                    theme,
+                    cx,
+                )
+            })
+            .collect::<Vec<_>>();
+        div()
+            .w_full()
+            .border(theme.border.thin)
+            .border_color(theme.border.muted)
+            .rounded(theme.button.radius)
+            .overflow_hidden()
+            .bg(theme.surface.background)
+            .child(book_table_header(selection_active, theme))
+            .children(rows)
+    }
+
+    fn footer_count(&self) -> String {
+        match &self.route {
+            BrowseRoute::Scoped { group, .. } => format!(
+                "{} {} in {}",
+                self.library_total,
+                pluralize_book(self.library_total),
+                group.name
+            ),
+            BrowseRoute::GroupIndex(_) => format!(
+                "{} {} in library",
+                self.catalog_total,
+                pluralize_book(self.catalog_total)
+            ),
+            BrowseRoute::AllBooks => format!(
+                "{} {}",
+                self.library_total,
+                pluralize_book(self.library_total)
+            ),
+        }
+    }
+
+    fn library_view(&self, theme: &PrimerTheme, cx: &mut Context<Self>) -> gpui::Div {
+        let selection_active = self.selection.is_active();
+        let selection_locked = self.busy
+            || self.removing
+            || self.device_resolving
+            || self.active_device_transfer.is_some()
+            || self.selection_pending.is_some()
+            || self.bulk_tags.is_some();
 
         div()
             .size_full()
@@ -5593,39 +6434,21 @@ impl LecternView {
                     .flex_1()
                     .min_h_0()
                     .flex()
+                    .child(self.browse_sidebar(theme, cx))
                     .child(
                         div()
-                            .id("library-scroll")
                             .flex_1()
                             .min_w_0()
-                            .overflow_y_scroll()
-                            .bg(theme.surface.muted_background)
-                            .p(theme.spacing.extra_large)
+                            .min_h_0()
                             .flex()
                             .flex_col()
-                            .gap(theme.spacing.large)
+                            .child(self.content_bar(theme, cx))
                             .child(
                                 div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .items_start()
-                                    .gap(theme.spacing.extra_large)
-                                    .children(cards),
-                            )
-                            .when(
-                                self.library_total
-                                    > u64::try_from(self.books.len()).unwrap_or(u64::MAX),
-                                |content| {
-                                    content.child(
-                                        div()
-                                            .text_color(theme.surface.muted_foreground)
-                                            .text_size(theme.typography.body_size)
-                                            .child(format!(
-                                                "Showing the first {} books.",
-                                                self.books.len()
-                                            )),
-                                    )
-                                },
+                                    .id("library-content")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .child(self.browse_content(theme, cx)),
                             ),
                     )
                     .when_some(self.bulk_tags.as_ref(), |body, editor| {
@@ -5647,7 +6470,7 @@ impl LecternView {
                     .justify_between()
                     .text_color(theme.surface.muted_foreground)
                     .text_size(theme.typography.body_size)
-                    .child(div().flex_none().child(book_count))
+                    .child(div().flex_none().child(self.footer_count()))
                     .when_some(self.status.clone(), |bar, status| {
                         bar.child(
                             div()
@@ -5670,10 +6493,15 @@ impl Render for LecternView {
             cx.on_next_frame(window, Self::initial_frame_presented);
         }
         let theme = PrimerTheme::current(cx);
-        let content = match self.library_state {
-            LibraryState::Loading => Self::loading_view(&theme),
-            LibraryState::Ready if self.books.is_empty() => self.empty_library_view(&theme, cx),
-            LibraryState::Ready => self.library_view(&theme, cx),
+        let content = if !self.catalog_loaded {
+            Self::loading_view(&theme)
+        } else if matches!(self.library_state, LibraryState::Ready)
+            && self.catalog_total == 0
+            && self.browse_error.is_none()
+        {
+            self.empty_library_view(&theme, cx)
+        } else {
+            self.library_view(&theme, cx)
         };
         let modal_open = self.removal_confirmation.is_some()
             || self.theme_dialog_open
@@ -5740,6 +6568,43 @@ enum LibraryState {
     Ready,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BrowsePresentation {
+    #[default]
+    Tiles,
+    Table,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BrowseRoute {
+    AllBooks,
+    GroupIndex(LibraryGrouping),
+    Scoped {
+        grouping: LibraryGrouping,
+        group: LibraryGroup,
+    },
+}
+
+impl BrowseRoute {
+    fn grouping(&self) -> Option<LibraryGrouping> {
+        match self {
+            Self::AllBooks => None,
+            Self::GroupIndex(grouping) | Self::Scoped { grouping, .. } => Some(*grouping),
+        }
+    }
+
+    fn scope(&self) -> LibraryScope {
+        match self {
+            Self::AllBooks | Self::GroupIndex(_) => LibraryScope::All,
+            Self::Scoped { group, .. } => group.scope,
+        }
+    }
+
+    fn shows_books(&self) -> bool {
+        !matches!(self, Self::GroupIndex(_))
+    }
+}
+
 struct LoadedBook {
     summary: BookSummary,
     cover: Option<Vec<u8>>,
@@ -5747,7 +6612,27 @@ struct LoadedBook {
 
 struct LibrarySnapshot {
     total: u64,
+    offset: u64,
     books: Vec<LoadedBook>,
+}
+
+enum BrowseContentSnapshot {
+    Books(LibrarySnapshot),
+    Groups(LibraryGroupPage),
+}
+
+struct BrowseSnapshot {
+    catalog_total: u64,
+    content: BrowseContentSnapshot,
+}
+
+#[derive(Clone)]
+struct BrowseLoadRequest {
+    route: BrowseRoute,
+    query: LibraryQuery,
+    presentation: BrowsePresentation,
+    book_page_offset: u64,
+    group_page_offset: u64,
 }
 
 struct LibraryBook {
@@ -5760,6 +6645,7 @@ enum GridSelectionMode {
     Explicit(HashSet<BookId>),
     AllMatching {
         query: LibraryQuery,
+        scope: LibraryScope,
         generation: LibraryGeneration,
         matching_books: u64,
         excluded: HashSet<BookId>,
@@ -5768,7 +6654,7 @@ enum GridSelectionMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SelectionAnchor {
-    index: usize,
+    index: u64,
 }
 
 #[derive(Default)]
@@ -5811,7 +6697,7 @@ impl GridSelection {
         )
     }
 
-    fn toggle(&mut self, id: BookId, index: usize) {
+    fn toggle(&mut self, id: BookId, index: u64) {
         match self
             .mode
             .get_or_insert_with(|| GridSelectionMode::Explicit(HashSet::with_capacity(1)))
@@ -5849,12 +6735,18 @@ impl GridSelection {
         }
     }
 
-    fn install_all_matching(&mut self, query: LibraryQuery, snapshot: SelectionSnapshot) {
+    fn install_all_matching(
+        &mut self,
+        query: LibraryQuery,
+        scope: LibraryScope,
+        snapshot: SelectionSnapshot,
+    ) {
         if snapshot.matching_books == 0 {
             self.clear();
         } else {
             self.mode = Some(GridSelectionMode::AllMatching {
                 query,
+                scope,
                 generation: snapshot.generation,
                 matching_books: snapshot.matching_books,
                 excluded: HashSet::new(),
@@ -5870,11 +6762,13 @@ impl GridSelection {
             }
             Some(GridSelectionMode::AllMatching {
                 query,
+                scope,
                 generation,
                 excluded,
                 ..
-            }) => Some(BookSelection::all_matching(
+            }) => Some(BookSelection::all_matching_in_scope(
                 query.clone(),
+                *scope,
                 *generation,
                 excluded.iter().copied().collect(),
             )),
@@ -5902,17 +6796,61 @@ struct BulkRemovalConfirmation {
 
 struct RemovalCompletion {
     result: BulkRemovalResult,
-    snapshot: Result<LibrarySnapshot, LibraryServiceError>,
+    snapshot: Result<BrowseSnapshot, LibraryServiceError>,
 }
 
 struct BulkTagCompletion {
     result: BulkTagResult,
-    snapshot: LibrarySnapshot,
+    snapshot: BrowseSnapshot,
 }
 
-fn load_library_snapshot(path: &Path) -> Result<LibrarySnapshot, LibraryServiceError> {
+fn load_browse_snapshot(
+    path: &Path,
+    request: &BrowseLoadRequest,
+) -> Result<BrowseSnapshot, LibraryServiceError> {
     let mut service = SqliteLibraryService::open(path)?;
-    load_library_snapshot_from(&mut service)
+    load_browse_snapshot_from(&mut service, request)
+}
+
+fn load_browse_snapshot_from(
+    service: &mut SqliteLibraryService,
+    request: &BrowseLoadRequest,
+) -> Result<BrowseSnapshot, LibraryServiceError> {
+    let catalog_total = service
+        .query_library_page(&LibraryQuery::default(), 0, 0)?
+        .total;
+    let content = match &request.route {
+        BrowseRoute::GroupIndex(grouping) => {
+            let mut page = service.browse_library_groups(
+                *grouping,
+                request.group_page_offset,
+                LIBRARY_GROUP_PAGE_SIZE,
+            )?;
+            if page.groups.is_empty() && page.total > 0 && page.offset > 0 {
+                let page_size = u64::from(LIBRARY_GROUP_PAGE_SIZE);
+                let last_offset = page.total.saturating_sub(1) / page_size * page_size;
+                page = service.browse_library_groups(
+                    *grouping,
+                    last_offset,
+                    LIBRARY_GROUP_PAGE_SIZE,
+                )?;
+            }
+            BrowseContentSnapshot::Groups(page)
+        }
+        BrowseRoute::AllBooks | BrowseRoute::Scoped { .. } => {
+            BrowseContentSnapshot::Books(load_library_snapshot_in_scope_from(
+                service,
+                &request.query,
+                request.route.scope(),
+                request.book_page_offset,
+                request.presentation == BrowsePresentation::Tiles,
+            )?)
+        }
+    };
+    Ok(BrowseSnapshot {
+        catalog_total,
+        content,
+    })
 }
 
 fn load_book(path: &Path, id: BookId) -> Result<Option<Book>, LibraryServiceError> {
@@ -5920,20 +6858,30 @@ fn load_book(path: &Path, id: BookId) -> Result<Option<Book>, LibraryServiceErro
     service.get_book(id)
 }
 
-fn load_library_snapshot_from(
-    service: &mut SqliteLibraryService,
-) -> Result<LibrarySnapshot, LibraryServiceError> {
-    load_library_snapshot_for_query_from(service, &LibraryQuery::default())
-}
-
 fn load_library_snapshot_for_query_from(
     service: &mut SqliteLibraryService,
     query: &LibraryQuery,
 ) -> Result<LibrarySnapshot, LibraryServiceError> {
-    let page = service.query_library_page(query, 0, LIBRARY_PAGE_SIZE)?;
+    load_library_snapshot_in_scope_from(service, query, LibraryScope::All, 0, true)
+}
+
+fn load_library_snapshot_in_scope_from(
+    service: &mut SqliteLibraryService,
+    query: &LibraryQuery,
+    scope: LibraryScope,
+    offset: u64,
+    load_covers: bool,
+) -> Result<LibrarySnapshot, LibraryServiceError> {
+    let mut page = service.query_library_page_in_scope(query, scope, offset, LIBRARY_PAGE_SIZE)?;
+    if page.books.is_empty() && page.total > 0 && page.offset > 0 {
+        let page_size = u64::from(LIBRARY_PAGE_SIZE);
+        let last_offset = page.total.saturating_sub(1) / page_size * page_size;
+        page = service.query_library_page_in_scope(query, scope, last_offset, LIBRARY_PAGE_SIZE)?;
+    }
+    let page_offset = page.offset;
     let mut books = Vec::with_capacity(page.books.len());
     for summary in page.books {
-        let cover = if summary.has_cover {
+        let cover = if load_covers && summary.has_cover {
             service.load_cover(summary.id)?
         } else {
             None
@@ -5942,6 +6890,7 @@ fn load_library_snapshot_for_query_from(
     }
     Ok(LibrarySnapshot {
         total: page.total,
+        offset: page_offset,
         books,
     })
 }
@@ -5950,30 +6899,32 @@ fn apply_bulk_tags_and_load_library(
     path: &Path,
     selection: &BookSelection,
     edit: &BulkTagEdit,
-    query: &LibraryQuery,
+    request: &BrowseLoadRequest,
 ) -> Result<BulkTagCompletion, LibraryServiceError> {
     let mut service = SqliteLibraryService::open(path)?;
     let result = service.apply_bulk_tags(selection, edit)?;
-    let snapshot = load_library_snapshot_for_query_from(&mut service, query)?;
+    let snapshot = load_browse_snapshot_from(&mut service, request)?;
     Ok(BulkTagCompletion { result, snapshot })
 }
 
 fn import_books_and_load_library(
     path: &Path,
     roots: &[PathBuf],
-) -> Result<(ImportSummary, LibrarySnapshot), LibraryServiceError> {
+    request: &BrowseLoadRequest,
+) -> Result<(ImportSummary, BrowseSnapshot), LibraryServiceError> {
     let mut service = SqliteLibraryService::open(path)?;
     let summary = service.import_publications(roots, &mut |_| {})?;
-    let snapshot = load_library_snapshot_from(&mut service)?;
+    let snapshot = load_browse_snapshot_from(&mut service, request)?;
     Ok((summary, snapshot))
 }
 
 fn resolve_selection_snapshot(
     path: &Path,
     query: &LibraryQuery,
+    scope: LibraryScope,
 ) -> Result<SelectionSnapshot, LibraryServiceError> {
     let mut service = SqliteLibraryService::open(path)?;
-    service.selection_snapshot(query)
+    service.selection_snapshot_in_scope(query, scope)
 }
 
 fn load_bulk_tag_benchmark_library(
@@ -6000,27 +6951,30 @@ fn resolve_bulk_tag_benchmark_selection(
 fn resolve_selection_range(
     path: &Path,
     query: &LibraryQuery,
+    scope: LibraryScope,
     offset: u64,
     limit: u32,
 ) -> Result<Vec<BookId>, LibraryServiceError> {
     let mut service = SqliteLibraryService::open(path)?;
-    service.query_library_ids_window(query, offset, limit)
+    service.query_library_ids_window_in_scope(query, scope, offset, limit)
 }
 
 fn remove_books_and_load_library(
     path: &Path,
     selection: &BookSelection,
+    request: &BrowseLoadRequest,
 ) -> Result<RemovalCompletion, LibraryServiceError> {
     let mut service = SqliteLibraryService::open(path)?;
     let result = service.remove_books(selection)?;
-    let snapshot = load_library_snapshot_from(&mut service);
+    let snapshot = load_browse_snapshot_from(&mut service, request);
     Ok(RemovalCompletion { result, snapshot })
 }
 
 fn save_book_and_load_library(
     path: &Path,
     edit: &lectern_core::organisation::BookEdit,
-) -> Result<(Book, LibrarySnapshot), String> {
+    request: &BrowseLoadRequest,
+) -> Result<(Book, BrowseSnapshot), String> {
     let mut service = SqliteLibraryService::open(path).map_err(|error| error.to_string())?;
     service
         .update_metadata(edit)
@@ -6029,13 +6983,14 @@ fn save_book_and_load_library(
         .get_book(edit.id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "The saved book is no longer in the library.".to_owned())?;
-    let snapshot = load_library_snapshot_from(&mut service).map_err(|error| error.to_string())?;
+    let snapshot =
+        load_browse_snapshot_from(&mut service, request).map_err(|error| error.to_string())?;
     Ok((book, snapshot))
 }
 
 struct AssetAttachCompletion {
     book: Book,
-    snapshot: LibrarySnapshot,
+    snapshot: BrowseSnapshot,
     message: String,
 }
 
@@ -6043,6 +6998,7 @@ fn attach_assets_and_load_library(
     path: &Path,
     id: BookId,
     paths: &[PathBuf],
+    request: &BrowseLoadRequest,
 ) -> Result<AssetAttachCompletion, String> {
     let mut service = SqliteLibraryService::open(path).map_err(|error| error.to_string())?;
     let mut attached = 0_usize;
@@ -6064,7 +7020,8 @@ fn attach_assets_and_load_library(
         .get_book(id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "The book is no longer in the library.".to_owned())?;
-    let snapshot = load_library_snapshot_from(&mut service).map_err(|error| error.to_string())?;
+    let snapshot =
+        load_browse_snapshot_from(&mut service, request).map_err(|error| error.to_string())?;
     let message = if failures.is_empty() {
         format!(
             "Added {attached} book {}.",
@@ -6089,7 +7046,8 @@ fn detach_asset_and_load_library(
     path: &Path,
     id: BookId,
     asset: AssetId,
-) -> Result<(Book, LibrarySnapshot), String> {
+    request: &BrowseLoadRequest,
+) -> Result<(Book, BrowseSnapshot), String> {
     let mut service = SqliteLibraryService::open(path).map_err(|error| error.to_string())?;
     let detached_book = service
         .detach_asset(asset)
@@ -6101,17 +7059,20 @@ fn detach_asset_and_load_library(
         .get_book(id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "The book is no longer in the library.".to_owned())?;
-    let snapshot = load_library_snapshot_from(&mut service).map_err(|error| error.to_string())?;
+    let snapshot =
+        load_browse_snapshot_from(&mut service, request).map_err(|error| error.to_string())?;
     Ok((book, snapshot))
 }
 
 fn remove_book_and_load_library(
     path: &Path,
     id: BookId,
-) -> Result<(bool, LibrarySnapshot), String> {
+    request: &BrowseLoadRequest,
+) -> Result<(bool, BrowseSnapshot), String> {
     let mut service = SqliteLibraryService::open(path).map_err(|error| error.to_string())?;
     let removed = service.remove_book(id).map_err(|error| error.to_string())?;
-    let snapshot = load_library_snapshot_from(&mut service).map_err(|error| error.to_string())?;
+    let snapshot =
+        load_browse_snapshot_from(&mut service, request).map_err(|error| error.to_string())?;
     Ok((removed, snapshot))
 }
 
@@ -7994,8 +8955,8 @@ fn detail_virtual_libraries_item(
             format!("{}  {}", library.icon.glyph(), library.name),
         )
         .disabled(editing_busy)
-        .on_remove(cx.listener(move |this, _, _, cx| {
-            this.toggle_detail_virtual_library(&selected, cx);
+        .on_remove(cx.listener(move |this, _, window, cx| {
+            this.toggle_detail_virtual_library(&selected, window, cx);
         }))
     });
     let selected_items = editor
@@ -8010,8 +8971,8 @@ fn detail_virtual_libraries_item(
             )
             .selected(true)
             .disabled(editor.virtual_library_busy)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_detail_virtual_library(&selected, cx);
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.toggle_detail_virtual_library(&selected, window, cx);
             }))
         })
         .collect::<Vec<_>>();
@@ -8027,8 +8988,8 @@ fn detail_virtual_libraries_item(
                 virtual_library_option_label(library),
             )
             .disabled(editor.virtual_library_busy)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_detail_virtual_library(&suggestion, cx);
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.toggle_detail_virtual_library(&suggestion, window, cx);
             }))
         })
         .collect::<Vec<_>>();
@@ -8446,9 +9407,472 @@ fn asset_row(
         .into_any_element()
 }
 
+const fn grouping_slug(grouping: LibraryGrouping) -> &'static str {
+    match grouping {
+        LibraryGrouping::VirtualLibraries => "virtual-libraries",
+        LibraryGrouping::Genres => "genres",
+        LibraryGrouping::Contributors => "contributors",
+        LibraryGrouping::Series => "series",
+    }
+}
+
+const fn grouping_item_name(grouping: LibraryGrouping) -> &'static str {
+    match grouping {
+        LibraryGrouping::VirtualLibraries => "Virtual Library",
+        LibraryGrouping::Genres => "Genre",
+        LibraryGrouping::Contributors => "Contributor",
+        LibraryGrouping::Series => "Series",
+    }
+}
+
+const fn grouping_empty_explanation(grouping: LibraryGrouping) -> &'static str {
+    match grouping {
+        LibraryGrouping::VirtualLibraries => {
+            "Create a Virtual Library to gather books into a collection you control."
+        }
+        LibraryGrouping::Genres => "Genres assigned to books will appear here.",
+        LibraryGrouping::Contributors => {
+            "Authors, editors, translators, and other credited people will appear here."
+        }
+        LibraryGrouping::Series => "Series assigned to books will appear here.",
+    }
+}
+
+fn route_loading_label(route: &BrowseRoute) -> String {
+    match route {
+        BrowseRoute::AllBooks => "all books".to_owned(),
+        BrowseRoute::GroupIndex(grouping) => grouping.to_string().to_lowercase(),
+        BrowseRoute::Scoped { group, .. } => format!("books in {}", group.name),
+    }
+}
+
+fn page_range_label(offset: u64, shown: usize, total: u64) -> String {
+    if shown == 0 || total == 0 {
+        return format!("0 of {total}");
+    }
+    let first = offset.saturating_add(1).min(total);
+    let last = offset
+        .saturating_add(u64::try_from(shown).unwrap_or(u64::MAX))
+        .min(total);
+    format!("{first}–{last} of {total}")
+}
+
+fn group_folder_mark(glyph: &'static str, theme: &PrimerTheme) -> gpui::Div {
+    div()
+        .w(px(56.0))
+        .flex()
+        .flex_col()
+        .items_start()
+        .child(
+            div()
+                .w(px(24.0))
+                .h(px(6.0))
+                .rounded_t(theme.action_menu.item_radius)
+                .bg(theme.selection.border),
+        )
+        .child(
+            div()
+                .w_full()
+                .h(px(34.0))
+                .rounded(theme.action_menu.item_radius)
+                .border(theme.border.thin)
+                .border_color(theme.selection.border)
+                .bg(theme.selection.background)
+                .text_color(theme.selection.border)
+                .flex()
+                .items_center()
+                .justify_center()
+                .font_weight(theme.typography.button_weight)
+                .child(glyph),
+        )
+}
+
+fn group_tile(
+    grouping: LibraryGrouping,
+    group: LibraryGroup,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let label = format!(
+        "Open {} {}, {} {}",
+        grouping_item_name(grouping),
+        group.name,
+        group.books,
+        pluralize_book(group.books)
+    );
+    let supporting_text = group
+        .description
+        .as_deref()
+        .filter(|description| !description.trim().is_empty())
+        .map_or_else(
+            || grouping_item_name(grouping).to_owned(),
+            ToOwned::to_owned,
+        );
+    let glyph = group
+        .icon
+        .map(VirtualLibraryIcon::glyph)
+        .unwrap_or_default();
+    let group_name = group.name.clone();
+    let group_to_open = group.clone();
+    let hover_background = theme.action_menu.hover_background;
+
+    BaseButton::new(format!(
+        "group-tile-{}-{group_name}",
+        grouping_slug(grouping)
+    ))
+    .accessibility_label(label)
+    .w(px(GROUP_TILE_WIDTH_PX))
+    .h(px(GROUP_TILE_HEIGHT_PX))
+    .flex_none()
+    .p(theme.spacing.large)
+    .border(theme.border.thin)
+    .border_color(theme.border.muted)
+    .rounded(theme.button.radius)
+    .bg(theme.surface.background)
+    .text_color(theme.surface.foreground)
+    .flex()
+    .flex_col()
+    .items_start()
+    .justify_between()
+    .cursor_pointer()
+    .hover(move |style| style.bg(hover_background))
+    .focus_visible(move |style| {
+        style
+            .border(theme.focus.width)
+            .border_color(theme.focus.color)
+    })
+    .on_click(cx.listener(move |this, _, window, cx| {
+        this.open_library_group(grouping, group_to_open.clone(), window, cx);
+    }))
+    .child(group_folder_mark(glyph, theme))
+    .child(
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap(theme.spacing.small)
+            .child(
+                div()
+                    .w_full()
+                    .truncate()
+                    .text_left()
+                    .font_weight(theme.typography.title_weight)
+                    .child(group.name),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(theme.spacing.small)
+                    .text_color(theme.surface.muted_foreground)
+                    .text_size(theme.typography.body_size)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_left()
+                            .child(supporting_text),
+                    )
+                    .child(div().flex_none().child(format!(
+                        "{} {}",
+                        group.books,
+                        pluralize_book(group.books)
+                    ))),
+            ),
+    )
+    .into_any_element()
+}
+
+fn group_table_header(grouping: LibraryGrouping, theme: &PrimerTheme) -> gpui::Div {
+    div()
+        .h(px(36.0))
+        .px(theme.spacing.large)
+        .flex()
+        .items_center()
+        .gap(theme.spacing.large)
+        .border_b(theme.border.thin)
+        .border_color(theme.border.muted)
+        .bg(theme.surface.muted_background)
+        .text_color(theme.surface.muted_foreground)
+        .text_size(theme.typography.body_size)
+        .font_weight(theme.typography.button_weight)
+        .child(div().min_w_0().flex_1().child("Name"))
+        .when(grouping == LibraryGrouping::VirtualLibraries, |row| {
+            row.child(div().w(px(260.0)).flex_none().child("Description"))
+        })
+        .child(div().w(px(96.0)).flex_none().text_right().child("Books"))
+}
+
+fn group_table_row(
+    grouping: LibraryGrouping,
+    group: LibraryGroup,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let label = format!(
+        "Open {} {}, {} {}",
+        grouping_item_name(grouping),
+        group.name,
+        group.books,
+        pluralize_book(group.books)
+    );
+    let description = group.description.clone().unwrap_or_default();
+    let group_name = group.name.clone();
+    let group_to_open = group.clone();
+    let hover_background = theme.action_menu.hover_background;
+    BaseButton::new(format!(
+        "group-row-{}-{group_name}",
+        grouping_slug(grouping)
+    ))
+    .accessibility_label(label)
+    .w_full()
+    .h(px(44.0))
+    .px(theme.spacing.large)
+    .gap(theme.spacing.large)
+    .justify_start()
+    .border_b(theme.border.thin)
+    .border_color(theme.border.muted)
+    .bg(theme.surface.background)
+    .text_color(theme.surface.foreground)
+    .text_size(theme.typography.body_size)
+    .cursor_pointer()
+    .hover(move |style| style.bg(hover_background))
+    .focus_visible(move |style| {
+        style
+            .border(theme.focus.width)
+            .border_color(theme.focus.color)
+    })
+    .on_click(cx.listener(move |this, _, window, cx| {
+        this.open_library_group(grouping, group_to_open.clone(), window, cx);
+    }))
+    .child(
+        div()
+            .min_w_0()
+            .flex_1()
+            .truncate()
+            .text_left()
+            .font_weight(theme.typography.button_weight)
+            .child(group.name),
+    )
+    .when(grouping == LibraryGrouping::VirtualLibraries, |row| {
+        row.child(
+            div()
+                .w(px(260.0))
+                .flex_none()
+                .truncate()
+                .text_left()
+                .text_color(theme.surface.muted_foreground)
+                .child(description),
+        )
+    })
+    .child(
+        div()
+            .w(px(96.0))
+            .flex_none()
+            .text_right()
+            .child(group.books.to_string()),
+    )
+    .into_any_element()
+}
+
+fn book_table_header(selection_active: bool, theme: &PrimerTheme) -> gpui::Div {
+    div()
+        .h(px(36.0))
+        .px(theme.spacing.large)
+        .flex()
+        .items_center()
+        .gap(theme.spacing.large)
+        .border_b(theme.border.thin)
+        .border_color(theme.border.muted)
+        .bg(theme.surface.muted_background)
+        .text_color(theme.surface.muted_foreground)
+        .text_size(theme.typography.body_size)
+        .font_weight(theme.typography.button_weight)
+        .when(selection_active, |row| {
+            row.child(div().w(theme.spacing.large).flex_none())
+        })
+        .child(div().min_w_0().flex_1().child("Title"))
+        .child(div().w(px(160.0)).flex_none().child("Contributor"))
+        .child(div().w(px(130.0)).flex_none().child("Series"))
+        .child(div().w(px(88.0)).flex_none().child("File status"))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one declarative row keeps its semantic button, fixed columns, and optional selector aligned"
+)]
+fn book_table_row(
+    book: &LibraryBook,
+    index: u64,
+    selected: bool,
+    selection_active: bool,
+    selection_locked: bool,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> gpui::AnyElement {
+    let book_id = book.summary.id;
+    let authors = if book.summary.authors.trim().is_empty() {
+        "Unknown contributor".to_owned()
+    } else {
+        book.summary.authors.clone()
+    };
+    let series = match (&book.summary.series, book.summary.series_index) {
+        (Some(series), Some(index)) => format!("{series} · {index}"),
+        (Some(series), None) => series.clone(),
+        (None, _) => "—".to_owned(),
+    };
+    let file_status = if book.summary.has_file_issue {
+        "Needs attention"
+    } else {
+        "Available"
+    };
+    let hover_background = theme.action_menu.hover_background;
+    let row_button = BaseButton::new(format!("book-row-{}", book_id.value()))
+        .accessibility_label(format!("Open {} by {authors}", book.summary.title))
+        .selected(selected)
+        .disabled(selection_locked)
+        .flex_1()
+        .min_w_0()
+        .h(px(44.0))
+        .gap(theme.spacing.large)
+        .justify_start()
+        .bg(if selected {
+            theme.selection.background
+        } else {
+            theme.surface.background
+        })
+        .text_color(theme.surface.foreground)
+        .text_size(theme.typography.body_size)
+        .when(!selection_locked, |button| {
+            button
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover_background))
+        })
+        .focus_visible(move |style| {
+            style
+                .border(theme.focus.width)
+                .border_color(theme.focus.color)
+        })
+        .on_click(
+            cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                this.handle_book_click(book_id, index, event.modifiers(), window, cx);
+            }),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .truncate()
+                .text_left()
+                .font_weight(theme.typography.button_weight)
+                .child(book.summary.title.clone()),
+        )
+        .child(
+            div()
+                .w(px(160.0))
+                .flex_none()
+                .truncate()
+                .text_left()
+                .text_color(theme.surface.muted_foreground)
+                .child(authors),
+        )
+        .child(
+            div()
+                .w(px(130.0))
+                .flex_none()
+                .truncate()
+                .text_left()
+                .text_color(theme.surface.muted_foreground)
+                .child(series),
+        )
+        .child(
+            div()
+                .w(px(88.0))
+                .flex_none()
+                .truncate()
+                .text_left()
+                .text_color(theme.surface.muted_foreground)
+                .child(file_status),
+        );
+
+    div()
+        .w_full()
+        .h(px(44.0))
+        .px(theme.spacing.large)
+        .flex()
+        .items_center()
+        .gap(theme.spacing.large)
+        .border_b(theme.border.thin)
+        .border_color(theme.border.muted)
+        .bg(if selected {
+            theme.selection.background
+        } else {
+            theme.surface.background
+        })
+        .when(selection_active, |row| {
+            row.child(book_table_selection_checkbox(
+                book,
+                index,
+                selected,
+                selection_locked,
+                theme,
+                cx,
+            ))
+        })
+        .child(row_button)
+        .into_any_element()
+}
+
+fn book_table_selection_checkbox(
+    book: &LibraryBook,
+    index: u64,
+    selected: bool,
+    selection_locked: bool,
+    theme: &PrimerTheme,
+    cx: &mut Context<LecternView>,
+) -> Checkbox {
+    let book_id = book.summary.id;
+    let checkbox_entity = cx.entity().downgrade();
+    Checkbox::new(format!("book-row-checkbox-{}", book_id.value()))
+        .checked(selected)
+        .disabled(selection_locked)
+        .accessibility_label(format!("Select {}", book.summary.title))
+        .size(theme.spacing.large)
+        .flex_none()
+        .rounded(theme.button.radius)
+        .border(theme.border.thin)
+        .border_color(theme.selection.border)
+        .bg(if selected {
+            theme.selection.check_background
+        } else {
+            theme.surface.background
+        })
+        .text_color(theme.selection.check_foreground)
+        .flex()
+        .items_center()
+        .justify_center()
+        .focus_visible(move |style| {
+            style
+                .border(theme.focus.width)
+                .border_color(theme.focus.color)
+        })
+        .on_change(move |_: CheckboxState, event, window, cx| {
+            cx.stop_propagation();
+            _ = checkbox_entity.update(cx, |this, cx| {
+                this.handle_book_click(book_id, index, event.modifiers(), window, cx);
+            });
+        })
+        .when(selected, |checkbox| checkbox.child("✓"))
+}
+
 fn book_card(
     book: &LibraryBook,
-    index: usize,
+    index: u64,
     selected: bool,
     selection_active: bool,
     selection_locked: bool,
@@ -8540,7 +9964,7 @@ fn book_card(
 
 fn book_selection_checkbox(
     book: &LibraryBook,
-    index: usize,
+    index: u64,
     selected: bool,
     selection_locked: bool,
     theme: &PrimerTheme,
@@ -8723,6 +10147,36 @@ fn benchmark_library_books() -> Vec<LibraryBook> {
                 has_file_issue: false,
             },
             cover: None,
+        })
+        .collect()
+}
+
+fn benchmark_browse_books() -> Vec<LibraryBook> {
+    let mut books = benchmark_library_books();
+    for (index, book) in books.iter_mut().enumerate() {
+        book.summary.series = Some(format!("Benchmark series {:02}", index % 24 + 1));
+        book.summary.series_index = SeriesIndex::from_scaled(
+            u64::try_from(index + 1).expect("benchmark index fits u64") * SeriesIndex::SCALE,
+        );
+        book.summary.has_file_issue = index.is_multiple_of(19);
+    }
+    books
+}
+
+fn benchmark_genre_groups() -> Vec<LibraryGroup> {
+    Genre::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(index, genre)| LibraryGroup {
+            scope: LibraryScope::Genre(genre),
+            name: genre.to_string(),
+            description: None,
+            icon: None,
+            books: if genre == Genre::Fantasy {
+                BENCHMARK_BROWSE_SCOPED_BOOKS
+            } else {
+                1_200 + u64::try_from(index).expect("genre index fits u64") * 17
+            },
         })
         .collect()
 }
@@ -8979,6 +10433,7 @@ mod selection_tests {
         let mut selection = GridSelection::default();
         selection.install_all_matching(
             query.clone(),
+            LibraryScope::All,
             SelectionSnapshot {
                 matching_books: 50_000,
                 generation,
@@ -8998,6 +10453,59 @@ mod selection_tests {
                 vec![excluded]
             ))
         );
+    }
+
+    #[test]
+    fn all_matching_selection_preserves_the_open_group_scope() {
+        let query = LibraryQuery::default();
+        let scope = LibraryScope::Genre(Genre::Fantasy);
+        let generation = LibraryGeneration {
+            connection_changes: 7,
+            data_version: 11,
+        };
+        let mut selection = GridSelection::default();
+        selection.install_all_matching(
+            query.clone(),
+            scope,
+            SelectionSnapshot {
+                matching_books: 256,
+                generation,
+            },
+        );
+
+        assert_eq!(
+            selection.descriptor(),
+            Some(BookSelection::all_matching_in_scope(
+                query,
+                scope,
+                generation,
+                Vec::new(),
+            ))
+        );
+    }
+
+    #[test]
+    fn browse_routes_separate_group_indexes_from_scoped_books() {
+        let group = LibraryGroup {
+            scope: LibraryScope::Genre(Genre::Fantasy),
+            name: "Fantasy".to_owned(),
+            description: None,
+            icon: None,
+            books: 256,
+        };
+        let index = BrowseRoute::GroupIndex(LibraryGrouping::Genres);
+        let scoped = BrowseRoute::Scoped {
+            grouping: LibraryGrouping::Genres,
+            group,
+        };
+
+        assert!(!index.shows_books());
+        assert_eq!(index.scope(), LibraryScope::All);
+        assert!(scoped.shows_books());
+        assert_eq!(scoped.grouping(), Some(LibraryGrouping::Genres));
+        assert_eq!(scoped.scope(), LibraryScope::Genre(Genre::Fantasy));
+        assert_eq!(page_range_label(128, 128, 500), "129–256 of 500");
+        assert_eq!(page_range_label(0, 0, 0), "0 of 0");
     }
 
     #[test]
@@ -9056,6 +10564,7 @@ enum BenchmarkWorkload {
     EmptyLibraryAddBooks,
     LibrarySelection,
     BookDetail,
+    LibraryBrowse,
     Genres,
     VirtualLibrary,
     BulkTags,
@@ -9113,6 +10622,9 @@ struct BenchmarkRun {
     action_started: Option<Instant>,
     selection_painted: Option<Duration>,
     detail_painted: Option<Duration>,
+    browse_group_index_painted: Option<Duration>,
+    browse_scoped_books_painted: Option<Duration>,
+    browse_table_painted: Option<Duration>,
     genre_picker_painted: Option<Duration>,
     virtual_library_dialog_painted: Option<Duration>,
     virtual_library_menu_painted: Option<Duration>,
@@ -9213,6 +10725,76 @@ impl BenchmarkRun {
         fs::write(&self.output, json).unwrap_or_else(|error| {
             panic!(
                 "write GPUI selection benchmark sample {}: {error}",
+                self.output.display()
+            )
+        });
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "browse benchmark correctness keeps every rendered contract explicit"
+    )]
+    fn finish_library_browse(
+        self,
+        library_total: u64,
+        group_count: usize,
+        scoped_total: u64,
+        rendered_books: usize,
+        selected_destination: String,
+        breadcrumb: String,
+        scoped_selection_preserved: bool,
+    ) {
+        assert_eq!(
+            self.workload,
+            BenchmarkWorkload::LibraryBrowse,
+            "browse completion belongs to the library-browse UI benchmark"
+        );
+        assert!(self.initial_render.is_some());
+        assert_eq!(selected_destination, "Genres");
+        assert_eq!(breadcrumb, "Fantasy");
+        assert_eq!(group_count, Genre::ALL.len());
+        assert_eq!(scoped_total, BENCHMARK_BROWSE_SCOPED_BOOKS);
+        assert_eq!(
+            rendered_books,
+            usize::try_from(LIBRARY_PAGE_SIZE).expect("page size fits usize")
+        );
+        assert!(scoped_selection_preserved);
+        let sample = UiLibraryBrowseBenchmarkSample {
+            schema_version: 1,
+            workload: "library-browse",
+            group_index_to_paint_ms: millis(
+                self.browse_group_index_painted
+                    .expect("group index was presented"),
+            ),
+            scoped_books_to_paint_ms: millis(
+                self.browse_scoped_books_painted
+                    .expect("scoped books were presented"),
+            ),
+            table_to_paint_ms: millis(self.browse_table_painted.expect("book table was presented")),
+            peak_rss_bytes: peak_rss_bytes(),
+            correctness: UiLibraryBrowseBenchmarkCorrectness {
+                library_total,
+                group_count,
+                scoped_total,
+                rendered_books,
+                selected_destination,
+                breadcrumb,
+                table_columns: vec!["Title", "Contributor", "Series", "File status"],
+                markers: vec![
+                    "browse_sidebar_destination_selected",
+                    "bounded_group_tiles_presented",
+                    "scoped_breadcrumb_presented",
+                    "bounded_scoped_book_page",
+                    "book_table_columns_presented",
+                    "compact_scoped_selection_descriptor",
+                ],
+            },
+        };
+        let json = serde_json::to_vec_pretty(&sample)
+            .expect("serialize GPUI library-browse benchmark sample");
+        fs::write(&self.output, json).unwrap_or_else(|error| {
+            panic!(
+                "write GPUI library-browse benchmark sample {}: {error}",
                 self.output.display()
             )
         });
@@ -9580,6 +11162,29 @@ struct UiSelectionBenchmarkCorrectness {
     library_total: u64,
     rendered_books: usize,
     selected_books: u64,
+    markers: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct UiLibraryBrowseBenchmarkSample {
+    schema_version: u32,
+    workload: &'static str,
+    group_index_to_paint_ms: f64,
+    scoped_books_to_paint_ms: f64,
+    table_to_paint_ms: f64,
+    peak_rss_bytes: Option<u64>,
+    correctness: UiLibraryBrowseBenchmarkCorrectness,
+}
+
+#[derive(Serialize)]
+struct UiLibraryBrowseBenchmarkCorrectness {
+    library_total: u64,
+    group_count: usize,
+    scoped_total: u64,
+    rendered_books: usize,
+    selected_destination: String,
+    breadcrumb: String,
+    table_columns: Vec<&'static str>,
     markers: Vec<&'static str>,
 }
 

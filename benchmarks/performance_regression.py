@@ -89,6 +89,7 @@ def main(arguments: list[str]) -> int:
             "ui-bootstrap",
             "ui-selection",
             "ui-book-detail",
+            "ui-library-browse",
             "ui-genres",
             "ui-virtual-library",
         ):
@@ -102,6 +103,11 @@ def main(arguments: list[str]) -> int:
             elif mode == "ui-book-detail":
                 ui_result = run_ui_book_detail(query_output, output, workload, commands)
                 decisions = evaluate_ui_book_detail_result(ui_result, budget)
+            elif mode == "ui-library-browse":
+                ui_result = run_ui_library_browse(
+                    query_output, output, workload, commands
+                )
+                decisions = evaluate_ui_library_browse_result(ui_result, budget)
             elif mode == "ui-genres":
                 ui_result = run_ui_genres(query_output, output, workload, commands)
                 decisions = evaluate_ui_genres_result(ui_result, budget)
@@ -429,6 +435,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "ui-bootstrap",
         "ui-selection",
         "ui-book-detail",
+        "ui-library-browse",
         "ui-genres",
         "ui-virtual-library",
     ):
@@ -438,11 +445,19 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             "'organisation-migration', 'organisation-query', 'library-browse', "
             "'organisation-vocabulary', 'bulk-tags', 'bulk-remove', 'saved-searches', 'genres', 'maintenance', "
             "'virtual-libraries', "
-            "'ui-bootstrap', 'ui-selection', 'ui-book-detail', 'ui-genres', or 'ui-virtual-library'"
+            "'ui-bootstrap', 'ui-selection', 'ui-book-detail', 'ui-library-browse', "
+            "'ui-genres', or 'ui-virtual-library'"
         )
     if (
         query_mode
-        in ("ui-bootstrap", "ui-selection", "ui-book-detail", "ui-genres", "ui-virtual-library")
+        in (
+            "ui-bootstrap",
+            "ui-selection",
+            "ui-book-detail",
+            "ui-library-browse",
+            "ui-genres",
+            "ui-virtual-library",
+        )
     ) != (
         budget["kind"] == UI_CONFIGURATION_KIND
     ):
@@ -614,7 +629,13 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                     raise RegressionError(
                         f"bulk removal workload {field} must be greater than zero"
                     )
-        if query_mode in ("ui-selection", "ui-book-detail", "ui-genres", "ui-virtual-library"):
+        if query_mode in (
+            "ui-selection",
+            "ui-book-detail",
+            "ui-library-browse",
+            "ui-genres",
+            "ui-virtual-library",
+        ):
             if positive_or_zero_field(workload, "page_size", "budget.workload") == 0:
                 raise RegressionError(
                     "populated UI workload page_size must be greater than zero"
@@ -623,6 +644,18 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             workload, "fixture_version", "budget.workload"
         ) != 2:
             raise RegressionError("book-detail UI workload must use fixture version two")
+        if query_mode == "ui-library-browse":
+            if positive_or_zero_field(
+                workload, "fixture_version", "budget.workload"
+            ) != 1:
+                raise RegressionError(
+                    "library-browse UI workload must use fixture version one"
+                )
+            for field in ("group_page_size", "group_count", "scoped_books"):
+                if positive_or_zero_field(workload, field, "budget.workload") == 0:
+                    raise RegressionError(
+                        f"library-browse UI workload {field} must be greater than zero"
+                    )
         if query_mode == "ui-genres" and positive_or_zero_field(
             workload, "fixture_version", "budget.workload"
         ) != 1:
@@ -719,6 +752,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             "ui-bootstrap",
             "ui-selection",
             "ui-book-detail",
+            "ui-library-browse",
             "ui-genres",
             "ui-virtual-library",
         ):
@@ -2352,6 +2386,97 @@ def run_ui_book_detail(
     return result
 
 
+def run_ui_library_browse(
+    output: pathlib.Path,
+    artifact_directory: pathlib.Path,
+    workload: dict[str, Any],
+    commands: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Measure group navigation, scoped books, and book-table presentation."""
+
+    run_command(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "lectern-desktop",
+            "--bin",
+            "lectern-gpui",
+        ],
+        commands,
+        timeout_seconds=1_800,
+    )
+    target_directory = pathlib.Path(
+        os.environ.get("CARGO_TARGET_DIR", str(REPOSITORY / "target"))
+    )
+    if not target_directory.is_absolute():
+        target_directory = REPOSITORY / target_directory
+    executable = target_directory / "release/lectern-gpui"
+    if sys.platform == "win32":
+        executable = executable.with_suffix(".exe")
+    if not executable.is_file():
+        raise RegressionError(f"release GPUI executable is missing: {executable}")
+
+    warmup = workload["warmup_iterations"]
+    measured = workload["measured_iterations"]
+    samples_directory = artifact_directory / "ui-samples"
+    samples_directory.mkdir()
+    measured_samples: list[dict[str, Any]] = []
+    raw_paths: list[str] = []
+    for index in range(warmup + measured):
+        phase = "warmup" if index < warmup else "measured"
+        phase_index = index if phase == "warmup" else index - warmup
+        sample_path = samples_directory / f"{phase}-{phase_index:03d}.json"
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "LECTERN_GPUI_BENCHMARK_OUTPUT": str(sample_path),
+                "LECTERN_GPUI_BENCHMARK_WORKLOAD": "library-browse",
+            }
+        )
+        run_command(
+            [str(executable)],
+            commands,
+            environment=environment,
+            timeout_seconds=15,
+        )
+        sample = read_json(sample_path)
+        validate_ui_library_browse_sample(sample, sample_path, workload)
+        raw_paths.append(str(sample_path))
+        if phase == "measured":
+            measured_samples.append(sample)
+
+    peak_samples = [
+        sample["peak_rss_bytes"]
+        for sample in measured_samples
+        if sample.get("peak_rss_bytes") is not None
+    ]
+    peak_rss = max(peak_samples) if peak_samples else None
+    scenarios = []
+    for name, field in (
+        ("group_index_to_painted_state", "group_index_to_paint_ms"),
+        ("scoped_books_to_painted_state", "scoped_books_to_paint_ms"),
+        ("tiles_to_table_painted_state", "table_to_paint_ms"),
+    ):
+        samples_ns = [
+            round(float(sample[field]) * 1_000_000) for sample in measured_samples
+        ]
+        scenarios.append(ui_scenario(name, samples_ns, peak_rss))
+    result = {
+        "kind": "lectern-ui-library-browse-performance",
+        "library_books": workload["books"],
+        "warmup_iterations": warmup,
+        "measured_iterations": measured,
+        "raw_samples": raw_paths,
+        "correctness": measured_samples[0]["correctness"],
+        "scenarios": scenarios,
+    }
+    write_json(output, result)
+    return result
+
+
 def run_ui_virtual_library(
     output: pathlib.Path,
     artifact_directory: pathlib.Path,
@@ -2634,6 +2759,49 @@ def expected_ui_book_detail_correctness(workload: dict[str, Any]) -> dict[str, A
             "half_star_rating_presented",
             "identifiers_presented",
             "multiple_assets_presented",
+        ],
+    }
+
+
+def validate_ui_library_browse_sample(
+    sample: dict[str, Any], path: pathlib.Path, workload: dict[str, Any]
+) -> None:
+    context = f"UI library-browse sample {path.name}"
+    if sample.get("schema_version") != 1:
+        raise RegressionError(f"{context} schema_version must be 1")
+    if sample.get("workload") != "library-browse":
+        raise RegressionError(f"{context} workload identity is invalid")
+    for field in (
+        "group_index_to_paint_ms",
+        "scoped_books_to_paint_ms",
+        "table_to_paint_ms",
+    ):
+        positive_number_field(sample, field, context)
+    peak_rss = sample.get("peak_rss_bytes")
+    if peak_rss is not None and positive_or_zero_field(
+        sample, "peak_rss_bytes", context
+    ) == 0:
+        raise RegressionError(f"{context} peak_rss_bytes must be positive when present")
+    if sample.get("correctness") != expected_ui_library_browse_correctness(workload):
+        raise RegressionError(f"{context} correctness markers are invalid")
+
+
+def expected_ui_library_browse_correctness(workload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "library_total": workload["books"],
+        "group_count": workload["group_count"],
+        "scoped_total": workload["scoped_books"],
+        "rendered_books": workload["page_size"],
+        "selected_destination": "Genres",
+        "breadcrumb": "Fantasy",
+        "table_columns": ["Title", "Contributor", "Series", "File status"],
+        "markers": [
+            "browse_sidebar_destination_selected",
+            "bounded_group_tiles_presented",
+            "scoped_breadcrumb_presented",
+            "bounded_scoped_book_page",
+            "book_table_columns_presented",
+            "compact_scoped_selection_descriptor",
         ],
     }
 
@@ -2955,6 +3123,25 @@ def evaluate_ui_book_detail_result(
             }
         )
     return decisions
+
+
+def evaluate_ui_library_browse_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "UI library-browse result"
+    if result.get("kind") != "lectern-ui-library-browse-performance":
+        raise RegressionError(f"{context} kind is invalid")
+    if positive_or_zero_field(result, "library_books", context) != workload["books"]:
+        raise RegressionError(f"{context} library size does not match the budget")
+    if result.get("correctness") != expected_ui_library_browse_correctness(workload):
+        raise RegressionError(f"{context} correctness markers are invalid")
+
+    common_result = dict(result)
+    common_result["kind"] = "lectern-ui-bootstrap-performance"
+    common_result["library_books"] = 0
+    common_result["correctness"] = expected_ui_correctness()
+    return evaluate_ui_bootstrap_result(common_result, budget)
 
 
 def run_bulk_tag_desktop(
