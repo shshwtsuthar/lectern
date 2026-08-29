@@ -55,6 +55,10 @@
       "budget": "benchmarks/organisation-query-regression-v3.json"
     },
     {
+      "name": "library-browse-v1",
+      "budget": "benchmarks/library-browse-regression-v1.json"
+    },
+    {
       "name": "organisation-vocabulary-v2",
       "budget": "benchmarks/organisation-vocabulary-regression-v2.json"
     },

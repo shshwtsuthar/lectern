@@ -91,6 +91,14 @@ projections. It measures a bounded 100-row manager page, application through the
 book IDs, and create/update/rename/delete lifecycle while proving that book, vocabulary, asset, and
 FTS state remains intact.
 
+The metadata browser gate in
+[`library-browse-regression-v1.json`](library-browse-regression-v1.json) exercises the production
+group-index and scoped-book paths over the 50,000-book organisation fixture, all 28 genres, and
+2,500 virtual libraries. It retains 40 samples after 10 warmups for all four first group pages, all
+four first scoped book pages, and a deep genre page without recounting. Independent SQL reference
+projections verify exact group identities, counts, book order, uniqueness, page bounds, and the
+covering contributor, series, genre, and virtual-library indexes.
+
 The GPUI bootstrap workload in
 [`ui-bootstrap-regression-v1.json`](ui-bootstrap-regression-v1.json) launches the optimized
 `lectern-gpui` binary in 5 warmup and 40 measured fresh processes. It retains each process's raw
@@ -148,6 +156,8 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-migration-regression-v3.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-query-regression-v3.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/library-browse-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-vocabulary-regression-v2.json
 python3 benchmarks/performance_regression.py \

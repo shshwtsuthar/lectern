@@ -36,6 +36,7 @@ class CiPerformanceTests(unittest.TestCase):
                 "reimport-known-path-v1",
                 "organisation-migration-v3",
                 "organisation-query-v3",
+                "library-browse-v1",
                 "organisation-vocabulary-v2",
                 "bulk-tags-v2",
                 "bulk-remove-v2",

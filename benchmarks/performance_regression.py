@@ -143,6 +143,7 @@ def main(arguments: list[str]) -> int:
             "reimport": "reimports.json",
             "organisation-migration": "migrations.json",
             "organisation-query": "organisation-queries.json",
+            "library-browse": "library-browse.json",
             "organisation-vocabulary": "organisation-vocabulary.json",
             "bulk-tags": "organisation-bulk-tags.json",
             "bulk-remove": "organisation-bulk-remove.json",
@@ -158,6 +159,7 @@ def main(arguments: list[str]) -> int:
             validate_migration_seed_result(seed, workload)
         elif mode in (
             "organisation-query",
+            "library-browse",
             "organisation-vocabulary",
             "bulk-tags",
             "bulk-remove",
@@ -188,6 +190,8 @@ def main(arguments: list[str]) -> int:
             decisions = evaluate_migration_result(query_result, budget)
         elif mode == "organisation-query":
             decisions = evaluate_organisation_query_result(query_result, budget)
+        elif mode == "library-browse":
+            decisions = evaluate_library_browse_result(query_result, budget)
         elif mode == "organisation-vocabulary":
             decisions = evaluate_organisation_vocabulary_result(query_result, budget)
         elif mode == "bulk-tags":
@@ -253,6 +257,7 @@ def seed_command(
         command += ["--bin", "organisation-benchmark", "--", "seed-migration"]
     elif mode in (
         "organisation-query",
+        "library-browse",
         "organisation-vocabulary",
         "bulk-tags",
         "bulk-remove",
@@ -277,6 +282,7 @@ def seed_command(
     ]
     if "fixture_version" in workload and mode in (
         "organisation-query",
+        "library-browse",
         "organisation-vocabulary",
         "bulk-tags",
         "bulk-remove",
@@ -297,6 +303,8 @@ def workload_command(
         command += ["--bin", "organisation-benchmark", "--", "migration"]
     elif mode == "organisation-query":
         command += ["--bin", "organisation-query-benchmark", "--", "query"]
+    elif mode == "library-browse":
+        command += ["--bin", "library-browse-benchmark", "--"]
     elif mode == "organisation-vocabulary":
         command += ["--bin", "organisation-vocabulary-benchmark", "--"]
     elif mode in ("bulk-tags", "bulk-remove"):
@@ -354,7 +362,7 @@ def workload_command(
         str(workload["measured_iterations"]),
         "--warmup",
         str(workload["warmup_iterations"]),
-    ] if mode in ("organisation-migration", "organisation-query") else command + [
+    ] if mode in ("organisation-migration", "organisation-query", "library-browse") else command + [
         "--database",
         str(database),
         "--output",
@@ -410,6 +418,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "reimport",
         "organisation-migration",
         "organisation-query",
+        "library-browse",
         "organisation-vocabulary",
         "bulk-tags",
         "bulk-remove",
@@ -426,7 +435,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         raise RegressionError(
             "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
             "'remove', 'detach', 'attach', 'replace', 'export', 'reimport', "
-            "'organisation-migration', 'organisation-query', "
+            "'organisation-migration', 'organisation-query', 'library-browse', "
             "'organisation-vocabulary', 'bulk-tags', 'bulk-remove', 'saved-searches', 'genres', 'maintenance', "
             "'virtual-libraries', "
             "'ui-bootstrap', 'ui-selection', 'ui-book-detail', 'ui-genres', or 'ui-virtual-library'"
@@ -504,6 +513,36 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             raise RegressionError(
                 "identifier-aware organisation query workload must use fixture version three"
             )
+        if query_mode == "library-browse":
+            if positive_or_zero_field(
+                workload, "fixture_version", "budget.workload"
+            ) != 3:
+                raise RegressionError(
+                    "library-browse workload must use organisation fixture version three"
+                )
+            if positive_or_zero_field(
+                workload, "browse_fixture_version", "budget.workload"
+            ) != 1:
+                raise RegressionError(
+                    "library-browse workload must use browse fixture version one"
+                )
+            for field in (
+                "page_size",
+                "group_page_size",
+                "contributors",
+                "series",
+                "tags",
+                "tags_per_book",
+                "identifiers_per_book",
+                "saved_searches",
+                "catalog_genres",
+                "virtual_libraries",
+                "virtual_memberships_per_book",
+            ):
+                if positive_or_zero_field(workload, field, "budget.workload") == 0:
+                    raise RegressionError(
+                        f"library-browse workload {field} must be greater than zero"
+                    )
         if query_mode in (
             "organisation-vocabulary",
             "bulk-tags",
@@ -730,6 +769,12 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 f"budget {name!r}",
             )
         if query_mode == "bulk-remove" and name == "bulk_remove_and_refresh":
+            positive_or_zero_field(
+                scenario_budget,
+                "max_peak_rss_delta_bytes",
+                f"budget {name!r}",
+            )
+        if query_mode == "library-browse":
             positive_or_zero_field(
                 scenario_budget,
                 "max_peak_rss_delta_bytes",
@@ -1631,6 +1676,120 @@ def evaluate_organisation_query_result(
     if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
         raise RegressionError("organisation query scenarios do not match the versioned budget")
     return evaluate_latency_budgets(by_name, budget)
+
+
+def evaluate_library_browse_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "library-browse result"
+    if result.get("kind") != "library-browse-performance":
+        raise RegressionError("library-browse result kind is invalid")
+    expected_fields = {
+        "library_books": workload["books"],
+        "contributors": workload["contributors"],
+        "series": workload["series"],
+        "catalog_genres": workload["catalog_genres"],
+        "virtual_libraries": workload["virtual_libraries"],
+        "virtual_memberships_per_book": workload["virtual_memberships_per_book"],
+        "group_page_size": workload["group_page_size"],
+        "book_page_size": workload["page_size"],
+        "warmup_iterations": workload["warmup_iterations"],
+        "measured_iterations": workload["measured_iterations"],
+    }
+    for field, expected in expected_fields.items():
+        if positive_or_zero_field(result, field, context) != expected:
+            raise RegressionError(
+                f"library-browse {field} does not match the versioned workload"
+            )
+
+    checks = result.get("verified_checks")
+    if not isinstance(checks, list) or set(checks) != set(workload["correctness"]):
+        raise RegressionError("library-browse correctness checks did not reconcile")
+    plans = result.get("query_plans")
+    required_indexes = {
+        "book_contributors_contributor_role_book_idx",
+        "series_memberships_series_index_book_idx",
+        "book_genres_genre_book_idx",
+        "book_virtual_libraries_library_book_idx",
+    }
+    if not isinstance(plans, list) or {
+        plan.get("required_index") for plan in plans if isinstance(plan, dict)
+    } != required_indexes:
+        raise RegressionError("library-browse plans did not cover every scoped index")
+    if any(
+        not isinstance(plan, dict)
+        or not isinstance(plan.get("details"), list)
+        or not plan["details"]
+        for plan in plans
+    ):
+        raise RegressionError("library-browse query-plan evidence is empty")
+
+    measured = workload["measured_iterations"]
+    successful = workload["warmup_iterations"] + measured
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError("library-browse result must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, scenario in enumerate(scenarios):
+        scenario_context = f"library-browse scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{scenario_context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{scenario_context}.name must be unique and non-empty")
+        if (
+            positive_or_zero_field(
+                scenario, "successful_operations", scenario_context
+            )
+            != successful
+        ):
+            raise RegressionError(
+                f"{scenario_context} operation count does not reconcile"
+            )
+        observed_results = positive_or_zero_field(
+            scenario, "observed_results", scenario_context
+        )
+        maximum_results = (
+            workload["group_page_size"]
+            if "groups_first_page" in name
+            else workload["page_size"]
+        )
+        if observed_results > maximum_results:
+            raise RegressionError(f"{scenario_context} exceeded its bounded page size")
+        samples = positive_samples(scenario, scenario_context, measured)
+        p95_ms = positive_number_field(
+            object_field(scenario, "latency_ms", scenario_context),
+            "p95",
+            f"{scenario_context}.latency_ms",
+        )
+        if not math.isclose(
+            p95_ms,
+            nearest_rank_p95(samples) / 1_000_000,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise RegressionError(f"{scenario_context} p95 does not match retained samples")
+        by_name[name] = scenario
+
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("library-browse scenarios do not match the versioned workload")
+
+    peak_rss = positive_or_zero_field(result, "peak_rss_delta_bytes", context)
+    decisions = evaluate_latency_budgets(by_name, budget)
+    for decision in decisions:
+        maximum_rss = budget["budgets"][decision["name"]][
+            "max_peak_rss_delta_bytes"
+        ]
+        decision |= {
+            "peak_rss_delta_bytes": peak_rss,
+            "max_peak_rss_delta_bytes": maximum_rss,
+        }
+        decision["passed"] = bool(
+            decision["passed"] and peak_rss <= maximum_rss
+        )
+    return decisions
 
 
 def evaluate_organisation_vocabulary_result(

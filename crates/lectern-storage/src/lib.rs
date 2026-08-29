@@ -27,12 +27,14 @@ use lectern_core::organisation::{
 use lectern_core::{
     AssetHealth, AssetHealthReport, AssetId, AssetStorage, BackupReport, Book, BookAsset,
     BookAssetDraft, BookDraft, BookFormat, BookId, BookImport, BookMetadataDraft, BookRating,
-    BookSummary, ImportRecord, LibraryDiagnostics, LibraryPage, LibraryQuery, LibraryStats,
-    PublicationDate, ReferencedFileDiagnostics, ReimportMetadataPolicy, SortOrder,
+    BookSummary, ImportRecord, LibraryDiagnostics, LibraryGroupPage, LibraryGrouping, LibraryPage,
+    LibraryQuery, LibraryScope, LibraryStats, PublicationDate, ReferencedFileDiagnostics,
+    ReimportMetadataPolicy, SortOrder,
 };
 use rayon::prelude::*;
 use rusqlite::{
     Connection, OptionalExtension, Statement, Transaction, TransactionBehavior, params,
+    types::Value,
 };
 use thiserror::Error;
 
@@ -687,9 +689,55 @@ impl LibraryDatabase {
         offset: u64,
         limit: u32,
     ) -> Result<LibraryPage> {
+        self.query_page_in_scope(query, LibraryScope::All, offset, limit)
+    }
+
+    /// Returns one bounded, counted page of stable metadata groups.
+    ///
+    /// Group counts and entries are read in the same deferred transaction. Result pages are
+    /// capped at one hundred entries so a large contributor vocabulary remains bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the offset exceeds `SQLite`'s range or a count or indexed group query
+    /// cannot be completed.
+    pub fn browse_groups(
+        &mut self,
+        grouping: LibraryGrouping,
+        offset: u64,
+        limit: u32,
+    ) -> Result<LibraryGroupPage> {
         let page_offset = offset;
         let offset = i64::try_from(offset).map_err(|_| StorageError::InvalidPageOffset(offset))?;
-        let plan = LibraryQueryPlan::new(query)?;
+        let limit = limit.min(100);
+        let transaction = self.connection.transaction()?;
+        let (total, groups) = organisation::browse_groups(&transaction, grouping, offset, limit)?;
+        transaction.commit()?;
+        Ok(LibraryGroupPage {
+            total,
+            offset: page_offset,
+            groups,
+        })
+    }
+
+    /// Returns one bounded, ordered book page inside a stable collection scope.
+    ///
+    /// Scope membership combines conjunctively with the ordinary query and remains an indexed
+    /// semi-join, preserving one compact summary row per logical book.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the scope/query cannot be planned or the page cannot be read.
+    pub fn query_page_in_scope(
+        &mut self,
+        query: &LibraryQuery,
+        scope: LibraryScope,
+        offset: u64,
+        limit: u32,
+    ) -> Result<LibraryPage> {
+        let page_offset = offset;
+        let offset = i64::try_from(offset).map_err(|_| StorageError::InvalidPageOffset(offset))?;
+        let plan = LibraryQueryPlan::new_in_scope(query, scope)?;
         let transaction = self.connection.transaction()?;
 
         if offset == 0 && limit > 0 && plan.has_full_text_search {
@@ -741,8 +789,23 @@ impl LibraryDatabase {
         offset: u64,
         limit: u32,
     ) -> Result<Vec<BookSummary>> {
+        self.query_window_in_scope(query, LibraryScope::All, offset, limit)
+    }
+
+    /// Returns a bounded ordered window inside a collection scope without recounting matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the scope/query is invalid or the offset exceeds `SQLite`'s range.
+    pub fn query_window_in_scope(
+        &self,
+        query: &LibraryQuery,
+        scope: LibraryScope,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<BookSummary>> {
         let offset = i64::try_from(offset).map_err(|_| StorageError::InvalidPageOffset(offset))?;
-        let plan = LibraryQueryPlan::new(query)?;
+        let plan = LibraryQueryPlan::new_in_scope(query, scope)?;
         query_window_with_plan(&self.connection, &plan, offset, limit)
     }
 
@@ -752,7 +815,20 @@ impl LibraryDatabase {
     ///
     /// Returns an error when the structured query or count cannot be evaluated.
     pub fn selection_snapshot(&mut self, query: &LibraryQuery) -> Result<SelectionSnapshot> {
-        let plan = LibraryQueryPlan::new(query)?;
+        self.selection_snapshot_in_scope(query, LibraryScope::All)
+    }
+
+    /// Returns the scoped matching count and invalidation generation without loading summaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the scope/query or count cannot be evaluated.
+    pub fn selection_snapshot_in_scope(
+        &mut self,
+        query: &LibraryQuery,
+        scope: LibraryScope,
+    ) -> Result<SelectionSnapshot> {
+        let plan = LibraryQueryPlan::new_in_scope(query, scope)?;
         let transaction = self.connection.transaction()?;
         let generation = current_generation(&transaction, self.logical_generation.get())?;
         let sql = format!(
@@ -780,11 +856,26 @@ impl LibraryDatabase {
         offset: u64,
         limit: u32,
     ) -> Result<Vec<BookId>> {
+        self.query_ids_window_in_scope(query, LibraryScope::All, offset, limit)
+    }
+
+    /// Returns only stable IDs for one ordered range inside a collection scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the scope/query is invalid or the offset exceeds `SQLite`'s range.
+    pub fn query_ids_window_in_scope(
+        &self,
+        query: &LibraryQuery,
+        scope: LibraryScope,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<BookId>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let offset = i64::try_from(offset).map_err(|_| StorageError::InvalidPageOffset(offset))?;
-        let plan = LibraryQueryPlan::new(query)?;
+        let plan = LibraryQueryPlan::new_in_scope(query, scope)?;
         let sql = format!(
             "SELECT b.id FROM books b {} {} ORDER BY {} LIMIT ?{} OFFSET ?{}",
             plan.joins,
@@ -3079,7 +3170,10 @@ fn prepare_selection(
             }
         }
         BookSelection::AllMatching {
-            query, excluded, ..
+            query,
+            scope,
+            excluded,
+            ..
         } => {
             let mut insert_exclusion = transaction.prepare_cached(
                 "INSERT OR IGNORE INTO temp.lectern_selection_exclusions(book_id) VALUES (?1)",
@@ -3090,7 +3184,7 @@ fn prepare_selection(
             }
             drop(insert_exclusion);
 
-            let plan = LibraryQueryPlan::new(query)?;
+            let plan = LibraryQueryPlan::new_in_scope(query, *scope)?;
             let exclusion = "NOT EXISTS ( \
                 SELECT 1 FROM temp.lectern_selection_exclusions excluded \
                 WHERE excluded.book_id = b.id \
@@ -3241,7 +3335,7 @@ fn rebuild_selected_tag_projections(transaction: &Transaction<'_>) -> Result<()>
 }
 
 struct LibraryQueryPlan {
-    bindings: Vec<rusqlite::types::Value>,
+    bindings: Vec<Value>,
     joins: String,
     where_clause: String,
     order: &'static str,
@@ -3250,6 +3344,10 @@ struct LibraryQueryPlan {
 
 impl LibraryQueryPlan {
     fn new(query: &LibraryQuery) -> Result<Self> {
+        Self::new_in_scope(query, LibraryScope::All)
+    }
+
+    fn new_in_scope(query: &LibraryQuery, scope: LibraryScope) -> Result<Self> {
         let expression = SearchExpression::parse(&query.search)?;
         let mut bindings = Vec::new();
         let mut predicates = Vec::new();
@@ -3306,6 +3404,8 @@ impl LibraryQueryPlan {
             ));
         }
 
+        push_scope_predicate(scope, &mut bindings, &mut predicates);
+
         if let Some(format) = query.format {
             push_asset_exists(&mut bindings, &mut predicates, "format", format.as_str());
         }
@@ -3338,9 +3438,37 @@ impl LibraryQueryPlan {
     }
 }
 
+fn push_scope_predicate(
+    scope: LibraryScope,
+    bindings: &mut Vec<Value>,
+    predicates: &mut Vec<String>,
+) {
+    let (binding, relation) = match scope {
+        LibraryScope::All => return,
+        LibraryScope::Contributor(contributor) => (
+            contributor.value().into(),
+            "SELECT bc.book_id FROM book_contributors bc WHERE bc.contributor_id",
+        ),
+        LibraryScope::Series(series) => (
+            series.value().into(),
+            "SELECT sm.book_id FROM series_memberships sm WHERE sm.series_id",
+        ),
+        LibraryScope::Genre(genre) => (
+            genre.as_str().to_owned().into(),
+            "SELECT bg.book_id FROM book_genres bg WHERE bg.genre",
+        ),
+        LibraryScope::VirtualLibrary(library) => (
+            library.value().into(),
+            "SELECT bv.book_id FROM book_virtual_libraries bv WHERE bv.virtual_library_id",
+        ),
+    };
+    bindings.push(binding);
+    predicates.push(format!("b.id IN ({relation} = ?{})", bindings.len()));
+}
+
 fn add_structured_search(
     expression: &SearchExpression,
-    bindings: &mut Vec<rusqlite::types::Value>,
+    bindings: &mut Vec<Value>,
     predicates: &mut Vec<String>,
     full_text_clauses: &mut Vec<String>,
 ) {
@@ -3392,7 +3520,7 @@ fn fts_match(column: Option<&str>, value: &TextMatch) -> String {
 }
 
 fn push_asset_exists(
-    bindings: &mut Vec<rusqlite::types::Value>,
+    bindings: &mut Vec<Value>,
     predicates: &mut Vec<String>,
     column: &'static str,
     value: &str,
@@ -3488,7 +3616,8 @@ mod tests {
 
     use lectern_core::{
         AssetHealth, AssetHealthReport, AssetId, AssetStorage, Book, BookAssetDraft, BookFormat,
-        BookId, BookMetadataDraft, BookRating, LibraryQuery, ReimportMetadataPolicy, SortOrder,
+        BookId, BookMetadataDraft, BookRating, LibraryGrouping, LibraryQuery, LibraryScope,
+        ReimportMetadataPolicy, SortOrder,
         organisation::{
             BookEdit, BookIdentifierEdit, BookSelection, BulkTagEdit, ContributorCreditEdit,
             ContributorFacet, ContributorReference, ContributorRole, ExactFacets, Genre,
@@ -5855,6 +5984,208 @@ END;
                 .unwrap(),
             before
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn group_indexes_and_scoped_pages_reconcile_exact_book_membership() {
+        let mut database = LibraryDatabase::open_in_memory().expect("open library");
+        let books = database
+            .import_books(&[
+                record(
+                    "/books/earthsea.epub",
+                    "A Wizard of Earthsea",
+                    "Legacy Author",
+                ),
+                record("/books/tehanu.epub", "Tehanu", "Legacy Author"),
+                record("/books/dune.epub", "Dune", "Legacy Author"),
+            ])
+            .expect("seed books");
+
+        database
+            .save_book_edit(&earthsea_edit(books[0]))
+            .expect("curate first Earthsea book");
+        let curated = database
+            .get_book(books[0])
+            .expect("load curated book")
+            .expect("curated book exists");
+        let contributor = curated.contributors[0].contributor.id;
+        let series = curated
+            .series_membership
+            .as_ref()
+            .expect("series membership")
+            .series
+            .id;
+
+        let mut second_edit = earthsea_edit(books[1]);
+        second_edit.title = "Tehanu".into();
+        second_edit.contributors = vec![ContributorCreditEdit {
+            contributor: ContributorReference::Existing(contributor),
+            role: ContributorRole::Editor,
+            position: 0,
+        }];
+        second_edit.series = Some(SeriesMembershipEdit {
+            series: SeriesReference::Existing(series),
+            index: Some("4".parse().expect("valid series index")),
+        });
+        second_edit.genres = vec![Genre::Fantasy];
+        database
+            .save_book_edit(&second_edit)
+            .expect("curate second Earthsea book");
+
+        let virtual_library = database
+            .create_virtual_library(
+                "Favorites",
+                Some("Books to revisit"),
+                VirtualLibraryIcon::Heart,
+                Some(books[0]),
+            )
+            .expect("create virtual library");
+        database
+            .set_book_virtual_library_membership(books[1], virtual_library.id, true)
+            .expect("add second virtual-library member");
+
+        let cases = [
+            (
+                LibraryGrouping::VirtualLibraries,
+                LibraryScope::VirtualLibrary(virtual_library.id),
+                "Favorites",
+                2,
+            ),
+            (
+                LibraryGrouping::Genres,
+                LibraryScope::Genre(Genre::Fantasy),
+                "Fantasy",
+                2,
+            ),
+            (
+                LibraryGrouping::Contributors,
+                LibraryScope::Contributor(contributor),
+                "Ursula K. Le Guin",
+                2,
+            ),
+            (
+                LibraryGrouping::Series,
+                LibraryScope::Series(series),
+                "Earthsea Cycle",
+                2,
+            ),
+        ];
+
+        for (grouping, scope, name, expected_books) in cases {
+            let groups = database
+                .browse_groups(grouping, 0, 100)
+                .expect("load group index");
+            let group = groups
+                .groups
+                .iter()
+                .find(|group| group.scope == scope)
+                .expect("group is indexed");
+            assert_eq!(group.name, name);
+            assert_eq!(group.books, expected_books);
+
+            let page = database
+                .query_page_in_scope(&LibraryQuery::default(), scope, 0, 128)
+                .expect("load scoped page");
+            assert_eq!(page.total, expected_books);
+            assert_eq!(page.books.len(), usize::try_from(expected_books).unwrap());
+            assert_eq!(
+                page.books.iter().map(|book| book.id).collect::<Vec<_>>(),
+                vec![books[0], books[1]]
+            );
+            assert_eq!(
+                database
+                    .query_ids_window_in_scope(&LibraryQuery::default(), scope, 1, 128)
+                    .expect("load scoped ID window"),
+                vec![books[1]]
+            );
+        }
+
+        let genres = database
+            .browse_groups(LibraryGrouping::Genres, 0, 100)
+            .expect("load fixed genre catalog");
+        assert_eq!(genres.total, 28);
+        assert_eq!(genres.groups.len(), 28);
+        assert!(genres.groups.iter().any(|group| {
+            group.scope == LibraryScope::Genre(Genre::ArtAndPhotography) && group.books == 0
+        }));
+
+        let snapshot = database
+            .selection_snapshot_in_scope(
+                &LibraryQuery::default(),
+                LibraryScope::VirtualLibrary(virtual_library.id),
+            )
+            .expect("capture scoped selection");
+        let selection = BookSelection::all_matching_in_scope(
+            LibraryQuery::default(),
+            LibraryScope::VirtualLibrary(virtual_library.id),
+            snapshot.generation,
+            vec![books[1]],
+        );
+        database
+            .apply_bulk_tags(
+                &selection,
+                &BulkTagEdit {
+                    add: vec![TagReference::New("Scoped".into())],
+                    remove: Vec::new(),
+                },
+            )
+            .expect("tag scoped selection");
+        assert!(
+            database
+                .get_book(books[0])
+                .unwrap()
+                .unwrap()
+                .tags
+                .iter()
+                .any(|tag| tag.name == "Scoped")
+        );
+        for book in [books[1], books[2]] {
+            assert!(
+                database
+                    .get_book(book)
+                    .unwrap()
+                    .unwrap()
+                    .tags
+                    .iter()
+                    .all(|tag| tag.name != "Scoped")
+            );
+        }
+    }
+
+    #[test]
+    fn collection_scopes_use_covering_relationship_indexes() {
+        let database = LibraryDatabase::open_in_memory().expect("open library");
+        for (sql, expected_index) in [
+            (
+                "SELECT book_id FROM book_contributors WHERE contributor_id = 1",
+                "book_contributors_contributor_role_book_idx",
+            ),
+            (
+                "SELECT book_id FROM series_memberships WHERE series_id = 1",
+                "series_memberships_series_index_book_idx",
+            ),
+            (
+                "SELECT book_id FROM book_genres WHERE genre = 'fantasy'",
+                "book_genres_genre_book_idx",
+            ),
+            (
+                "SELECT book_id FROM book_virtual_libraries WHERE virtual_library_id = 1",
+                "book_virtual_libraries_library_book_idx",
+            ),
+        ] {
+            let details = database
+                .connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare scoped query plan")
+                .query_map([], |row| row.get::<_, String>(3))
+                .expect("explain scoped query")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect scoped query plan")
+                .join("\n");
+            assert!(details.contains(expected_index), "{details}");
+            assert!(details.contains("COVERING"), "{details}");
+        }
     }
 
     #[test]

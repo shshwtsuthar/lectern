@@ -64,6 +64,8 @@ python3 benchmarks/performance_regression.py \
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-query-regression-v3.json
 python3 benchmarks/performance_regression.py \
+  --budget benchmarks/library-browse-regression-v1.json
+python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-vocabulary-regression-v2.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/bulk-tags-regression-v2.json
@@ -145,6 +147,20 @@ the fixed-genre schema. The query-only v3 fixture additionally assigns three ide
 covers bounded identifier-type lookup plus a complete identifier metadata save/reload through
 production paths. Keeping detail-only publication metadata outside the hot `books` rows preserves
 the compact indexed projection used by grid and search scans.
+
+Metadata-group and scoped-book browsing changes require the library-browse suite:
+
+```sh
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/library-browse-regression-v1.json
+```
+
+It extends the version-three 50,000-book organisation fixture with all 28 fixed genres and 2,500
+virtual libraries. Ten warmups and 40 retained samples cover the first bounded page for every group
+index, the first 128 books within representative virtual-library, genre, contributor, and series
+scopes, and a deep scoped window without a recount. Correctness reconciles stable identities,
+counts, order, uniqueness, page bounds, and the four covering relationship indexes; each scenario
+has a 50 ms p95 budget and a 64 MiB peak-RSS-delta budget.
 
 GPUI virtual-library creation and single-book membership controls require the native
 virtual-library suite:

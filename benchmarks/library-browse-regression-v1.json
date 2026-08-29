@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "kind": "lectern-organisation-regression-budget",
+  "workload": {
+    "query_mode": "library-browse",
+    "fixture_version": 3,
+    "browse_fixture_version": 1,
+    "books": 50000,
+    "seed": 20260825,
+    "cover_every": 3,
+    "page_size": 128,
+    "group_page_size": 100,
+    "contributors": 20000,
+    "series": 2500,
+    "tags": 500,
+    "tags_per_book": 8,
+    "identifiers_per_book": 3,
+    "contributors_per_book": {
+      "minimum": 1,
+      "maximum": 4
+    },
+    "series_membership_percent": 70,
+    "saved_searches": 250,
+    "catalog_genres": 28,
+    "virtual_libraries": 2500,
+    "virtual_memberships_per_book": 8,
+    "warmup_iterations": 10,
+    "measured_iterations": 40,
+    "scenarios": [
+      "virtual_library_groups_first_page",
+      "genre_groups_first_page",
+      "contributor_groups_first_page",
+      "series_groups_first_page",
+      "virtual_library_books_first_page",
+      "genre_books_first_page",
+      "contributor_books_first_page",
+      "series_books_first_page",
+      "deep_genre_book_window_without_count"
+    ],
+    "correctness": [
+      "exact_group_identities",
+      "exact_group_counts",
+      "matching_book_counts",
+      "stable_book_order",
+      "unique_book_rows",
+      "bounded_pages",
+      "covering_query_plans"
+    ]
+  },
+  "comparison": {
+    "paired_runs": 3,
+    "max_p95_regression_percent": 10,
+    "minimum_p95_delta_ms": 0.25
+  },
+  "budgets": {
+    "virtual_library_groups_first_page": {
+      "max_p95_ms": 50,
+      "max_peak_rss_delta_bytes": 67108864
+    },
+    "genre_groups_first_page": {
+      "max_p95_ms": 50,
+      "max_peak_rss_delta_bytes": 67108864
+    },
+    "contributor_groups_first_page": {
+      "max_p95_ms": 50,
+      "max_peak_rss_delta_bytes": 67108864
+    },
+    "series_groups_first_page": {
+      "max_p95_ms": 50,
+      "max_peak_rss_delta_bytes": 67108864
+    },
+    "virtual_library_books_first_page": {
+      "max_p95_ms": 50,
+      "max_peak_rss_delta_bytes": 67108864
+    },
+    "genre_books_first_page": {
+      "max_p95_ms": 50,
+      "max_peak_rss_delta_bytes": 67108864
+    },
+    "contributor_books_first_page": {
+      "max_p95_ms": 50,
+      "max_peak_rss_delta_bytes": 67108864
+    },
+    "series_books_first_page": {
+      "max_p95_ms": 50,
+      "max_peak_rss_delta_bytes": 67108864
+    },
+    "deep_genre_book_window_without_count": {
+      "max_p95_ms": 50,
+      "max_peak_rss_delta_bytes": 67108864
+    }
+  }
+}

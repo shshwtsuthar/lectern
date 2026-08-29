@@ -459,6 +459,85 @@ impl fmt::Display for SortOrder {
     }
 }
 
+/// One metadata dimension exposed by the library browser.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum LibraryGrouping {
+    /// User-created collections with explicit book membership.
+    VirtualLibraries,
+    /// Lectern's fixed book-classification catalog.
+    Genres,
+    /// Stable normalized contributor identities across every supported role.
+    Contributors,
+    /// Stable normalized series identities.
+    Series,
+}
+
+impl LibraryGrouping {
+    /// Every grouping exposed by the library browser, in navigation order.
+    pub const ALL: [Self; 4] = [
+        Self::VirtualLibraries,
+        Self::Genres,
+        Self::Contributors,
+        Self::Series,
+    ];
+}
+
+impl fmt::Display for LibraryGrouping {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::VirtualLibraries => "Virtual Libraries",
+            Self::Genres => "Genres",
+            Self::Contributors => "Contributors",
+            Self::Series => "Series",
+        })
+    }
+}
+
+/// Stable collection location combined with, but stored separately from, a [`LibraryQuery`].
+///
+/// A scope describes where the user is browsing. It is carried by query-backed selections but is
+/// not silently persisted as part of a saved search's query/filter/sort state.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum LibraryScope {
+    /// The complete canonical library.
+    #[default]
+    All,
+    /// Books credited to one contributor in any role.
+    Contributor(organisation::ContributorId),
+    /// Books belonging to one series.
+    Series(organisation::SeriesId),
+    /// Books assigned one fixed genre.
+    Genre(organisation::Genre),
+    /// Books explicitly assigned to one virtual library.
+    VirtualLibrary(organisation::VirtualLibraryId),
+}
+
+/// One stable metadata group shown in a library-group index.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LibraryGroup {
+    /// Stable scope applied when the group is opened.
+    pub scope: LibraryScope,
+    /// Display-ready group name.
+    pub name: String,
+    /// Optional bounded supporting description, currently used by virtual libraries.
+    pub description: Option<String>,
+    /// Optional built-in glyph identity, currently used by virtual libraries.
+    pub icon: Option<organisation::VirtualLibraryIcon>,
+    /// Exact number of canonical books assigned to the group.
+    pub books: u64,
+}
+
+/// One bounded, ordered page of metadata groups.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LibraryGroupPage {
+    /// Number of groups in this metadata dimension.
+    pub total: u64,
+    /// Zero-based group position of the first returned entry.
+    pub offset: u64,
+    /// Bounded group entries in canonical display order.
+    pub groups: Vec<LibraryGroup>,
+}
+
 /// Search, filter, and sort parameters for a library projection.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LibraryQuery {
@@ -797,10 +876,36 @@ pub trait LibraryService {
         limit: u32,
     ) -> Result<LibraryPage, Self::Error>;
 
+    /// Returns one bounded, counted page of stable metadata groups.
+    fn browse_library_groups(
+        &mut self,
+        grouping: LibraryGrouping,
+        offset: u64,
+        limit: u32,
+    ) -> Result<LibraryGroupPage, Self::Error>;
+
+    /// Returns a bounded book page and count inside one stable collection scope.
+    fn query_library_page_in_scope(
+        &mut self,
+        query: &LibraryQuery,
+        scope: LibraryScope,
+        offset: u64,
+        limit: u32,
+    ) -> Result<LibraryPage, Self::Error>;
+
     /// Returns a bounded result window without recounting the projection.
     fn query_library_window(
         &mut self,
         query: &LibraryQuery,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<BookSummary>, Self::Error>;
+
+    /// Returns a bounded result window inside a scope without recounting the projection.
+    fn query_library_window_in_scope(
+        &mut self,
+        query: &LibraryQuery,
+        scope: LibraryScope,
         offset: u64,
         limit: u32,
     ) -> Result<Vec<BookSummary>, Self::Error>;
@@ -811,10 +916,26 @@ pub trait LibraryService {
         query: &LibraryQuery,
     ) -> Result<organisation::SelectionSnapshot, Self::Error>;
 
+    /// Captures a scoped matching count and invalidation token for query-backed selection.
+    fn selection_snapshot_in_scope(
+        &mut self,
+        query: &LibraryQuery,
+        scope: LibraryScope,
+    ) -> Result<organisation::SelectionSnapshot, Self::Error>;
+
     /// Returns only stable book identities for one ordered projection range.
     fn query_library_ids_window(
         &mut self,
         query: &LibraryQuery,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<BookId>, Self::Error>;
+
+    /// Returns stable book identities for one ordered range inside a collection scope.
+    fn query_library_ids_window_in_scope(
+        &mut self,
+        query: &LibraryQuery,
+        scope: LibraryScope,
         offset: u64,
         limit: u32,
     ) -> Result<Vec<BookId>, Self::Error>;
