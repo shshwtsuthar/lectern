@@ -936,6 +936,8 @@ pub enum BookSelection {
     AllMatching {
         /// Complete query/filter/sort state captured when selection was established.
         query: crate::LibraryQuery,
+        /// Stable collection location containing the matching projection.
+        scope: crate::LibraryScope,
         /// Library state captured alongside the matching count.
         generation: LibraryGeneration,
         /// Stable book identities explicitly removed from the selection.
@@ -963,6 +965,25 @@ impl BookSelection {
         excluded.dedup();
         Self::AllMatching {
             query,
+            scope: crate::LibraryScope::All,
+            generation,
+            excluded,
+        }
+    }
+
+    /// Builds a canonical all-matching descriptor inside one stable collection scope.
+    #[must_use]
+    pub fn all_matching_in_scope(
+        query: crate::LibraryQuery,
+        scope: crate::LibraryScope,
+        generation: LibraryGeneration,
+        mut excluded: Vec<BookId>,
+    ) -> Self {
+        excluded.sort_unstable();
+        excluded.dedup();
+        Self::AllMatching {
+            query,
+            scope,
             generation,
             excluded,
         }
@@ -1780,12 +1801,12 @@ impl<'a> SearchParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContributorFacet, ContributorId, ExactFacets, FacetError, NameKind, NameValidationError,
-        SearchClause, SearchExpression, SearchParseErrorKind, SeriesId, SeriesIndex,
-        SeriesIndexError, TagId, TextMatch, identity_key, normalize_identifier_value,
-        normalize_name,
+        BookSelection, ContributorFacet, ContributorId, ExactFacets, FacetError, LibraryGeneration,
+        NameKind, NameValidationError, SearchClause, SearchExpression, SearchParseErrorKind,
+        SeriesId, SeriesIndex, SeriesIndexError, TagId, TextMatch, VirtualLibraryId, identity_key,
+        normalize_identifier_value, normalize_name,
     };
-    use crate::{AssetHealth, BookFormat};
+    use crate::{AssetHealth, BookFormat, BookId, LibraryQuery, LibraryScope};
 
     #[test]
     fn stable_identifiers_round_trip_storage_values() {
@@ -1793,7 +1814,7 @@ mod tests {
         assert_eq!(SeriesId::new(8).to_string(), "8");
         assert_eq!(TagId::new(9).value(), 9);
         assert_eq!(super::SavedSearchId::new(10).to_string(), "10");
-        assert_eq!(super::VirtualLibraryId::new(11).value(), 11);
+        assert_eq!(VirtualLibraryId::new(11).value(), 11);
     }
 
     #[test]
@@ -1806,6 +1827,32 @@ mod tests {
         }
         assert_eq!(storage_values.len(), 28);
         assert_eq!(super::Genre::parse("made_up_genre"), None);
+    }
+
+    #[test]
+    fn scoped_all_matching_selection_preserves_scope_and_canonicalizes_exclusions() {
+        let selection = BookSelection::all_matching_in_scope(
+            LibraryQuery::default(),
+            LibraryScope::VirtualLibrary(VirtualLibraryId::new(17)),
+            LibraryGeneration {
+                connection_changes: 23,
+                data_version: 29,
+            },
+            vec![BookId::new(9), BookId::new(3), BookId::new(9)],
+        );
+
+        assert_eq!(
+            selection,
+            BookSelection::AllMatching {
+                query: LibraryQuery::default(),
+                scope: LibraryScope::VirtualLibrary(VirtualLibraryId::new(17)),
+                generation: LibraryGeneration {
+                    connection_changes: 23,
+                    data_version: 29,
+                },
+                excluded: vec![BookId::new(3), BookId::new(9)],
+            }
+        );
     }
 
     #[test]

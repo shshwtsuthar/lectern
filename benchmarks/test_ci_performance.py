@@ -36,6 +36,7 @@ class CiPerformanceTests(unittest.TestCase):
                 "reimport-known-path-v1",
                 "organisation-migration-v3",
                 "organisation-query-v3",
+                "library-browse-v1",
                 "organisation-vocabulary-v2",
                 "bulk-tags-v2",
                 "bulk-remove-v2",
@@ -44,6 +45,7 @@ class CiPerformanceTests(unittest.TestCase):
                 "ui-selection-v1",
                 "ui-material-covers-v1",
                 "ui-book-detail-v2",
+                "ui-library-browse-v1",
             ],
         )
         self.assertIn(
@@ -85,6 +87,13 @@ class CiPerformanceTests(unittest.TestCase):
             {
                 "name": "ui-material-covers-v1",
                 "budget": "benchmarks/ui-material-covers-regression-v1.json",
+            },
+            registry["suites"],
+        )
+        self.assertIn(
+            {
+                "name": "ui-library-browse-v1",
+                "budget": "benchmarks/ui-library-browse-regression-v1.json",
             },
             registry["suites"],
         )

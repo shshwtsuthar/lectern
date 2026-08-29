@@ -3,7 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use lectern_core::{
-    AssetHealth, BookFormat, BookId, LibraryQuery, SortOrder,
+    AssetHealth, BookFormat, BookId, LibraryGroup, LibraryGrouping, LibraryQuery, LibraryScope,
+    SortOrder,
     organisation::{
         BookEdit, Contributor, ContributorCredit, ContributorCreditEdit, ContributorId,
         ContributorReference, ContributorRole, ContributorUsage, DEFAULT_IDENTIFIER_TYPES, Genre,
@@ -1528,6 +1529,195 @@ fn validate_virtual_library_description(description: Option<&str>) -> Result<Opt
         )));
     }
     Ok(Some(description.to_owned()))
+}
+
+/// Returns one counted, bounded group-index page in canonical display order.
+pub(super) fn browse_groups(
+    transaction: &Transaction<'_>,
+    grouping: LibraryGrouping,
+    offset: i64,
+    limit: u32,
+) -> Result<(u64, Vec<LibraryGroup>)> {
+    match grouping {
+        LibraryGrouping::VirtualLibraries => browse_virtual_libraries(transaction, offset, limit),
+        LibraryGrouping::Genres => browse_genres(transaction, offset, limit),
+        LibraryGrouping::Contributors => browse_contributor_groups(transaction, offset, limit),
+        LibraryGrouping::Series => browse_series_groups(transaction, offset, limit),
+    }
+}
+
+fn browse_virtual_libraries(
+    transaction: &Transaction<'_>,
+    offset: i64,
+    limit: u32,
+) -> Result<(u64, Vec<LibraryGroup>)> {
+    let total = checked_count(transaction.query_row(
+        "SELECT count(*) FROM virtual_libraries",
+        [],
+        |row| row.get(0),
+    )?)?;
+    if limit == 0 {
+        return Ok((total, Vec::new()));
+    }
+    let mut statement = transaction.prepare_cached(
+        "SELECT v.id, v.name, v.description, v.icon, ( \
+             SELECT count(*) FROM book_virtual_libraries bv \
+             WHERE bv.virtual_library_id = v.id \
+         ) FROM virtual_libraries v \
+         ORDER BY v.identity_key, v.id LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = statement.query_map(params![i64::from(limit), offset], |row| {
+        let id = VirtualLibraryId::new(row.get(0)?);
+        let icon_value = row.get::<_, String>(3)?;
+        let icon = VirtualLibraryIcon::parse(&icon_value).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                format!("invalid virtual-library icon {icon_value:?}").into(),
+            )
+        })?;
+        let books = row.get::<_, i64>(4)?;
+        Ok((
+            id,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            icon,
+            books,
+        ))
+    })?;
+    let groups = rows
+        .map(|row| {
+            let (id, name, description, icon, books) = row?;
+            Ok(LibraryGroup {
+                scope: LibraryScope::VirtualLibrary(id),
+                name,
+                description,
+                icon: Some(icon),
+                books: checked_count(books)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((total, groups))
+}
+
+fn browse_genres(
+    transaction: &Transaction<'_>,
+    offset: i64,
+    limit: u32,
+) -> Result<(u64, Vec<LibraryGroup>)> {
+    let total = u64::try_from(Genre::ALL.len()).expect("fixed genre count fits u64");
+    if limit == 0 {
+        return Ok((total, Vec::new()));
+    }
+    let mut statement =
+        transaction.prepare_cached("SELECT genre, count(*) FROM book_genres GROUP BY genre")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut counts = HashMap::with_capacity(Genre::ALL.len());
+    for row in rows {
+        let (value, books) = row?;
+        let genre = Genre::parse(&value).ok_or_else(|| {
+            StorageError::Integrity(format!("book_genres contains invalid genre {value:?}"))
+        })?;
+        counts.insert(genre, checked_count(books)?);
+    }
+    let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+    let groups = Genre::ALL
+        .into_iter()
+        .skip(offset)
+        .take(usize::try_from(limit).expect("u32 limit fits usize"))
+        .map(|genre| LibraryGroup {
+            scope: LibraryScope::Genre(genre),
+            name: genre.to_string(),
+            description: None,
+            icon: None,
+            books: counts.get(&genre).copied().unwrap_or(0),
+        })
+        .collect();
+    Ok((total, groups))
+}
+
+fn browse_contributor_groups(
+    transaction: &Transaction<'_>,
+    offset: i64,
+    limit: u32,
+) -> Result<(u64, Vec<LibraryGroup>)> {
+    let total =
+        checked_count(
+            transaction.query_row("SELECT count(*) FROM contributors", [], |row| row.get(0))?,
+        )?;
+    if limit == 0 {
+        return Ok((total, Vec::new()));
+    }
+    let mut statement = transaction.prepare_cached(
+        "SELECT c.id, c.display_name, ( \
+             SELECT count(DISTINCT bc.book_id) FROM book_contributors bc \
+             WHERE bc.contributor_id = c.id \
+         ) FROM contributors c \
+         ORDER BY c.identity_key, c.id LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = statement.query_map(params![i64::from(limit), offset], |row| {
+        Ok((
+            ContributorId::new(row.get(0)?),
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let groups = rows
+        .map(|row| {
+            let (id, name, books) = row?;
+            Ok(LibraryGroup {
+                scope: LibraryScope::Contributor(id),
+                name,
+                description: None,
+                icon: None,
+                books: checked_count(books)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((total, groups))
+}
+
+fn browse_series_groups(
+    transaction: &Transaction<'_>,
+    offset: i64,
+    limit: u32,
+) -> Result<(u64, Vec<LibraryGroup>)> {
+    let total = checked_count(transaction.query_row(
+        "SELECT count(*) FROM series_entities",
+        [],
+        |row| row.get(0),
+    )?)?;
+    if limit == 0 {
+        return Ok((total, Vec::new()));
+    }
+    let mut statement = transaction.prepare_cached(
+        "SELECT s.id, s.name, ( \
+             SELECT count(*) FROM series_memberships sm WHERE sm.series_id = s.id \
+         ) FROM series_entities s \
+         ORDER BY s.identity_key, s.id LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = statement.query_map(params![i64::from(limit), offset], |row| {
+        Ok((
+            SeriesId::new(row.get(0)?),
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let groups = rows
+        .map(|row| {
+            let (id, name, books) = row?;
+            Ok(LibraryGroup {
+                scope: LibraryScope::Series(id),
+                name,
+                description: None,
+                icon: None,
+                books: checked_count(books)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((total, groups))
 }
 
 /// Returns bounded identifier-type identity-prefix matches, including unused defaults.

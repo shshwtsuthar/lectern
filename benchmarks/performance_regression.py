@@ -90,6 +90,7 @@ def main(arguments: list[str]) -> int:
             "ui-selection",
             "ui-material-covers",
             "ui-book-detail",
+            "ui-library-browse",
             "ui-genres",
             "ui-virtual-library",
         ):
@@ -108,6 +109,11 @@ def main(arguments: list[str]) -> int:
             elif mode == "ui-book-detail":
                 ui_result = run_ui_book_detail(query_output, output, workload, commands)
                 decisions = evaluate_ui_book_detail_result(ui_result, budget)
+            elif mode == "ui-library-browse":
+                ui_result = run_ui_library_browse(
+                    query_output, output, workload, commands
+                )
+                decisions = evaluate_ui_library_browse_result(ui_result, budget)
             elif mode == "ui-genres":
                 ui_result = run_ui_genres(query_output, output, workload, commands)
                 decisions = evaluate_ui_genres_result(ui_result, budget)
@@ -149,6 +155,7 @@ def main(arguments: list[str]) -> int:
             "reimport": "reimports.json",
             "organisation-migration": "migrations.json",
             "organisation-query": "organisation-queries.json",
+            "library-browse": "library-browse.json",
             "organisation-vocabulary": "organisation-vocabulary.json",
             "bulk-tags": "organisation-bulk-tags.json",
             "bulk-remove": "organisation-bulk-remove.json",
@@ -164,6 +171,7 @@ def main(arguments: list[str]) -> int:
             validate_migration_seed_result(seed, workload)
         elif mode in (
             "organisation-query",
+            "library-browse",
             "organisation-vocabulary",
             "bulk-tags",
             "bulk-remove",
@@ -194,6 +202,8 @@ def main(arguments: list[str]) -> int:
             decisions = evaluate_migration_result(query_result, budget)
         elif mode == "organisation-query":
             decisions = evaluate_organisation_query_result(query_result, budget)
+        elif mode == "library-browse":
+            decisions = evaluate_library_browse_result(query_result, budget)
         elif mode == "organisation-vocabulary":
             decisions = evaluate_organisation_vocabulary_result(query_result, budget)
         elif mode == "bulk-tags":
@@ -259,6 +269,7 @@ def seed_command(
         command += ["--bin", "organisation-benchmark", "--", "seed-migration"]
     elif mode in (
         "organisation-query",
+        "library-browse",
         "organisation-vocabulary",
         "bulk-tags",
         "bulk-remove",
@@ -283,6 +294,7 @@ def seed_command(
     ]
     if "fixture_version" in workload and mode in (
         "organisation-query",
+        "library-browse",
         "organisation-vocabulary",
         "bulk-tags",
         "bulk-remove",
@@ -303,6 +315,8 @@ def workload_command(
         command += ["--bin", "organisation-benchmark", "--", "migration"]
     elif mode == "organisation-query":
         command += ["--bin", "organisation-query-benchmark", "--", "query"]
+    elif mode == "library-browse":
+        command += ["--bin", "library-browse-benchmark", "--"]
     elif mode == "organisation-vocabulary":
         command += ["--bin", "organisation-vocabulary-benchmark", "--"]
     elif mode in ("bulk-tags", "bulk-remove"):
@@ -360,7 +374,7 @@ def workload_command(
         str(workload["measured_iterations"]),
         "--warmup",
         str(workload["warmup_iterations"]),
-    ] if mode in ("organisation-migration", "organisation-query") else command + [
+    ] if mode in ("organisation-migration", "organisation-query", "library-browse") else command + [
         "--database",
         str(database),
         "--output",
@@ -416,6 +430,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "reimport",
         "organisation-migration",
         "organisation-query",
+        "library-browse",
         "organisation-vocabulary",
         "bulk-tags",
         "bulk-remove",
@@ -427,16 +442,18 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
         "ui-selection",
         "ui-material-covers",
         "ui-book-detail",
+        "ui-library-browse",
         "ui-genres",
         "ui-virtual-library",
     ):
         raise RegressionError(
             "budget.workload.query_mode must be 'full', 'page', 'page-covered', "
             "'remove', 'detach', 'attach', 'replace', 'export', 'reimport', "
-            "'organisation-migration', 'organisation-query', "
+            "'organisation-migration', 'organisation-query', 'library-browse', "
             "'organisation-vocabulary', 'bulk-tags', 'bulk-remove', 'saved-searches', 'genres', 'maintenance', "
             "'virtual-libraries', "
             "'ui-bootstrap', 'ui-selection', 'ui-material-covers', 'ui-book-detail', "
+            "'ui-library-browse', "
             "'ui-genres', or 'ui-virtual-library'"
         )
     if (
@@ -446,6 +463,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             "ui-selection",
             "ui-material-covers",
             "ui-book-detail",
+            "ui-library-browse",
             "ui-genres",
             "ui-virtual-library",
         )
@@ -519,6 +537,36 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             raise RegressionError(
                 "identifier-aware organisation query workload must use fixture version three"
             )
+        if query_mode == "library-browse":
+            if positive_or_zero_field(
+                workload, "fixture_version", "budget.workload"
+            ) != 3:
+                raise RegressionError(
+                    "library-browse workload must use organisation fixture version three"
+                )
+            if positive_or_zero_field(
+                workload, "browse_fixture_version", "budget.workload"
+            ) != 1:
+                raise RegressionError(
+                    "library-browse workload must use browse fixture version one"
+                )
+            for field in (
+                "page_size",
+                "group_page_size",
+                "contributors",
+                "series",
+                "tags",
+                "tags_per_book",
+                "identifiers_per_book",
+                "saved_searches",
+                "catalog_genres",
+                "virtual_libraries",
+                "virtual_memberships_per_book",
+            ):
+                if positive_or_zero_field(workload, field, "budget.workload") == 0:
+                    raise RegressionError(
+                        f"library-browse workload {field} must be greater than zero"
+                    )
         if query_mode in (
             "organisation-vocabulary",
             "bulk-tags",
@@ -594,6 +642,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             "ui-selection",
             "ui-material-covers",
             "ui-book-detail",
+            "ui-library-browse",
             "ui-genres",
             "ui-virtual-library",
         ):
@@ -609,6 +658,18 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             workload, "fixture_version", "budget.workload"
         ) != 2:
             raise RegressionError("book-detail UI workload must use fixture version two")
+        if query_mode == "ui-library-browse":
+            if positive_or_zero_field(
+                workload, "fixture_version", "budget.workload"
+            ) != 1:
+                raise RegressionError(
+                    "library-browse UI workload must use fixture version one"
+                )
+            for field in ("group_page_size", "group_count", "scoped_books"):
+                if positive_or_zero_field(workload, field, "budget.workload") == 0:
+                    raise RegressionError(
+                        f"library-browse UI workload {field} must be greater than zero"
+                    )
         if query_mode == "ui-genres" and positive_or_zero_field(
             workload, "fixture_version", "budget.workload"
         ) != 1:
@@ -706,6 +767,7 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
             "ui-selection",
             "ui-material-covers",
             "ui-book-detail",
+            "ui-library-browse",
             "ui-genres",
             "ui-virtual-library",
         ):
@@ -756,6 +818,12 @@ def validate_budget(budget: dict[str, Any]) -> dict[str, Any]:
                 f"budget {name!r}",
             )
         if query_mode == "bulk-remove" and name == "bulk_remove_and_refresh":
+            positive_or_zero_field(
+                scenario_budget,
+                "max_peak_rss_delta_bytes",
+                f"budget {name!r}",
+            )
+        if query_mode == "library-browse":
             positive_or_zero_field(
                 scenario_budget,
                 "max_peak_rss_delta_bytes",
@@ -1659,6 +1727,120 @@ def evaluate_organisation_query_result(
     return evaluate_latency_budgets(by_name, budget)
 
 
+def evaluate_library_browse_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "library-browse result"
+    if result.get("kind") != "library-browse-performance":
+        raise RegressionError("library-browse result kind is invalid")
+    expected_fields = {
+        "library_books": workload["books"],
+        "contributors": workload["contributors"],
+        "series": workload["series"],
+        "catalog_genres": workload["catalog_genres"],
+        "virtual_libraries": workload["virtual_libraries"],
+        "virtual_memberships_per_book": workload["virtual_memberships_per_book"],
+        "group_page_size": workload["group_page_size"],
+        "book_page_size": workload["page_size"],
+        "warmup_iterations": workload["warmup_iterations"],
+        "measured_iterations": workload["measured_iterations"],
+    }
+    for field, expected in expected_fields.items():
+        if positive_or_zero_field(result, field, context) != expected:
+            raise RegressionError(
+                f"library-browse {field} does not match the versioned workload"
+            )
+
+    checks = result.get("verified_checks")
+    if not isinstance(checks, list) or set(checks) != set(workload["correctness"]):
+        raise RegressionError("library-browse correctness checks did not reconcile")
+    plans = result.get("query_plans")
+    required_indexes = {
+        "book_contributors_contributor_role_book_idx",
+        "series_memberships_series_index_book_idx",
+        "book_genres_genre_book_idx",
+        "book_virtual_libraries_library_book_idx",
+    }
+    if not isinstance(plans, list) or {
+        plan.get("required_index") for plan in plans if isinstance(plan, dict)
+    } != required_indexes:
+        raise RegressionError("library-browse plans did not cover every scoped index")
+    if any(
+        not isinstance(plan, dict)
+        or not isinstance(plan.get("details"), list)
+        or not plan["details"]
+        for plan in plans
+    ):
+        raise RegressionError("library-browse query-plan evidence is empty")
+
+    measured = workload["measured_iterations"]
+    successful = workload["warmup_iterations"] + measured
+    scenarios = result.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RegressionError("library-browse result must contain scenarios")
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, scenario in enumerate(scenarios):
+        scenario_context = f"library-browse scenario {index}"
+        if not isinstance(scenario, dict):
+            raise RegressionError(f"{scenario_context} must be an object")
+        name = scenario.get("name")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RegressionError(f"{scenario_context}.name must be unique and non-empty")
+        if (
+            positive_or_zero_field(
+                scenario, "successful_operations", scenario_context
+            )
+            != successful
+        ):
+            raise RegressionError(
+                f"{scenario_context} operation count does not reconcile"
+            )
+        observed_results = positive_or_zero_field(
+            scenario, "observed_results", scenario_context
+        )
+        maximum_results = (
+            workload["group_page_size"]
+            if "groups_first_page" in name
+            else workload["page_size"]
+        )
+        if observed_results > maximum_results:
+            raise RegressionError(f"{scenario_context} exceeded its bounded page size")
+        samples = positive_samples(scenario, scenario_context, measured)
+        p95_ms = positive_number_field(
+            object_field(scenario, "latency_ms", scenario_context),
+            "p95",
+            f"{scenario_context}.latency_ms",
+        )
+        if not math.isclose(
+            p95_ms,
+            nearest_rank_p95(samples) / 1_000_000,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise RegressionError(f"{scenario_context} p95 does not match retained samples")
+        by_name[name] = scenario
+
+    expected_names = set(workload["scenarios"])
+    if set(by_name) != expected_names or expected_names != set(budget["budgets"]):
+        raise RegressionError("library-browse scenarios do not match the versioned workload")
+
+    peak_rss = positive_or_zero_field(result, "peak_rss_delta_bytes", context)
+    decisions = evaluate_latency_budgets(by_name, budget)
+    for decision in decisions:
+        maximum_rss = budget["budgets"][decision["name"]][
+            "max_peak_rss_delta_bytes"
+        ]
+        decision |= {
+            "peak_rss_delta_bytes": peak_rss,
+            "max_peak_rss_delta_bytes": maximum_rss,
+        }
+        decision["passed"] = bool(
+            decision["passed"] and peak_rss <= maximum_rss
+        )
+    return decisions
+
+
 def evaluate_organisation_vocabulary_result(
     result: dict[str, Any], budget: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -2309,6 +2491,97 @@ def run_ui_book_detail(
     return result
 
 
+def run_ui_library_browse(
+    output: pathlib.Path,
+    artifact_directory: pathlib.Path,
+    workload: dict[str, Any],
+    commands: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Measure group navigation, scoped books, and book-table presentation."""
+
+    run_command(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "lectern-desktop",
+            "--bin",
+            "lectern-gpui",
+        ],
+        commands,
+        timeout_seconds=1_800,
+    )
+    target_directory = pathlib.Path(
+        os.environ.get("CARGO_TARGET_DIR", str(REPOSITORY / "target"))
+    )
+    if not target_directory.is_absolute():
+        target_directory = REPOSITORY / target_directory
+    executable = target_directory / "release/lectern-gpui"
+    if sys.platform == "win32":
+        executable = executable.with_suffix(".exe")
+    if not executable.is_file():
+        raise RegressionError(f"release GPUI executable is missing: {executable}")
+
+    warmup = workload["warmup_iterations"]
+    measured = workload["measured_iterations"]
+    samples_directory = artifact_directory / "ui-samples"
+    samples_directory.mkdir()
+    measured_samples: list[dict[str, Any]] = []
+    raw_paths: list[str] = []
+    for index in range(warmup + measured):
+        phase = "warmup" if index < warmup else "measured"
+        phase_index = index if phase == "warmup" else index - warmup
+        sample_path = samples_directory / f"{phase}-{phase_index:03d}.json"
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "LECTERN_GPUI_BENCHMARK_OUTPUT": str(sample_path),
+                "LECTERN_GPUI_BENCHMARK_WORKLOAD": "library-browse",
+            }
+        )
+        run_command(
+            [str(executable)],
+            commands,
+            environment=environment,
+            timeout_seconds=15,
+        )
+        sample = read_json(sample_path)
+        validate_ui_library_browse_sample(sample, sample_path, workload)
+        raw_paths.append(str(sample_path))
+        if phase == "measured":
+            measured_samples.append(sample)
+
+    peak_samples = [
+        sample["peak_rss_bytes"]
+        for sample in measured_samples
+        if sample.get("peak_rss_bytes") is not None
+    ]
+    peak_rss = max(peak_samples) if peak_samples else None
+    scenarios = []
+    for name, field in (
+        ("group_index_to_painted_state", "group_index_to_paint_ms"),
+        ("scoped_books_to_painted_state", "scoped_books_to_paint_ms"),
+        ("tiles_to_table_painted_state", "table_to_paint_ms"),
+    ):
+        samples_ns = [
+            round(float(sample[field]) * 1_000_000) for sample in measured_samples
+        ]
+        scenarios.append(ui_scenario(name, samples_ns, peak_rss))
+    result = {
+        "kind": "lectern-ui-library-browse-performance",
+        "library_books": workload["books"],
+        "warmup_iterations": warmup,
+        "measured_iterations": measured,
+        "raw_samples": raw_paths,
+        "correctness": measured_samples[0]["correctness"],
+        "scenarios": scenarios,
+    }
+    write_json(output, result)
+    return result
+
+
 def run_ui_virtual_library(
     output: pathlib.Path,
     artifact_directory: pathlib.Path,
@@ -2628,6 +2901,49 @@ def expected_ui_book_detail_correctness(workload: dict[str, Any]) -> dict[str, A
             "half_star_rating_presented",
             "identifiers_presented",
             "multiple_assets_presented",
+        ],
+    }
+
+
+def validate_ui_library_browse_sample(
+    sample: dict[str, Any], path: pathlib.Path, workload: dict[str, Any]
+) -> None:
+    context = f"UI library-browse sample {path.name}"
+    if sample.get("schema_version") != 1:
+        raise RegressionError(f"{context} schema_version must be 1")
+    if sample.get("workload") != "library-browse":
+        raise RegressionError(f"{context} workload identity is invalid")
+    for field in (
+        "group_index_to_paint_ms",
+        "scoped_books_to_paint_ms",
+        "table_to_paint_ms",
+    ):
+        positive_number_field(sample, field, context)
+    peak_rss = sample.get("peak_rss_bytes")
+    if peak_rss is not None and positive_or_zero_field(
+        sample, "peak_rss_bytes", context
+    ) == 0:
+        raise RegressionError(f"{context} peak_rss_bytes must be positive when present")
+    if sample.get("correctness") != expected_ui_library_browse_correctness(workload):
+        raise RegressionError(f"{context} correctness markers are invalid")
+
+
+def expected_ui_library_browse_correctness(workload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "library_total": workload["books"],
+        "group_count": workload["group_count"],
+        "scoped_total": workload["scoped_books"],
+        "rendered_books": workload["page_size"],
+        "selected_destination": "Genres",
+        "breadcrumb": "Fantasy",
+        "table_columns": ["Title", "Contributor", "Series", "File status"],
+        "markers": [
+            "browse_sidebar_destination_selected",
+            "bounded_group_tiles_presented",
+            "scoped_breadcrumb_presented",
+            "bounded_scoped_book_page",
+            "book_table_columns_presented",
+            "compact_scoped_selection_descriptor",
         ],
     }
 
@@ -3024,6 +3340,25 @@ def evaluate_ui_book_detail_result(
             }
         )
     return decisions
+
+
+def evaluate_ui_library_browse_result(
+    result: dict[str, Any], budget: dict[str, Any]
+) -> list[dict[str, Any]]:
+    workload = budget["workload"]
+    context = "UI library-browse result"
+    if result.get("kind") != "lectern-ui-library-browse-performance":
+        raise RegressionError(f"{context} kind is invalid")
+    if positive_or_zero_field(result, "library_books", context) != workload["books"]:
+        raise RegressionError(f"{context} library size does not match the budget")
+    if result.get("correctness") != expected_ui_library_browse_correctness(workload):
+        raise RegressionError(f"{context} correctness markers are invalid")
+
+    common_result = dict(result)
+    common_result["kind"] = "lectern-ui-bootstrap-performance"
+    common_result["library_books"] = 0
+    common_result["correctness"] = expected_ui_correctness()
+    return evaluate_ui_bootstrap_result(common_result, budget)
 
 
 def run_bulk_tag_desktop(

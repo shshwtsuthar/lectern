@@ -50,16 +50,17 @@ fn resolve_selection(
         BookSelection::Explicit(books) => Ok(books.clone()),
         BookSelection::AllMatching {
             query,
+            scope,
             generation,
             excluded,
         } => {
-            validate_generation(service, query, *generation)?;
+            validate_generation(service, query, *scope, *generation)?;
             let excluded = excluded.iter().copied().collect::<HashSet<_>>();
             let mut ids = Vec::new();
             let mut offset = 0_u64;
             loop {
                 let page = service
-                    .query_library_ids_window(query, offset, SELECTION_PAGE_SIZE)
+                    .query_library_ids_window_in_scope(query, *scope, offset, SELECTION_PAGE_SIZE)
                     .map_err(|error| error.to_string())?;
                 let page_len = page.len();
                 ids.extend(page.into_iter().filter(|id| !excluded.contains(id)));
@@ -78,10 +79,11 @@ fn resolve_selection(
 fn validate_generation(
     service: &mut SqliteLibraryService,
     query: &lectern_core::LibraryQuery,
+    scope: lectern_core::LibraryScope,
     expected: LibraryGeneration,
 ) -> Result<(), String> {
     let current = service
-        .selection_snapshot(query)
+        .selection_snapshot_in_scope(query, scope)
         .map_err(|error| error.to_string())?;
     if current.generation == expected {
         Ok(())

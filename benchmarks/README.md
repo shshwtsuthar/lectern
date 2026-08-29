@@ -91,6 +91,14 @@ projections. It measures a bounded 100-row manager page, application through the
 book IDs, and create/update/rename/delete lifecycle while proving that book, vocabulary, asset, and
 FTS state remains intact.
 
+The metadata browser gate in
+[`library-browse-regression-v1.json`](library-browse-regression-v1.json) exercises the production
+group-index and scoped-book paths over the 50,000-book organisation fixture, all 28 genres, and
+2,500 virtual libraries. It retains 40 samples after 10 warmups for all four first group pages, all
+four first scoped book pages, and a deep genre page without recounting. Independent SQL reference
+projections verify exact group identities, counts, book order, uniqueness, page bounds, and the
+covering contributor, series, genre, and virtual-library indexes.
+
 The GPUI bootstrap workload in
 [`ui-bootstrap-regression-v1.json`](ui-bootstrap-regression-v1.json) launches the optimized
 `lectern-gpui` binary in 5 warmup and 40 measured fresh processes. It retains each process's raw
@@ -120,6 +128,14 @@ The GPUI book-detail workload in
 contributor, series, tag, identifier, publication-date, half-star-rating, description, and
 multi-asset presentation markers. It gates the populated first paint and
 book-selection-to-painted-sidebar p95 plus peak RSS while retaining every fresh-process sample.
+
+The GPUI metadata-browser workload in
+[`ui-library-browse-regression-v1.json`](ui-library-browse-regression-v1.json) paints a
+representative 28-genre index over a 50,000-book catalog, drills into a bounded 128-book genre
+scope, and changes that scoped projection from Tiles to Table. It retains every fresh-process
+sample, verifies the selected Browse destination, breadcrumb, exact group and scoped counts, table
+columns, and compact scope carried by query-backed selection, and gates all three interaction p95s
+plus peak RSS.
 
 Performance-sensitive pull requests additionally run the base and candidate revisions three times
 each on the same runner. The gate compares the median of their run-level p95 values and fails a
@@ -157,6 +173,8 @@ python3 benchmarks/performance_regression.py \
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-query-regression-v3.json
 python3 benchmarks/performance_regression.py \
+  --budget benchmarks/library-browse-regression-v1.json
+python3 benchmarks/performance_regression.py \
   --budget benchmarks/organisation-vocabulary-regression-v2.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/bulk-tags-regression-v2.json
@@ -172,6 +190,8 @@ python3 benchmarks/performance_regression.py \
   --budget benchmarks/ui-material-covers-regression-v1.json
 python3 benchmarks/performance_regression.py \
   --budget benchmarks/ui-book-detail-regression-v2.json
+python3 benchmarks/performance_regression.py \
+  --budget benchmarks/ui-library-browse-regression-v1.json
 ```
 
 Use `--output-dir PATH` to choose a new artifact directory, or `--budget PATH` to evaluate a

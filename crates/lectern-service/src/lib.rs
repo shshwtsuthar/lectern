@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use directories::ProjectDirs;
 use lectern_core::{
     AssetHealthReport, AssetId, BackupReport, Book, BookFormat, BookId, BookSummary,
-    ImportProgress, ImportSummary, LibraryDiagnostics, LibraryPage, LibraryQuery, LibraryService,
-    LibraryStats,
+    ImportProgress, ImportSummary, LibraryDiagnostics, LibraryGroupPage, LibraryGrouping,
+    LibraryPage, LibraryQuery, LibraryScope, LibraryService, LibraryStats,
     organisation::{
         BookEdit, BookSelection, BulkRemovalResult, BulkTagEdit, BulkTagResult, ContributorId,
         ContributorUsage, IdentifierTypeUsage, SavedSearch, SavedSearchId, SelectionSnapshot,
@@ -85,6 +85,27 @@ impl LibraryService for SqliteLibraryService {
         Ok(self.database.query_page(query, offset, limit)?)
     }
 
+    fn browse_library_groups(
+        &mut self,
+        grouping: LibraryGrouping,
+        offset: u64,
+        limit: u32,
+    ) -> Result<LibraryGroupPage, Self::Error> {
+        Ok(self.database.browse_groups(grouping, offset, limit)?)
+    }
+
+    fn query_library_page_in_scope(
+        &mut self,
+        query: &LibraryQuery,
+        scope: LibraryScope,
+        offset: u64,
+        limit: u32,
+    ) -> Result<LibraryPage, Self::Error> {
+        Ok(self
+            .database
+            .query_page_in_scope(query, scope, offset, limit)?)
+    }
+
     fn query_library_window(
         &mut self,
         query: &LibraryQuery,
@@ -94,11 +115,31 @@ impl LibraryService for SqliteLibraryService {
         Ok(self.database.query_window(query, offset, limit)?)
     }
 
+    fn query_library_window_in_scope(
+        &mut self,
+        query: &LibraryQuery,
+        scope: LibraryScope,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<BookSummary>, Self::Error> {
+        Ok(self
+            .database
+            .query_window_in_scope(query, scope, offset, limit)?)
+    }
+
     fn selection_snapshot(
         &mut self,
         query: &LibraryQuery,
     ) -> Result<SelectionSnapshot, Self::Error> {
         Ok(self.database.selection_snapshot(query)?)
+    }
+
+    fn selection_snapshot_in_scope(
+        &mut self,
+        query: &LibraryQuery,
+        scope: LibraryScope,
+    ) -> Result<SelectionSnapshot, Self::Error> {
+        Ok(self.database.selection_snapshot_in_scope(query, scope)?)
     }
 
     fn query_library_ids_window(
@@ -108,6 +149,18 @@ impl LibraryService for SqliteLibraryService {
         limit: u32,
     ) -> Result<Vec<BookId>, Self::Error> {
         Ok(self.database.query_ids_window(query, offset, limit)?)
+    }
+
+    fn query_library_ids_window_in_scope(
+        &mut self,
+        query: &LibraryQuery,
+        scope: LibraryScope,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<BookId>, Self::Error> {
+        Ok(self
+            .database
+            .query_ids_window_in_scope(query, scope, offset, limit)?)
     }
 
     fn selection_tag_usage(
